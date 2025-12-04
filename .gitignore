@@ -1,0 +1,19 @@
+# Training artifacts
+wandb/
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Environment
+.venv/
+venv/
+.env
