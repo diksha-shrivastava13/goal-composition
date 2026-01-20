@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import time
@@ -17,6 +19,8 @@ import wandb
 import chex
 from enum import IntEnum
 import matplotlib
+from jax import Array
+
 matplotlib.use('Agg')  # Non-interactive backend for server environments
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
@@ -32,70 +36,67 @@ from jaxued.utils import max_mc, positive_value_loss, compute_max_returns
 from jaxued.wrappers import AutoReplayWrapper
 
 """
-Causal Analysis Constants:
 --------------------------
+Causal Analysis Constants
+--------------------------
+
 These constants control the causal world model extraction and analysis.
 Arbitrary values are marked as hyperparameters which may need tuning.
 
+1. Statistical Constants (mathematically justified):
 
+MAD_TO_STD_FACTOR = 1.4826: For normal distribution: MAD * 1.4826 ≈ std deviation
+UNIFORM_PRIOR = 0.5: Maximum entropy prior for binary unknown (edge exists or not).
 
-"""
+2. Statistical Thresholds (Convention-based, Semi-justified):
 
-# =============================================================================
-# CAUSAL ANALYSIS CONSTANTS
-# =============================================================================
-# These constants control the causal world model extraction and analysis.
-# Values are documented with their justification. Arbitrary values are marked
-# and should be treated as hyperparameters that may need tuning.
+MAD_MULTIPLIER = 2.5: Number of MADs above median for outlier/significance detection. 2.5 ≈ 2σ for normal distribution (95% CI). Common in robust statistics.
+SIGNIFICANCE_STD_MULTIPLIER = 2.0: Number of standard deviations for significance testing. 2.0 corresponds to ~95% confidence interval (exact value is 1.96).
 
-# --- Statistical Constants (Mathematically Justified) ---
-MAD_TO_STD_FACTOR = 1.4826  # For normal distribution: MAD * 1.4826 ≈ std deviation
-UNIFORM_PRIOR = 0.5  # Maximum entropy prior for binary unknown (edge exists or not)
+3. Bayesian Update Constants (Semi-justified):
 
-# --- Statistical Thresholds (Convention-based, Semi-justified) ---
-# Number of MADs above median for outlier/significance detection
-# 2.5 ≈ 2σ for normal distribution (95% CI). Common in robust statistics.
-MAD_MULTIPLIER = 2.5
-
-# Number of standard deviations for significance testing
-# 2.0 corresponds to ~95% confidence interval (exact value is 1.96)
-SIGNIFICANCE_STD_MULTIPLIER = 2.0
-
-# --- Bayesian Update Constants (Semi-justified) ---
-# Bounds to prevent certainty in Bayesian belief updates
-# Certainty (0 or 1) would stop learning; these allow continued updates
-# Values chosen to be symmetric and allow strong but not absolute beliefs
 BELIEF_LOWER_BOUND = 0.05  # Minimum P(edge exists)
 BELIEF_UPPER_BOUND = 0.95  # Maximum P(edge exists)
 
-# --- Temporal Analysis Constants (Statistically Justified) ---
-# Fraction of horizon to use for noise estimation at start of trajectory
-# Using early timesteps assumes intervention effects haven't propagated yet
+Bounds to prevent certainty in Bayesian belief updates. Certainty (0 or 1) would stop learning; these allow continued updates. 
+Values chosen to be symmetric and allow strong but not absolute beliefs.
+
+4. Temporal Analysis Constants (Statistically Justified):
+
+Fraction of horizon to use for noise estimation at start of trajectory. Using early timesteps assumes 
+intervention effects haven't propagated yet.
+
 NOISE_ESTIMATION_FRACTION = 0.1  # Will use max(MIN_SAMPLES_FOR_VARIANCE, horizon * 0.1)
+MIN_SAMPLES_FOR_VARIANCE = 3: Minimum samples needed for reliable variance estimate. Statistical minimum is 2 (for sample variance), but 3 provides 1 degree of freedom for detecting outliers. This is the theoretical minimum, not arbitrary.
+MIN_DECAY_WINDOW = 3
 
-# Minimum samples needed for reliable variance estimate
-# Statistical minimum is 2 (for sample variance), but 3 provides 1 degree of freedom
-# for detecting outliers. This is the theoretical minimum, not arbitrary.
+Minimum timesteps after peak needed to estimate decay rate. Exponential decay fit has 2 parameters (amplitude, rate), requiring minimum 3 points
+(n_params + 1 degree of freedom for goodness-of-fit assessment)
+
+"""
+
+MAD_TO_STD_FACTOR = 1.4826
+UNIFORM_PRIOR = 0.5
+MAD_MULTIPLIER = 2.5
+SIGNIFICANCE_STD_MULTIPLIER = 2.0   # TODO: could try replacing with exact value 1.86
+BELIEF_LOWER_BOUND = 0.05
+BELIEF_UPPER_BOUND = 0.95
+NOISE_ESTIMATION_FRACTION = 0.1
 MIN_SAMPLES_FOR_VARIANCE = 3
-
-# Minimum timesteps after peak needed to estimate decay rate
-# Exponential decay fit has 2 parameters (amplitude, rate), requiring minimum 3 points
-# (n_params + 1 degree of freedom for goodness-of-fit assessment)
 MIN_DECAY_WINDOW = 3
 
 
 def compute_noise_threshold(baseline_divergences: np.ndarray) -> float:
-    """Compute noise threshold from baseline divergence distribution.
-
-    Uses MAD-based robust estimation to determine the threshold above which
-    divergences are considered "real" effects rather than noise.
-
-    Args:
-        baseline_divergences: Array of divergence values from baseline (no intervention)
-
-    Returns:
-        Threshold value: median + 2.5 * MAD * 1.4826 (approximately 2.5 std devs)
     """
+    Compute noise threshold from baseline divergence distribution.
+
+    Uses MAD-based robust estimation to determine the threshold above
+    which divergences are considered real effects rather than noise.
+
+    :param baseline_divergences: Array of divergence values from baseline (no intervention).
+    :return: Threshold value: median + 2.5 * MAD * 1.4826 (approximately 2.5 std devs)
+    """
+
     if len(baseline_divergences) < MIN_SAMPLES_FOR_VARIANCE:
         return 0.0  # Not enough data, accept all
     median = np.median(baseline_divergences)
@@ -104,40 +105,40 @@ def compute_noise_threshold(baseline_divergences: np.ndarray) -> float:
 
 
 def compute_edge_inclusion_threshold(n_observations: int, base_threshold: float = 0.5) -> float:
-    """Compute edge inclusion threshold based on observation count.
+    """
+    Compute edge inclusion threshold based on observation count.
 
     Uses Wilson score interval to determine if belief is significantly above 0.5.
     With more observations, we can be more confident, so threshold approaches 0.5.
     With fewer observations, we require higher belief to include edge.
 
-    Args:
-        n_observations: Number of observations used to estimate edge belief
-        base_threshold: Base threshold (0.5 = "more likely than not")
-
-    Returns:
-        Threshold that accounts for uncertainty from limited observations
+    :param n_observations: Number of observations used to estimate edge belief
+    :param base_threshold: Base threshold (0.5 = "more likely than not")
+    :return: Threshold that accounts for uncertainty from limited observations
     """
+
     if n_observations <= 0:
         return 1.0  # No observations, don't include any edges
+
     # Standard error of proportion estimate: sqrt(p(1-p)/n)
     # At p=0.5 (maximum uncertainty): SE = sqrt(0.25/n) = 0.5/sqrt(n)
     # Require belief to exceed 0.5 by ~1 standard error
+
     margin = 0.5 / np.sqrt(n_observations)
     return min(base_threshold + margin, BELIEF_UPPER_BOUND)
 
 
 def compute_effect_normalization(observed_effects: np.ndarray) -> tuple[float, float]:
-    """Compute effect normalization parameters from observed baseline effects.
+    """
+    Compute effect normalization parameters from observed baseline effects.
 
     Instead of arbitrary constants, normalize based on the actual distribution
     of observed effects. This makes the Bayesian updates scale-invariant.
 
-    Args:
-        observed_effects: Array of effect magnitudes from observations
-
-    Returns:
-        (baseline, cap): baseline for normalization, cap for numerical stability
+    :param observed_effects: Array of effect magnitudes from observations
+    :return: baseline for normalization, cap for numerical stability
     """
+
     if len(observed_effects) < MIN_SAMPLES_FOR_VARIANCE:
         # Not enough data, use conservative defaults that won't dominate updates
         return 1.0, 3.0
@@ -279,8 +280,10 @@ def sample_trajectories_rnn_with_predictions(
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
         ac_input = jax.tree_util.tree_map(lambda t: t[None, ...], (obs, last_done))
+
         # For prediction network, we pass None for actions_for_pred during rollout
         # (predictions computed separately during loss computation)
+
         hstate, pi, value, _ = train_state.apply_fn(train_state.params, ac_input, hstate, None)
         action = pi.sample(seed=rng_action)
         log_prob = pi.log_prob(action)
@@ -317,6 +320,12 @@ def sample_trajectories_rnn_with_predictions(
     ac_input = jax.tree_util.tree_map(lambda t: t[None, ...], (last_obs, last_done))
     _, _, last_value, _ = train_state.apply_fn(train_state.params, ac_input, hstate, None)
     return (rng, train_state, hstate, last_obs, last_env_state, last_value.squeeze(0)), traj
+
+
+# TODO: check the sample_trajectories_rnn_with_predictions function as it does not really seem
+#  to return the complete logits or the next obs.
+
+# TODO: yes, it does, remove these two todos.
 
 
 def evaluate_rnn(
@@ -455,18 +464,34 @@ def update_actor_critic_rnn_with_predictions(
     reward_pred_coeff: float,
     update_grad: bool = True,
 ) -> Tuple[Tuple[chex.PRNGKey, TrainState], chex.ArrayTree]:
-    """PPO update with prediction losses for causal world model learning.
+
+    """
+    PPO update with prediction losses for causal world model learning.
 
     This extends update_actor_critic_rnn to also train the prediction heads:
     - Next observation prediction (MSE loss)
     - Next direction prediction (cross-entropy loss)
     - Reward prediction (MSE loss)
 
-    Args:
-        batch: (obs, actions, dones, log_probs, values, targets, advantages, next_obs, rewards)
-        pred_coeff: Weight for observation prediction loss
-        reward_pred_coeff: Weight for reward prediction loss
+    :param rng:
+    :param train_state:
+    :param init_hstate:
+    :param batch: (obs, actions, dones, log_probs, values, targets, advantages, next_obs, rewards)
+    :param num_envs:
+    :param n_steps:
+    :param n_minibatch:
+    :param n_epochs:
+    :param clip_eps:
+    :param entropy_coeff:
+    :param critic_coeff:
+    :param pred_coeff: Weight for observation prediction loss
+    :param reward_pred_coeff: Weight for reward prediction loss
+    :param update_grad:
+    :return:
     """
+
+    # TODO: complete the docstring when you get time
+
     obs, actions, dones, log_probs, values, targets, advantages, next_obs, rewards = batch
     last_dones = jnp.roll(dones, 1, axis=0).at[0].set(False)
     batch = obs, actions, last_dones, log_probs, values, targets, advantages, next_obs, rewards
@@ -494,17 +519,18 @@ def update_actor_critic_rnn_with_predictions(
                 l_vf = 0.5 * jnp.maximum((values_pred - targets) ** 2, (values_pred_clipped - targets) ** 2).mean()
 
                 # Prediction losses
-                # Next observation image prediction (MSE)
+
+                # First: Next observation image prediction (MSE)
                 l_pred_obs = jnp.mean((predictions['next_obs_image'] - next_obs.image) ** 2)
 
-                # Next direction prediction (cross-entropy)
+                # Second: Next direction prediction (cross-entropy)
                 next_dir_onehot = jax.nn.one_hot(next_obs.agent_dir, 4)
                 l_pred_dir = -jnp.mean(jnp.sum(
                     next_dir_onehot * jax.nn.log_softmax(predictions['next_obs_dir_logits']),
                     axis=-1
                 ))
 
-                # Reward prediction (MSE)
+                # Third: Reward prediction (MSE)
                 l_pred_reward = jnp.mean((predictions['reward'] - rewards) ** 2)
 
                 # Combined prediction loss
@@ -531,11 +557,15 @@ def update_actor_critic_rnn_with_predictions(
                     'l_pred_reward': l_pred_reward,
                 }
 
+            # TODO: data type changed, be careful
+
             grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
             (loss, loss_info), grads = grad_fn(train_state.params)
             if update_grad:
                 train_state = train_state.apply_gradients(grads=grads)
             return train_state, (loss, loss_info)
+
+        # TODO: carrying an extra loss_info, be careful
 
         rng, train_state = carry
         rng, rng_perm = jax.random.split(rng)
@@ -693,14 +723,18 @@ class ActorCriticWithPrediction(nn.Module):
         return nn.OptimizedLSTMCell(features=256).initialize_carry(jax.random.PRNGKey(0), (*batch_dims, 256))
 
 
-# =============================================================================
-# CAUSAL WORLD MODEL EXTRACTION
-# =============================================================================
+"""
+-----------------------------
+CAUSAL WORLD MODEL EXTRACTION
+-----------------------------
 
-# Define the causal variables we want to probe in the Maze environment
-# 'type' determines intervention behavior:
-#   - 'initial': Set once at episode start, let dynamics evolve naturally
-#   - 'persistent': Reset to target value after every step (for testing counterfactual "what if always at X")
+Define the causal variables we want to probe in the Maze environment
+'type' determines intervention behavior:
+  - 'initial': Set once at episode start, let dynamics evolve naturally
+  - 'persistent': Reset to target value after every step (for testing counterfactual "what if always at X")
+  
+"""
+
 CWM_VARIABLES = {
     'agent_x': {
         'type': 'initial',  # Set at start, let agent move naturally
@@ -744,7 +778,7 @@ def get_env_dimensions(env: UnderspecifiedEnv) -> Tuple[int, int]:
     return env.max_height, env.max_width
 
 
-def is_valid_position(wall_map: jnp.ndarray, x: int, y: int) -> bool:
+def is_valid_position(wall_map: jnp.ndarray, x: int, y: int) -> bool | Array:
     """Check if a position is valid (not a wall and within bounds).
 
     Args:
@@ -756,8 +790,10 @@ def is_valid_position(wall_map: jnp.ndarray, x: int, y: int) -> bool:
         True if position is valid (empty cell)
     """
     h, w = wall_map.shape
+
     if x < 0 or x >= w or y < 0 or y >= h:
         return False
+
     return wall_map[y, x] == 0
 
 
@@ -772,11 +808,13 @@ def get_valid_positions(wall_map: jnp.ndarray) -> list:
     """
     h, w = wall_map.shape
     valid = []
+
     # Skip border (always walls in Maze env)
     for y in range(1, h - 1):
         for x in range(1, w - 1):
             if wall_map[y, x] == 0:
                 valid.append((x, y))
+
     return valid
 
 
@@ -795,14 +833,17 @@ def get_variable_domain(var_name: str, env_size: int, num_values: int) -> list:
 
     if var_info['domain_type'] == 'discrete':
         return var_info['domain']
+
     elif var_info['domain_type'] == 'spatial':
         # Sample evenly spaced positions, avoiding walls at edges (1 to env_size-2)
         valid_range = env_size - 2  # Exclude border walls
+
         if num_values >= valid_range:
             return list(range(1, env_size - 1))
         else:
             step = valid_range // num_values
             return [1 + i * step for i in range(num_values)]
+
     else:
         raise ValueError(f"Unknown domain type: {var_info['domain_type']}")
 
@@ -819,14 +860,19 @@ def extract_env_state_variable(env_state: EnvState, var_name: str) -> jnp.ndarra
     """
     if var_name == 'agent_x':
         return env_state.agent_pos[0]
+
     elif var_name == 'agent_y':
         return env_state.agent_pos[1]
+
     elif var_name == 'agent_dir':
         return env_state.agent_dir
+
     elif var_name == 'goal_x':
         return env_state.goal_pos[0]
+
     elif var_name == 'goal_y':
         return env_state.goal_pos[1]
+
     else:
         raise ValueError(f"Unknown variable: {var_name}")
 
@@ -849,17 +895,22 @@ def apply_intervention_to_env_state(
     if var_name == 'agent_x':
         new_agent_pos = env_state.agent_pos.at[0].set(value)
         return env_state.replace(agent_pos=new_agent_pos)
+
     elif var_name == 'agent_y':
         new_agent_pos = env_state.agent_pos.at[1].set(value)
         return env_state.replace(agent_pos=new_agent_pos)
+
     elif var_name == 'agent_dir':
         return env_state.replace(agent_dir=value)
+
     elif var_name == 'goal_x':
         new_goal_pos = env_state.goal_pos.at[0].set(value)
         return env_state.replace(goal_pos=new_goal_pos)
+
     elif var_name == 'goal_y':
         new_goal_pos = env_state.goal_pos.at[1].set(value)
         return env_state.replace(goal_pos=new_goal_pos)
+
     else:
         raise ValueError(f"Unknown variable: {var_name}")
 
