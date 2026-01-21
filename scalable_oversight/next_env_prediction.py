@@ -19,10 +19,15 @@ from enum import IntEnum
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server environments
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
 
 from jaxued.environments.underspecified_env import EnvParams, EnvState, Observation, UnderspecifiedEnv
 from jaxued.linen import ResetRNN
+from jaxued.environments import Maze, MazeRenderer
+from jaxued.environments.maze import Level, make_level_generator, make_level_mutator_minimax
+from jaxued.environments.maze.env import Observation as MazeObservation
+from jaxued.level_sampler import LevelSampler
+from jaxued.utils import max_mc, positive_value_loss, compute_max_returns
+from jaxued.wrappers import AutoReplayWrapper
 
 # =============================================================================
 # CURRICULUM PREDICTION CONSTANTS
@@ -38,12 +43,6 @@ DEFAULT_CURRICULUM_HIDDEN_SIZE = 128
 
 # Calibration computation
 DEFAULT_CALIBRATION_BINS = 10
-
-# Note: Loss weights for curriculum prediction components (wall, goal, agent_pos, agent_dir)
-# are configurable via CLI arguments. No default weights are hardcoded here to avoid
-# unjustified assumptions about relative importance. Users should tune based on empirical
-# results or use equal weighting (1.0 for all) as a starting point.
-
 
 # =============================================================================
 # CURRICULUM STATE FOR CROSS-EPISODE MEMORY
@@ -186,7 +185,8 @@ def get_curriculum_features(
 
     # Normalize training progress
     normalized_step = curriculum_state.training_step / 30000.0  # Assume 30k max steps
-    # Avoid division by zero - use safe division
+    # TODO: 30k max steps is an assumption here, this should be changed according to the steps we actually run for
+
     safe_training_step = jnp.maximum(curriculum_state.training_step, 1)
     replay_fraction = curriculum_state.total_replay_steps / safe_training_step
 
@@ -1201,14 +1201,6 @@ def create_position_prediction_heatmap(
 # =============================================================================
 # JAXUED IMPORTS AND EXISTING CODE
 # =============================================================================
-
-from jaxued.environments import Maze, MazeRenderer
-from jaxued.environments.maze import Level, make_level_generator, make_level_mutator_minimax
-from jaxued.environments.maze.env import Observation as MazeObservation
-from jaxued.level_sampler import LevelSampler
-from jaxued.utils import max_mc, positive_value_loss, compute_max_returns
-from jaxued.wrappers import AutoReplayWrapper
-
 
 class UpdateState(IntEnum):
     DR = 0
