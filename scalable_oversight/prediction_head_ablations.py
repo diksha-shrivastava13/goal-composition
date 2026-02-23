@@ -2601,8 +2601,14 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                             zc_masked_mean = zc_vals
                         log_dict[f"curriculum_pred/{branch_name}/{zc_key}"] = float(zc_masked_mean)
 
-                    # Experiment III: Goal displacement from buffer centroid (kept)
-                    for gd_metric in ["goal_distance_from_centroid", "goal_prob_at_actual", "goal_prediction_correct"]:
+                    # Experiment III: Goal displacement from buffer centroid
+                    # Distance as histogram (distribution matters), others as line (trends)
+                    gd_dist_vals = pred_metrics.get("goal_distance_from_centroid", None)
+                    if gd_dist_vals is not None and hasattr(gd_dist_vals, 'shape') and gd_dist_vals.shape:
+                        branch_gd = np.array(gd_dist_vals)[np.array(mask)]
+                        if len(branch_gd) > 0:
+                            log_dict[f"curriculum_pred/{branch_name}/goal_distance_from_centroid"] = wandb.Histogram(branch_gd)
+                    for gd_metric in ["goal_prob_at_actual", "goal_prediction_correct"]:
                         gd_vals = pred_metrics.get(gd_metric, jnp.array([0.0]))
                         if hasattr(gd_vals, 'shape') and gd_vals.shape:
                             gd_masked_mean = (gd_vals * mask).sum() / count
@@ -2611,14 +2617,20 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                         log_dict[f"curriculum_pred/{branch_name}/{gd_metric}"] = float(gd_masked_mean)
 
                     # Experiment III: Comprehensive batch displacement metrics per branch
-                    # Pairwise metrics as histograms (distribution of per-step values)
-                    for var in ["wall_map_hamming", "goal_pos_l2", "agent_pos_l2", "agent_dir_changed"]:
+                    # Pairwise metrics: histograms for continuous, fraction for binary
+                    for var in ["wall_map_hamming", "goal_pos_l2", "agent_pos_l2"]:
                         key = f"pairwise/{var}/mean"
                         vals = pred_metrics.get(key, None)
                         if vals is not None and hasattr(vals, 'shape') and vals.shape:
                             branch_vals = np.array(vals)[np.array(mask)]
                             if len(branch_vals) > 0:
                                 log_dict[f"curriculum_pred/{branch_name}/pairwise_hist/{var}"] = wandb.Histogram(branch_vals)
+                    # Agent dir changed: fraction (binary, so histogram is meaningless)
+                    adc_vals = pred_metrics.get("pairwise/agent_dir_changed/mean", None)
+                    if adc_vals is not None and hasattr(adc_vals, 'shape') and adc_vals.shape:
+                        branch_adc = np.array(adc_vals)[np.array(mask)]
+                        if len(branch_adc) > 0:
+                            log_dict[f"curriculum_pred/{branch_name}/pairwise/agent_dir_changed_frac"] = float(branch_adc.mean())
                     # Batch-level metrics as histograms
                     for metric in ["wall_density_shift", "wall_iou", "goal_centroid_shift",
                                    "agent_pos_centroid_shift", "agent_dir_distribution_shift"]:
@@ -2674,7 +2686,6 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                     denom = max(np.sqrt(((rx - mx)**2).sum() * ((ry - my)**2).sum()), 1e-8)
                     spearman = float(cov / denom)
                     log_dict[f"curriculum_pred/{branch_name}/corr/{var_name}_spearman"] = spearman
-                    log_dict[f"curriculum_pred/{branch_name}/corr/{var_name}_n"] = n
 
                     if var_name == "agent_dir":
                         # Bar chart: mean loss for dir_unchanged vs dir_changed
@@ -2784,8 +2795,8 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                             env_height=env_max_height, env_width=env_max_width,
                         )
                         for zone_name in ['observed', 'adjacent', 'distant']:
-                            for metric_suffix in ['loss', 'accuracy', 'baseline_accuracy',
-                                                   'accuracy_above_baseline', 'wall_density', 'cell_count']:
+                            for metric_suffix in ['accuracy', 'baseline_accuracy',
+                                                   'accuracy_above_baseline', 'wall_density']:
                                 key = f'{zone_name}_{metric_suffix}'
                                 log_dict[f"curriculum_pred/zones/{zone_name}/{metric_suffix}"] = float(zone_metrics[key])
                     except Exception as e:
