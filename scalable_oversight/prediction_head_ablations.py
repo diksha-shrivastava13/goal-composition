@@ -2497,10 +2497,15 @@ def main(config=None, project="JaxUED-minigrid-maze"):
         wandb.define_metric("curriculum_pred/openendedness/*", step_metric="num_updates")
         wandb.define_metric("curriculum_state/*", step_metric="num_updates")
 
-    # Rolling correlation accumulator (persists across log_eval calls)
-    # Keys: (branch_id, disp_key, loss_key) -> {sum_x, sum_y, sum_xy, sum_x2, sum_y2, n}
-    corr_accum = defaultdict(lambda: {'sum_x': 0.0, 'sum_y': 0.0, 'sum_xy': 0.0,
-                                       'sum_x2': 0.0, 'sum_y2': 0.0, 'n': 0})
+    # Scatter plot accumulator (persists across log_eval calls)
+    # Keys: (branch_id, var_name) -> list of [displacement, loss] pairs
+    scatter_accum = defaultdict(list)
+    scatter_pairings = [
+        ("pairwise/wall_map_hamming/mean", "wall_loss", "wall"),
+        ("pairwise/goal_pos_l2/mean", "goal_loss", "goal"),
+        ("pairwise/agent_pos_l2/mean", "agent_pos_loss", "agent_pos"),
+        ("pairwise/agent_dir_changed/mean", "agent_dir_loss", "agent_dir"),
+    ]
 
     def log_eval(stats, train_state_info, train_state=None):
         print(f"Logging update: {stats['update_count']}")
@@ -2606,79 +2611,93 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                         log_dict[f"curriculum_pred/{branch_name}/{gd_metric}"] = float(gd_masked_mean)
 
                     # Experiment III: Comprehensive batch displacement metrics per branch
-                    # Pairwise metrics (mean/min/max)
+                    # Pairwise metrics as histograms (distribution of per-step values)
                     for var in ["wall_map_hamming", "goal_pos_l2", "agent_pos_l2", "agent_dir_changed"]:
-                        for stat in ["mean", "min", "max"]:
-                            key = f"pairwise/{var}/{stat}"
-                            vals = pred_metrics.get(key, jnp.array([0.0]))
-                            if hasattr(vals, 'shape') and vals.shape:
-                                masked_val = (vals * mask).sum() / count
-                            else:
-                                masked_val = vals
-                            log_dict[f"curriculum_pred/{branch_name}/{key}"] = float(masked_val)
-                    # Batch-level metrics
+                        key = f"pairwise/{var}/mean"
+                        vals = pred_metrics.get(key, None)
+                        if vals is not None and hasattr(vals, 'shape') and vals.shape:
+                            branch_vals = np.array(vals)[np.array(mask)]
+                            if len(branch_vals) > 0:
+                                log_dict[f"curriculum_pred/{branch_name}/pairwise_hist/{var}"] = wandb.Histogram(branch_vals)
+                    # Batch-level metrics as histograms
                     for metric in ["wall_density_shift", "wall_iou", "goal_centroid_shift",
                                    "agent_pos_centroid_shift", "agent_dir_distribution_shift"]:
                         key = f"batch/{metric}"
-                        vals = pred_metrics.get(key, jnp.array([0.0]))
-                        if hasattr(vals, 'shape') and vals.shape:
-                            masked_val = (vals * mask).sum() / count
-                        else:
-                            masked_val = vals
-                        log_dict[f"curriculum_pred/{branch_name}/{key}"] = float(masked_val)
+                        vals = pred_metrics.get(key, None)
+                        if vals is not None and hasattr(vals, 'shape') and vals.shape:
+                            branch_vals = np.array(vals)[np.array(mask)]
+                            if len(branch_vals) > 0:
+                                log_dict[f"curriculum_pred/{branch_name}/batch_hist/{metric}"] = wandb.Histogram(branch_vals)
 
-            # Displacement-vs-loss rolling correlation (per branch)
-            # Uses sufficient statistics accumulated across all eval windows
-            displacement_keys = [
-                "pairwise/wall_map_hamming/mean", "pairwise/goal_pos_l2/mean",
-                "pairwise/agent_pos_l2/mean", "pairwise/agent_dir_changed/mean",
-                "batch/wall_density_shift", "batch/goal_centroid_shift",
-                "batch/agent_pos_centroid_shift",
-            ]
-            loss_keys = ["wall_loss", "goal_loss", "agent_pos_loss", "agent_dir_loss", "total_loss"]
+            # Displacement-vs-loss: accumulate points, scatter plots, Spearman correlation
+            # Uses 4 natural pairings only (not the 7x5 cross-product)
             for branch_id, branch_name in branch_names.items():
                 mask = (branches == branch_id)
                 count = int(mask.sum())
                 if count == 0:
                     continue
-                for disp_key in displacement_keys:
-                    disp_vals = pred_metrics.get(disp_key, None)
-                    if disp_vals is None or not hasattr(disp_vals, 'shape') or not disp_vals.shape:
-                        continue
-                    for loss_key in loss_keys:
-                        loss_vals = pred_metrics.get(loss_key, None)
-                        if loss_vals is None or not hasattr(loss_vals, 'shape') or not loss_vals.shape:
-                            continue
-                        # Update rolling sufficient statistics with this window's data
-                        acc = corr_accum[(branch_id, disp_key, loss_key)]
-                        # Extract per-step values for this branch
-                        d_arr = np.array(disp_vals)
-                        l_arr = np.array(loss_vals)
-                        m_arr = np.array(mask)
-                        for i in range(len(d_arr)):
-                            if m_arr[i]:
-                                x, y = float(d_arr[i]), float(l_arr[i])
-                                acc['sum_x'] += x
-                                acc['sum_y'] += y
-                                acc['sum_xy'] += x * y
-                                acc['sum_x2'] += x * x
-                                acc['sum_y2'] += y * y
-                                acc['n'] += 1
 
-                        # Compute correlation from accumulated stats
-                        n = acc['n']
-                        if n > 10:  # Need enough points for meaningful correlation
-                            mean_x = acc['sum_x'] / n
-                            mean_y = acc['sum_y'] / n
-                            var_x = acc['sum_x2'] / n - mean_x ** 2
-                            var_y = acc['sum_y2'] / n - mean_y ** 2
-                            cov_xy = acc['sum_xy'] / n - mean_x * mean_y
-                            denom = max(np.sqrt(max(var_x, 0.0) * max(var_y, 0.0)), 1e-8)
-                            corr = cov_xy / denom
-                            disp_short = disp_key.split("/")[-1] if "/" in disp_key else disp_key
-                            loss_short = loss_key.replace("_loss", "")
-                            log_dict[f"curriculum_pred/{branch_name}/corr/{disp_short}_vs_{loss_short}"] = float(corr)
-                            log_dict[f"curriculum_pred/{branch_name}/corr/{disp_short}_vs_{loss_short}_n"] = n
+                # Accumulate scatter plot points for this branch
+                for disp_key, loss_key, var_name in scatter_pairings:
+                    disp_vals = pred_metrics.get(disp_key, None)
+                    loss_vals = pred_metrics.get(loss_key, None)
+                    if (disp_vals is None or not hasattr(disp_vals, 'shape') or not disp_vals.shape
+                            or loss_vals is None or not hasattr(loss_vals, 'shape') or not loss_vals.shape):
+                        continue
+                    d_arr = np.array(disp_vals)
+                    l_arr = np.array(loss_vals)
+                    m_arr = np.array(mask)
+                    for i in range(len(d_arr)):
+                        if m_arr[i]:
+                            scatter_accum[(branch_id, var_name)].append(
+                                [float(d_arr[i]), float(l_arr[i])]
+                            )
+
+                # Log scatter plots (continuous vars) and bar chart (agent_dir)
+                for disp_key, loss_key, var_name in scatter_pairings:
+                    points = scatter_accum.get((branch_id, var_name))
+                    if not points or len(points) < 2:
+                        continue
+                    arr = np.array(points)
+                    xs, ys = arr[:, 0], arr[:, 1]
+
+                    # Compute Spearman rank correlation
+                    def _rankdata(a):
+                        order = np.argsort(a)
+                        ranks = np.empty_like(order, dtype=float)
+                        ranks[order] = np.arange(1, len(a) + 1, dtype=float)
+                        return ranks
+                    n = len(xs)
+                    rx, ry = _rankdata(xs), _rankdata(ys)
+                    mx, my = rx.mean(), ry.mean()
+                    cov = ((rx - mx) * (ry - my)).sum()
+                    denom = max(np.sqrt(((rx - mx)**2).sum() * ((ry - my)**2).sum()), 1e-8)
+                    spearman = float(cov / denom)
+                    log_dict[f"curriculum_pred/{branch_name}/corr/{var_name}_spearman"] = spearman
+                    log_dict[f"curriculum_pred/{branch_name}/corr/{var_name}_n"] = n
+
+                    if var_name == "agent_dir":
+                        # Bar chart: mean loss for dir_unchanged vs dir_changed
+                        unchanged_losses = ys[xs == 0.0]
+                        changed_losses = ys[xs > 0.0]
+                        bar_data = []
+                        if len(unchanged_losses) > 0:
+                            bar_data.append(["dir_unchanged", float(unchanged_losses.mean())])
+                        if len(changed_losses) > 0:
+                            bar_data.append(["dir_changed", float(changed_losses.mean())])
+                        if bar_data:
+                            bar_table = wandb.Table(data=bar_data, columns=["condition", "mean_loss"])
+                            log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.plot.bar(
+                                bar_table, "condition", "mean_loss",
+                                title=f"{branch_name}: agent_dir_loss by direction change (rho={spearman:.3f}, n={n})"
+                            )
+                    else:
+                        # Scatter plot for continuous displacement variables
+                        table = wandb.Table(data=points, columns=["displacement", "loss"])
+                        log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.plot.scatter(
+                            table, "displacement", "loss",
+                            title=f"{branch_name}: {var_name} displacement vs {loss_key} (rho={spearman:.3f}, n={n})"
+                        )
 
         # Curriculum state metrics (if enabled)
         if config.get("use_curriculum_prediction", False) and train_state is not None and train_state.curriculum_state is not None:
