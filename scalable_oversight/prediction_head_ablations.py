@@ -2498,7 +2498,7 @@ def main(config=None, project="JaxUED-minigrid-maze"):
         wandb.define_metric("curriculum_state/*", step_metric="num_updates")
 
     # Scatter plot accumulator (persists across log_eval calls)
-    # Keys: (branch_id, var_name) -> list of [displacement, loss] pairs
+    # Keys: (branch_id, var_name) -> list of [displacement, loss, update_step] triples
     scatter_accum = defaultdict(list)
     scatter_pairings = [
         ("pairwise/wall_map_hamming/mean", "wall_loss", "wall"),
@@ -2506,6 +2506,7 @@ def main(config=None, project="JaxUED-minigrid-maze"):
         ("pairwise/agent_pos_l2/mean", "agent_pos_loss", "agent_pos"),
         ("pairwise/agent_dir_changed/mean", "agent_dir_loss", "agent_dir"),
     ]
+    max_training_updates = config.get("num_updates", 50000)
 
     def log_eval(stats, train_state_info, train_state=None):
         print(f"Logging update: {stats['update_count']}")
@@ -2650,6 +2651,7 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                     continue
 
                 # Accumulate scatter plot points for this branch
+                current_update = stats.get("update_count", 0)
                 for disp_key, loss_key, var_name in scatter_pairings:
                     disp_vals = pred_metrics.get(disp_key, None)
                     loss_vals = pred_metrics.get(loss_key, None)
@@ -2662,7 +2664,7 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                     for i in range(len(d_arr)):
                         if m_arr[i]:
                             scatter_accum[(branch_id, var_name)].append(
-                                [float(d_arr[i]), float(l_arr[i])]
+                                [float(d_arr[i]), float(l_arr[i]), float(current_update)]
                             )
 
                 # Log scatter plots (continuous vars) and bar chart (agent_dir)
@@ -2671,7 +2673,7 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                     if not points or len(points) < 2:
                         continue
                     arr = np.array(points)
-                    xs, ys = arr[:, 0], arr[:, 1]
+                    xs, ys, steps = arr[:, 0], arr[:, 1], arr[:, 2]
 
                     # Compute Spearman rank correlation
                     def _rankdata(a):
@@ -2691,24 +2693,34 @@ def main(config=None, project="JaxUED-minigrid-maze"):
                         # Bar chart: mean loss for dir_unchanged vs dir_changed
                         unchanged_losses = ys[xs == 0.0]
                         changed_losses = ys[xs > 0.0]
-                        bar_data = []
+                        labels, values = [], []
                         if len(unchanged_losses) > 0:
-                            bar_data.append(["dir_unchanged", float(unchanged_losses.mean())])
+                            labels.append("dir_unchanged")
+                            values.append(float(unchanged_losses.mean()))
                         if len(changed_losses) > 0:
-                            bar_data.append(["dir_changed", float(changed_losses.mean())])
-                        if bar_data:
-                            bar_table = wandb.Table(data=bar_data, columns=["condition", "mean_loss"])
-                            log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.plot.bar(
-                                bar_table, "condition", "mean_loss",
-                                title=f"{branch_name}: agent_dir_loss by direction change (rho={spearman:.3f}, n={n})"
-                            )
+                            labels.append("dir_changed")
+                            values.append(float(changed_losses.mean()))
+                        if labels:
+                            fig, ax = plt.subplots(1, 1, figsize=(4, 3))
+                            ax.bar(labels, values, color=['#4a90d9', '#d94a4a'])
+                            ax.set_ylabel('Mean Loss')
+                            ax.set_title(f"{branch_name}: agent_dir by dir change (rho={spearman:.3f}, n={n})")
+                            fig.tight_layout()
+                            log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
+                            plt.close(fig)
                     else:
-                        # Scatter plot for continuous displacement variables
-                        table = wandb.Table(data=points, columns=["displacement", "loss"])
-                        log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.plot.scatter(
-                            table, "displacement", "loss",
-                            title=f"{branch_name}: {var_name} displacement vs {loss_key} (rho={spearman:.3f}, n={n})"
-                        )
+                        # Scatter plot with temporal colour gradient
+                        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+                        sc = ax.scatter(xs, ys, c=steps, cmap='Reds', s=12, alpha=0.7,
+                                        vmin=0, vmax=max_training_updates, edgecolors='none')
+                        cbar = plt.colorbar(sc, ax=ax)
+                        cbar.set_label('Training Update')
+                        ax.set_xlabel(f'{var_name} displacement')
+                        ax.set_ylabel(loss_key)
+                        ax.set_title(f"{branch_name}: {var_name} vs {loss_key} (rho={spearman:.3f}, n={n})")
+                        fig.tight_layout()
+                        log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
+                        plt.close(fig)
 
         # Curriculum state metrics (if enabled)
         if config.get("use_curriculum_prediction", False) and train_state is not None and train_state.curriculum_state is not None:
