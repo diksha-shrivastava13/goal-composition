@@ -2473,7 +2473,7 @@ def main(config=None, project="JaxUED-minigrid-maze"):
     else:
         tags.append("PLR")
 
-    run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
+    run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags, mode="offline")
     config = wandb.config
 
     wandb.define_metric("num_updates")
