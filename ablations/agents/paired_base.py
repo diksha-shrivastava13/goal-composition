@@ -79,6 +79,8 @@ from ..common.metrics import (
     compute_agent_learnability_from_tracking,
     compute_agent_openendedness_from_tracking,
     update_agent_tracking,
+    # Displacement metrics
+    compute_batch_displacement_metrics,
 )
 from ..common.visualization import (
     create_regret_dynamics_plot,
@@ -92,6 +94,7 @@ from ..common.visualization import (
     create_information_content_dashboard,
     create_novelty_learnability_plot,
     create_correlation_scatter_plot,
+    build_curriculum_pred_log_dict,
 )
 from ..common.utils import setup_checkpointing, flatten_hstate
 
@@ -384,6 +387,7 @@ class PAIREDBaseAgent(ABC):
         metrics.update(eval_metrics)
 
         metrics["update_count"] = train_state.update_count
+        metrics["max_updates"] = jnp.float32(self.config.get("num_updates", 50000))
 
         return (rng, train_state), metrics
 
@@ -418,6 +422,11 @@ class PAIREDBaseAgent(ABC):
 
         # Extract generated levels from adversary's final state
         levels = adv_extras["last_env_state"].level
+
+        # Compute displacement from previous adversary-generated levels
+        # On first step, last_adversary_level is None so compare with self (zero displacement)
+        prev_levels = train_state.last_adversary_level if train_state.last_adversary_level is not None else levels
+        displacement = compute_batch_displacement_metrics(levels, prev_levels)
 
         # 2. Protagonist rollout
         rng, rng_pro = jax.random.split(rng)
@@ -522,9 +531,10 @@ class PAIREDBaseAgent(ABC):
         probe_opt_state = train_state.probe_opt_state
         probe_tracking = train_state.probe_tracking
 
+        probe_loss = jnp.float32(0.0)
         if probe_params is not None:
             rng, probe_rng = jax.random.split(rng)
-            probe_params, probe_opt_state, probe_tracking = self._update_probe(
+            probe_params, probe_opt_state, probe_tracking, probe_loss = self._update_probe(
                 probe_rng, probe_params, probe_opt_state, probe_tracking,
                 pro_extras["final_hstate"], levels,
                 pro_extras["rewards"], pro_extras["dones"],
@@ -543,6 +553,9 @@ class PAIREDBaseAgent(ABC):
             "est_regret": est_regret,
             "pro_eps": pro_eps,
             "ant_eps": ant_eps,
+            "displacement": displacement,
+            "branch": jnp.int32(3),  # adversary branch
+            "probe_loss": probe_loss,
         }
 
         # Update PAIRED-specific history tracking
@@ -620,6 +633,8 @@ class PAIREDBaseAgent(ABC):
             level_history_wall_maps=new_level_history,
             history_ptr=history_ptr,
             history_total=history_total,
+            # Displacement tracking
+            last_adversary_level=levels,
         )
 
         return (rng, train_state), metrics
@@ -881,7 +896,7 @@ class PAIREDBaseAgent(ABC):
                 is_per_instance_valid=new_is_valid,
             )
 
-        return new_probe_params, new_opt_state, probe_tracking
+        return new_probe_params, new_opt_state, probe_tracking, loss
 
     def evaluate(
         self,
@@ -1251,6 +1266,15 @@ class PAIREDBaseAgent(ABC):
             log_dict["paired/openendedness/learnability"] = openendedness['learnability']
             log_dict["paired/openendedness/interestingness"] = openendedness['interestingness']
             log_dict["paired/openendedness/score"] = openendedness['openendedness_score']
+
+        # =====================================================================
+        # DISPLACEMENT + ZONE METRICS (curriculum_pred/)
+        # =====================================================================
+        try:
+            curriculum_log = build_curriculum_pred_log_dict(metrics, train_state)
+            log_dict.update(curriculum_log)
+        except Exception:
+            pass
 
         # =====================================================================
         # VISUALIZATIONS (every eval call)

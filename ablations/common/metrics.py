@@ -439,6 +439,8 @@ def compute_curriculum_prediction_loss(
     agent_dir_weight: float = 1.0,
     env_height: int = DEFAULT_ENV_HEIGHT,
     env_width: int = DEFAULT_ENV_WIDTH,
+    wall_mask=None,
+    wall_loss_region: str = "full",
 ) -> Tuple[jnp.ndarray, dict]:
     """
     Compute loss between predicted distributions and actual level.
@@ -458,6 +460,12 @@ def compute_curriculum_prediction_loss(
         agent_dir_weight: Weight for agent direction loss
         env_height: Environment height
         env_width: Environment width
+        wall_mask: Optional (H, W) boolean observed mask from previous trajectory.
+            Used both for training region masking and zone evaluation.
+        wall_loss_region: Training mask region. One of:
+            "full" - all cells (default, original behavior)
+            "explored" - only cells observed in previous trajectory
+            "frontier" - observed + adjacent cells (explored bubble)
 
     Returns:
         total_loss: Weighted sum of all losses
@@ -469,7 +477,70 @@ def compute_curriculum_prediction_loss(
         predictions['wall_logits'],
         wall_targets
     )
-    wall_loss = wall_bce.mean()
+
+    # Apply training region mask if provided
+    if wall_mask is not None and wall_loss_region != "full":
+        observed_f = wall_mask.astype(jnp.float32)
+        if wall_loss_region == "explored":
+            region_mask = observed_f
+        else:  # "frontier" = observed + adjacent (1-cell dilation)
+            padded = jnp.pad(wall_mask, 1, mode='constant', constant_values=False)
+            dilated = (
+                padded[1:-1, 1:-1] | padded[0:-2, 1:-1] | padded[2:, 1:-1] |
+                padded[1:-1, 0:-2] | padded[1:-1, 2:]
+            )
+            region_mask = dilated.astype(jnp.float32)
+        mask_sum = jnp.maximum(region_mask.sum(), 1.0)
+        wall_loss = (wall_bce * region_mask).sum() / mask_sum
+    else:
+        wall_loss = wall_bce.mean()
+
+    # Zone evaluation losses (always computed when mask is available)
+    if wall_mask is not None:
+        observed_f = wall_mask.astype(jnp.float32)
+        # Adjacent: 1-cell dilation minus observed
+        padded = jnp.pad(wall_mask, 1, mode='constant', constant_values=False)
+        dilated = (
+            padded[1:-1, 1:-1] | padded[0:-2, 1:-1] | padded[2:, 1:-1] |
+            padded[1:-1, 0:-2] | padded[1:-1, 2:]
+        )
+        adjacent_f = (dilated & ~wall_mask).astype(jnp.float32)
+        distant_f = (~dilated).astype(jnp.float32)
+
+        obs_sum = jnp.maximum(observed_f.sum(), 1.0)
+        adj_sum = jnp.maximum(adjacent_f.sum(), 1.0)
+        dist_sum = jnp.maximum(distant_f.sum(), 1.0)
+
+        zone_observed_loss = (wall_bce * observed_f).sum() / obs_sum
+        zone_adjacent_loss = (wall_bce * adjacent_f).sum() / adj_sum
+        zone_distant_loss = (wall_bce * distant_f).sum() / dist_sum
+
+        # Zone coverage fractions
+        total_cells = jnp.float32(env_height * env_width)
+        observed_frac = observed_f.sum() / total_cells
+        adjacent_frac = adjacent_f.sum() / total_cells
+        distant_frac = distant_f.sum() / total_cells
+
+        # Zone membership for goal and agent positions
+        goal_y, goal_x = actual_level.goal_pos[1], actual_level.goal_pos[0]
+        agent_y, agent_x = actual_level.agent_pos[1], actual_level.agent_pos[0]
+        goal_in_observed = wall_mask[goal_y, goal_x].astype(jnp.float32)
+        goal_in_adjacent = (dilated & ~wall_mask)[goal_y, goal_x].astype(jnp.float32)
+        goal_in_distant = (~dilated)[goal_y, goal_x].astype(jnp.float32)
+        agent_in_observed = wall_mask[agent_y, agent_x].astype(jnp.float32)
+        agent_in_distant = (~dilated)[agent_y, agent_x].astype(jnp.float32)
+    else:
+        zone_observed_loss = wall_bce.mean()
+        zone_adjacent_loss = wall_bce.mean()
+        zone_distant_loss = wall_bce.mean()
+        goal_in_observed = jnp.float32(1.0)
+        goal_in_adjacent = jnp.float32(0.0)
+        goal_in_distant = jnp.float32(0.0)
+        agent_in_observed = jnp.float32(1.0)
+        agent_in_distant = jnp.float32(0.0)
+        observed_frac = jnp.float32(1.0)
+        adjacent_frac = jnp.float32(0.0)
+        distant_frac = jnp.float32(0.0)
 
     # Goal position loss: Cross-entropy over flattened grid
     goal_idx = actual_level.goal_pos[1] * env_width + actual_level.goal_pos[0]
@@ -510,6 +581,20 @@ def compute_curriculum_prediction_loss(
         'goal_nll': goal_loss,
         'agent_pos_nll': agent_pos_loss,
         'agent_dir_nll': agent_dir_loss,
+        # Zone evaluation losses (always present)
+        'zone_loss/observed': zone_observed_loss,
+        'zone_loss/adjacent': zone_adjacent_loss,
+        'zone_loss/distant': zone_distant_loss,
+        # Zone membership for positions
+        'zone_membership/goal_in_observed': goal_in_observed,
+        'zone_membership/goal_in_adjacent': goal_in_adjacent,
+        'zone_membership/goal_in_distant': goal_in_distant,
+        'zone_membership/agent_in_observed': agent_in_observed,
+        'zone_membership/agent_in_distant': agent_in_distant,
+        # Zone coverage fractions
+        'zone_coverage/observed_frac': observed_frac,
+        'zone_coverage/adjacent_frac': adjacent_frac,
+        'zone_coverage/distant_frac': distant_frac,
     }
 
     return total_loss, metrics
@@ -2033,3 +2118,272 @@ def update_agent_tracking(
         buffer_ptr=(ptr + 1) % buffer_size,
         total_samples=agent_tracking.total_samples + 1,
     )
+
+
+# =============================================================================
+# DISPLACEMENT METRICS (ported from scalable_oversight)
+# =============================================================================
+
+def compute_batch_displacement_metrics(
+    current_batch,
+    previous_batch,
+    env_height=DEFAULT_ENV_HEIGHT,
+    env_width=DEFAULT_ENV_WIDTH,
+):
+    """
+    Compute comprehensive displacement metrics between consecutive level batches
+    for the same branch. Measures how much levels change between consecutive steps.
+
+    All operations are JAX-compatible (runs inside jit).
+
+    Args:
+        current_batch: Level batch (N levels) from current step
+        previous_batch: Level batch (N levels) from previous step for same branch
+        env_height: Grid height
+        env_width: Grid width
+
+    Returns:
+        Dict with pairwise and batch-level displacement metrics
+    """
+    # =====================================================================
+    # Category A: Pairwise distances (level[i] in prev vs level[i] in current)
+    # =====================================================================
+
+    # Wall map hamming: fraction of cells that differ, per level pair
+    curr_walls = current_batch.wall_map.astype(jnp.float32)   # (N, H, W)
+    prev_walls = previous_batch.wall_map.astype(jnp.float32)  # (N, H, W)
+    total_cells = env_height * env_width
+    wall_hamming_per_level = jnp.abs(curr_walls - prev_walls).sum(axis=(-2, -1)) / total_cells  # (N,)
+
+    # Goal position L2 distance per level pair
+    curr_goal = current_batch.goal_pos.astype(jnp.float32)    # (N, 2)
+    prev_goal = previous_batch.goal_pos.astype(jnp.float32)   # (N, 2)
+    goal_l2_per_level = jnp.sqrt(
+        (curr_goal[:, 0] - prev_goal[:, 0]) ** 2 +
+        (curr_goal[:, 1] - prev_goal[:, 1]) ** 2
+    )  # (N,)
+
+    # Agent position L2 distance per level pair
+    curr_agent = current_batch.agent_pos.astype(jnp.float32)  # (N, 2)
+    prev_agent = previous_batch.agent_pos.astype(jnp.float32) # (N, 2)
+    agent_l2_per_level = jnp.sqrt(
+        (curr_agent[:, 0] - prev_agent[:, 0]) ** 2 +
+        (curr_agent[:, 1] - prev_agent[:, 1]) ** 2
+    )  # (N,)
+
+    # Agent direction changed (binary per pair)
+    curr_dir = current_batch.agent_dir.astype(jnp.int32)      # (N,)
+    prev_dir = previous_batch.agent_dir.astype(jnp.int32)     # (N,)
+    agent_dir_changed_per_level = (curr_dir != prev_dir).astype(jnp.float32)  # (N,)
+
+    # =====================================================================
+    # Category B: Batch statistics shift
+    # =====================================================================
+
+    # Wall density shift: |mean wall density of current - mean wall density of prev|
+    curr_wall_density = curr_walls.mean(axis=(-2, -1))  # (N,)
+    prev_wall_density = prev_walls.mean(axis=(-2, -1))  # (N,)
+    wall_density_shift = jnp.abs(curr_wall_density.mean() - prev_wall_density.mean())
+
+    # Wall IoU: intersection-over-union averaged across batch
+    intersection = (curr_walls * prev_walls).sum(axis=(-2, -1))  # (N,)
+    union = jnp.clip(curr_walls + prev_walls, 0.0, 1.0).sum(axis=(-2, -1))  # (N,)
+    iou_per_level = intersection / jnp.maximum(union, 1.0)  # (N,)
+    wall_iou = iou_per_level.mean()
+
+    # Goal centroid shift: L2 between mean goal pos of current vs prev batch
+    curr_goal_centroid = curr_goal.mean(axis=0)  # (2,)
+    prev_goal_centroid = prev_goal.mean(axis=0)  # (2,)
+    goal_centroid_shift = jnp.sqrt(
+        (curr_goal_centroid[0] - prev_goal_centroid[0]) ** 2 +
+        (curr_goal_centroid[1] - prev_goal_centroid[1]) ** 2
+    )
+
+    # Agent position centroid shift
+    curr_agent_centroid = curr_agent.mean(axis=0)  # (2,)
+    prev_agent_centroid = prev_agent.mean(axis=0)  # (2,)
+    agent_pos_centroid_shift = jnp.sqrt(
+        (curr_agent_centroid[0] - prev_agent_centroid[0]) ** 2 +
+        (curr_agent_centroid[1] - prev_agent_centroid[1]) ** 2
+    )
+
+    # Agent direction distribution shift: total variation distance between 4-bin histograms
+    num_dirs = 4
+    curr_dir_hist = jnp.zeros(num_dirs)
+    prev_dir_hist = jnp.zeros(num_dirs)
+    n_levels = curr_dir.shape[0]
+    for d in range(num_dirs):
+        curr_dir_hist = curr_dir_hist.at[d].set((curr_dir == d).sum().astype(jnp.float32))
+        prev_dir_hist = prev_dir_hist.at[d].set((prev_dir == d).sum().astype(jnp.float32))
+    curr_dir_hist = curr_dir_hist / jnp.maximum(n_levels, 1)
+    prev_dir_hist = prev_dir_hist / jnp.maximum(n_levels, 1)
+    agent_dir_distribution_shift = 0.5 * jnp.abs(curr_dir_hist - prev_dir_hist).sum()
+
+    return {
+        # Pairwise metrics (mean/min/max)
+        'pairwise/wall_map_hamming/mean': wall_hamming_per_level.mean(),
+        'pairwise/wall_map_hamming/min': wall_hamming_per_level.min(),
+        'pairwise/wall_map_hamming/max': wall_hamming_per_level.max(),
+        'pairwise/goal_pos_l2/mean': goal_l2_per_level.mean(),
+        'pairwise/goal_pos_l2/min': goal_l2_per_level.min(),
+        'pairwise/goal_pos_l2/max': goal_l2_per_level.max(),
+        'pairwise/agent_pos_l2/mean': agent_l2_per_level.mean(),
+        'pairwise/agent_pos_l2/min': agent_l2_per_level.min(),
+        'pairwise/agent_pos_l2/max': agent_l2_per_level.max(),
+        'pairwise/agent_dir_changed/mean': agent_dir_changed_per_level.mean(),
+        'pairwise/agent_dir_changed/min': agent_dir_changed_per_level.min(),
+        'pairwise/agent_dir_changed/max': agent_dir_changed_per_level.max(),
+        # Batch-level metrics
+        'batch/wall_density_shift': wall_density_shift,
+        'batch/wall_iou': wall_iou,
+        'batch/goal_centroid_shift': goal_centroid_shift,
+        'batch/agent_pos_centroid_shift': agent_pos_centroid_shift,
+        'batch/agent_dir_distribution_shift': agent_dir_distribution_shift,
+    }
+
+
+# =============================================================================
+# ZONE MASK COMPUTATION (ported from scalable_oversight)
+# =============================================================================
+
+def compute_visited_mask_from_positions(
+    agent_positions,
+    agent_dirs,
+    agent_view_size,
+    env_height=DEFAULT_ENV_HEIGHT,
+    env_width=DEFAULT_ENV_WIDTH,
+):
+    """
+    Compute visited mask from trajectory agent positions and directions.
+    Uses dilated position mask to approximate the agent's view cone coverage.
+
+    Fully JIT-compatible. Returns a union mask across all envs and timesteps.
+
+    Args:
+        agent_positions: (T, N, 2) array of [x, y] positions
+        agent_dirs: (T, N) array of directions (0-3)
+        agent_view_size: agent's view size (e.g. 5)
+        env_height: grid height
+        env_width: grid width
+
+    Returns:
+        observed_mask: (H, W) boolean - cells observed by any env at any timestep
+        adjacent_mask: (H, W) boolean - 1-cell dilation of observed minus observed
+        distant_mask: (H, W) boolean - everything else
+    """
+    T, N = agent_positions.shape[:2]
+
+    # Mark all agent positions across all timesteps and envs
+    all_positions = agent_positions.reshape(-1, 2)  # (T*N, 2)
+    xs = all_positions[:, 0].astype(jnp.int32)
+    ys = all_positions[:, 1].astype(jnp.int32)
+
+    # Scatter agent positions into mask
+    flat_indices = ys * env_width + xs
+    mask_flat = jnp.zeros(env_height * env_width, dtype=jnp.bool_)
+    mask_flat = mask_flat.at[flat_indices].set(True)
+    position_mask = mask_flat.reshape(env_height, env_width)
+
+    # Dilate by agent_view_size // 2 to approximate view coverage
+    dilation_radius = agent_view_size // 2
+
+    def dilate_step(m, _):
+        padded = jnp.pad(m, 1, mode='constant', constant_values=False)
+        dilated = (
+            padded[1:-1, 1:-1] |  # center
+            padded[0:-2, 1:-1] |  # up
+            padded[2:, 1:-1]   |  # down
+            padded[1:-1, 0:-2] |  # left
+            padded[1:-1, 2:]      # right
+        )
+        return dilated, None
+
+    observed_mask, _ = jax.lax.scan(dilate_step, position_mask, None, length=dilation_radius)
+
+    # Adjacent: 1 more dilation minus observed
+    adjacent_dilated, _ = jax.lax.scan(dilate_step, observed_mask, None, length=1)
+    adjacent_mask = adjacent_dilated & ~observed_mask
+
+    # Distant: everything else
+    distant_mask = ~observed_mask & ~adjacent_mask
+
+    return observed_mask, adjacent_mask, distant_mask
+
+
+def compute_zone_decomposed_wall_metrics(
+    predictions,
+    actual_level,
+    observed_mask,
+    adjacent_mask,
+    distant_mask,
+    env_height=DEFAULT_ENV_HEIGHT,
+    env_width=DEFAULT_ENV_WIDTH,
+):
+    """
+    Decompose wall prediction metrics by visibility zone.
+
+    For each zone (observed, adjacent, distant), computes:
+    - loss: mean binary cross-entropy
+    - accuracy: fraction of correct wall/no-wall predictions
+    - baseline_accuracy: majority-class baseline
+    - accuracy_above_baseline: accuracy minus baseline
+    - wall_density: fraction of cells that are walls in this zone
+    - cell_count: number of cells in this zone
+
+    Args:
+        predictions: Dict with 'wall_logits' of shape (env_height, env_width)
+        actual_level: Level with wall_map
+        observed_mask: Boolean mask for observed cells
+        adjacent_mask: Boolean mask for adjacent cells
+        distant_mask: Boolean mask for distant cells
+        env_height: Grid height
+        env_width: Grid width
+
+    Returns:
+        Dict with {zone}_{metric} keys
+    """
+    wall_targets = actual_level.wall_map.astype(jnp.float32)
+    wall_logits = predictions['wall_logits']
+
+    # Per-cell binary cross-entropy
+    wall_bce = optax.sigmoid_binary_cross_entropy(wall_logits, wall_targets)
+
+    # Per-cell predictions
+    wall_probs = jax.nn.sigmoid(wall_logits)
+    wall_correct = ((wall_probs > 0.5) == wall_targets).astype(jnp.float32)
+
+    results = {}
+    zones = {
+        'observed': observed_mask,
+        'adjacent': adjacent_mask,
+        'distant': distant_mask,
+    }
+
+    for zone_name, mask in zones.items():
+        mask_f = mask.astype(jnp.float32)
+        cell_count = mask_f.sum()
+        safe_count = jnp.maximum(cell_count, 1.0)
+
+        # Mean loss in zone
+        zone_loss = (wall_bce * mask_f).sum() / safe_count
+
+        # Accuracy in zone
+        zone_accuracy = (wall_correct * mask_f).sum() / safe_count
+
+        # Wall density in zone
+        zone_wall_density = (wall_targets * mask_f).sum() / safe_count
+
+        # Majority-class baseline: predict whichever class is more common
+        zone_baseline = jnp.maximum(zone_wall_density, 1.0 - zone_wall_density)
+
+        # Accuracy above baseline
+        zone_above_baseline = zone_accuracy - zone_baseline
+
+        results[f'{zone_name}_loss'] = zone_loss
+        results[f'{zone_name}_accuracy'] = zone_accuracy
+        results[f'{zone_name}_baseline_accuracy'] = zone_baseline
+        results[f'{zone_name}_accuracy_above_baseline'] = zone_above_baseline
+        results[f'{zone_name}_wall_density'] = zone_wall_density
+        results[f'{zone_name}_cell_count'] = cell_count
+
+    return results

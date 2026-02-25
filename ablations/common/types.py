@@ -137,6 +137,14 @@ class ProbeTrackingState:
     branch_agent_pos_loss_history: chex.Array          # (3, buffer_size)
     branch_agent_dir_loss_history: chex.Array          # (3, buffer_size)
 
+    # Per-branch zone-decomposed wall losses
+    branch_zone_wall_loss_observed: chex.Array        # (3, buffer_size)
+    branch_zone_wall_loss_adjacent: chex.Array        # (3, buffer_size)
+    branch_zone_wall_loss_distant: chex.Array         # (3, buffer_size)
+    branch_zone_wall_accuracy_observed: chex.Array    # (3, buffer_size)
+    branch_zone_wall_accuracy_adjacent: chex.Array    # (3, buffer_size)
+    branch_zone_wall_accuracy_distant: chex.Array     # (3, buffer_size)
+
     # Per-branch aggregated accuracy (agent_pos, agent_dir, combined)
     dist_accuracy_agent_pos_history: chex.Array        # (3, buffer_size)
     dist_accuracy_agent_dir_history: chex.Array        # (3, buffer_size)
@@ -218,6 +226,12 @@ def create_probe_tracking_state(
         branch_goal_loss_history=jnp.zeros((3, buffer_size)),
         branch_agent_pos_loss_history=jnp.zeros((3, buffer_size)),
         branch_agent_dir_loss_history=jnp.zeros((3, buffer_size)),
+        branch_zone_wall_loss_observed=jnp.zeros((3, buffer_size)),
+        branch_zone_wall_loss_adjacent=jnp.zeros((3, buffer_size)),
+        branch_zone_wall_loss_distant=jnp.zeros((3, buffer_size)),
+        branch_zone_wall_accuracy_observed=jnp.zeros((3, buffer_size)),
+        branch_zone_wall_accuracy_adjacent=jnp.zeros((3, buffer_size)),
+        branch_zone_wall_accuracy_distant=jnp.zeros((3, buffer_size)),
         dist_accuracy_agent_pos_history=jnp.zeros((3, buffer_size)),
         dist_accuracy_agent_dir_history=jnp.zeros((3, buffer_size)),
         dist_accuracy_combined_history=jnp.zeros((3, buffer_size)),
@@ -603,6 +617,9 @@ class PAIREDTrainState:
     ant_probe_params: Optional[chex.ArrayTree] = None
     ant_probe_opt_state: Optional[chex.ArrayTree] = None
     ant_memory_state: Optional[chex.ArrayTree] = None
+
+    # Last adversary-generated level batch for displacement tracking
+    last_adversary_level: Optional[chex.ArrayTree] = None
 
     # PAIRED-specific tracking for experiments
     adversary_level_features: Optional[chex.Array] = None

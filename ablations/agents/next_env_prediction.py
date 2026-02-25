@@ -51,6 +51,7 @@ from ..common.metrics import (
     compute_curriculum_prediction_loss,
     compute_calibration_metrics,
     compute_distribution_divergence,
+    compute_batch_displacement_metrics,
 )
 from ..common.visualization import (
     log_curriculum_prediction_metrics,
@@ -341,6 +342,7 @@ class NextEnvPredictionAgent(BaseAgent):
         curriculum_features: chex.Array,
         levels,  # The actual levels that were used
         branch: int,
+        traj_info=None,  # Optional: trajectory info dict with agent_pos/agent_dir
     ) -> Tuple[NextEnvPredictionTrainState, dict]:
         """
         Compute prediction loss and update novelty/learnability tracking.
@@ -348,7 +350,13 @@ class NextEnvPredictionAgent(BaseAgent):
         Unlike probe agents where gradients don't affect the main network,
         here we compute the prediction loss but don't apply gradients separately
         (they're already included in the PPO update through shared backbone).
+
+        If traj_info is provided (with 'agent_pos' and 'agent_dir' keys from
+        trajectory sampling), computes zone-decomposed wall losses using
+        the visited mask from the trajectory.
         """
+        from ..common.metrics import compute_visited_mask_from_positions
+
         config = self.config
 
         # Get predictions from the network
@@ -370,6 +378,17 @@ class NextEnvPredictionAgent(BaseAgent):
             predict_curriculum=True,
         )
 
+        # Build wall_mask from trajectory if available
+        wall_mask = None
+        if traj_info is not None and 'agent_pos' in traj_info and 'agent_dir' in traj_info:
+            agent_positions = traj_info['agent_pos']  # (T, N, 2)
+            agent_dirs = traj_info['agent_dir']        # (T, N)
+            observed_mask, _, _ = compute_visited_mask_from_positions(
+                agent_positions, agent_dirs,
+                agent_view_size=config.get("agent_view_size", 5),
+            )
+            wall_mask = observed_mask
+
         # Compute prediction loss for the first level in batch
         level_0 = jax.tree_util.tree_map(lambda x: x[0], levels)
         pred_loss, pred_metrics = compute_curriculum_prediction_loss(
@@ -379,6 +398,8 @@ class NextEnvPredictionAgent(BaseAgent):
             goal_weight=config.get("curriculum_goal_weight", 1.0),
             agent_pos_weight=config.get("curriculum_agent_pos_weight", 1.0),
             agent_dir_weight=config.get("curriculum_agent_dir_weight", 1.0),
+            wall_mask=wall_mask,
+            wall_loss_region=config.get("wall_loss_region", "full"),
         )
 
         # Compute calibration metrics
@@ -464,9 +485,9 @@ class NextEnvPredictionAgent(BaseAgent):
             update_grad=config["exploratory_grad_updates"],
         )
 
-        # Compute prediction loss and update tracking
+        # Compute prediction loss and update tracking (with zone decomposition)
         train_state, pred_metrics = self.compute_prediction_loss_and_update(
-            train_state, curriculum_features, new_levels, branch=0
+            train_state, curriculum_features, new_levels, branch=0, traj_info=info,
         )
 
         # Update curriculum state
@@ -484,10 +505,17 @@ class NextEnvPredictionAgent(BaseAgent):
             sampler_stats=sampler_stats,
         )
 
+        # Compute displacement from previous DR batch
+        displacement = compute_batch_displacement_metrics(
+            new_levels, train_state.dr_last_level_batch
+        )
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
             "pred_metrics": pred_metrics,
+            "displacement": displacement,
+            "branch": jnp.int32(0),
         }
 
         train_state = train_state.replace(
@@ -560,9 +588,9 @@ class NextEnvPredictionAgent(BaseAgent):
             update_grad=True,
         )
 
-        # Compute prediction loss and update tracking
+        # Compute prediction loss and update tracking (with zone decomposition)
         train_state, pred_metrics = self.compute_prediction_loss_and_update(
-            train_state, curriculum_features, levels, branch=1
+            train_state, curriculum_features, levels, branch=1, traj_info=info,
         )
 
         # Update curriculum state
@@ -580,10 +608,17 @@ class NextEnvPredictionAgent(BaseAgent):
             sampler_stats=sampler_stats,
         )
 
+        # Compute displacement from previous replay batch
+        displacement = compute_batch_displacement_metrics(
+            levels, train_state.replay_last_level_batch
+        )
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
             "pred_metrics": pred_metrics,
+            "displacement": displacement,
+            "branch": jnp.int32(1),
         }
 
         train_state = train_state.replace(
@@ -657,9 +692,9 @@ class NextEnvPredictionAgent(BaseAgent):
             update_grad=config["exploratory_grad_updates"],
         )
 
-        # Compute prediction loss and update tracking
+        # Compute prediction loss and update tracking (with zone decomposition)
         train_state, pred_metrics = self.compute_prediction_loss_and_update(
-            train_state, curriculum_features, child_levels, branch=2
+            train_state, curriculum_features, child_levels, branch=2, traj_info=info,
         )
 
         # Update curriculum state
@@ -677,10 +712,17 @@ class NextEnvPredictionAgent(BaseAgent):
             sampler_stats=sampler_stats,
         )
 
+        # Compute displacement from previous mutation batch
+        displacement = compute_batch_displacement_metrics(
+            child_levels, train_state.mutation_last_level_batch
+        )
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
             "pred_metrics": pred_metrics,
+            "displacement": displacement,
+            "branch": jnp.int32(2),
         }
 
         train_state = train_state.replace(
@@ -756,7 +798,7 @@ class NextEnvPredictionAgent(BaseAgent):
         pred_metrics = {}
         if current_levels is not None:
             train_state, pred_metrics = self.compute_prediction_loss_and_update(
-                train_state, curriculum_features, current_levels, branch=0
+                train_state, curriculum_features, current_levels, branch=0, traj_info=info,
             )
 
             # Update curriculum state
@@ -775,10 +817,26 @@ class NextEnvPredictionAgent(BaseAgent):
             )
             train_state = train_state.replace(curriculum_state=curriculum_state)
 
+        # For pure DR mode, displacement is zeros (no previous level batch to compare)
+        _zero = jnp.float32(0.0)
+        displacement = {
+            'pairwise/wall_map_hamming/mean': _zero, 'pairwise/wall_map_hamming/min': _zero,
+            'pairwise/wall_map_hamming/max': _zero, 'pairwise/goal_pos_l2/mean': _zero,
+            'pairwise/goal_pos_l2/min': _zero, 'pairwise/goal_pos_l2/max': _zero,
+            'pairwise/agent_pos_l2/mean': _zero, 'pairwise/agent_pos_l2/min': _zero,
+            'pairwise/agent_pos_l2/max': _zero, 'pairwise/agent_dir_changed/mean': _zero,
+            'pairwise/agent_dir_changed/min': _zero, 'pairwise/agent_dir_changed/max': _zero,
+            'batch/wall_density_shift': _zero, 'batch/wall_iou': _zero,
+            'batch/goal_centroid_shift': _zero, 'batch/agent_pos_centroid_shift': _zero,
+            'batch/agent_dir_distribution_shift': _zero,
+        }
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_return": rewards.sum(axis=0).mean(),
             "pred_metrics": pred_metrics,
+            "displacement": displacement,
+            "branch": jnp.int32(0),
         }
 
         # Update train state with continuous rollout state
@@ -847,6 +905,177 @@ class NextEnvPredictionAgent(BaseAgent):
                 pred_metrics, branch, update_count,
             )
             log_dict.update(formatted)
+
+        # =====================================================================
+        # PREDICTION-SPECIFIC: Spearman correlations & scatter summaries
+        # Pair displacement metrics with prediction losses across eval window
+        # =====================================================================
+        try:
+            displacement = metrics.get("displacement", None)
+            branches = metrics.get("branch", None)
+            if displacement is not None and pred_metrics:
+                from scipy.stats import spearmanr
+
+                branch_names = {0: "random", 1: "replay", 2: "mutate"}
+                branches_np = np.array(branches)
+
+                # For each branch, pair displacement with prediction loss
+                for branch_id, branch_name in branch_names.items():
+                    mask = (branches_np == branch_id)
+                    if mask.sum() < 3:
+                        continue
+
+                    # Get prediction total loss for this branch
+                    pred_total = pred_metrics.get("total_loss")
+                    if pred_total is not None:
+                        pred_vals = np.array(pred_total)[mask]
+                    else:
+                        continue
+
+                    # Spearman: wall displacement vs prediction loss
+                    wall_disp = displacement.get("pairwise/wall_map_hamming/mean")
+                    if wall_disp is not None:
+                        wall_vals = np.array(wall_disp)[mask]
+                        if len(wall_vals) >= 3 and np.std(wall_vals) > 0 and np.std(pred_vals) > 0:
+                            rho, p = spearmanr(wall_vals, pred_vals)
+                            log_dict[f"curriculum_pred/{branch_name}/spearman/wall_vs_pred_loss"] = float(rho)
+                            log_dict[f"curriculum_pred/{branch_name}/spearman/wall_vs_pred_loss_p"] = float(p)
+
+                    # Spearman: goal displacement vs prediction loss
+                    goal_disp = displacement.get("pairwise/goal_pos_l2/mean")
+                    if goal_disp is not None:
+                        goal_vals = np.array(goal_disp)[mask]
+                        if len(goal_vals) >= 3 and np.std(goal_vals) > 0 and np.std(pred_vals) > 0:
+                            rho, p = spearmanr(goal_vals, pred_vals)
+                            log_dict[f"curriculum_pred/{branch_name}/spearman/goal_vs_pred_loss"] = float(rho)
+
+                    # Spearman: agent displacement vs prediction loss
+                    agent_disp = displacement.get("pairwise/agent_pos_l2/mean")
+                    if agent_disp is not None:
+                        agent_vals = np.array(agent_disp)[mask]
+                        if len(agent_vals) >= 3 and np.std(agent_vals) > 0 and np.std(pred_vals) > 0:
+                            rho, p = spearmanr(agent_vals, pred_vals)
+                            log_dict[f"curriculum_pred/{branch_name}/spearman/agent_pos_vs_pred_loss"] = float(rho)
+
+                    # Spearman: wall IoU vs prediction loss
+                    wall_iou = displacement.get("batch/wall_iou")
+                    if wall_iou is not None:
+                        iou_vals = np.array(wall_iou)[mask]
+                        if len(iou_vals) >= 3 and np.std(iou_vals) > 0 and np.std(pred_vals) > 0:
+                            rho, p = spearmanr(iou_vals, pred_vals)
+                            log_dict[f"curriculum_pred/{branch_name}/spearman/wall_iou_vs_pred_loss"] = float(rho)
+
+                    # Per-component prediction losses for this branch
+                    for comp in ["wall_loss", "goal_loss", "agent_pos_loss", "agent_dir_loss"]:
+                        comp_vals = pred_metrics.get(comp)
+                        if comp_vals is not None:
+                            branch_comp = np.array(comp_vals)[mask]
+                            if len(branch_comp) > 0:
+                                log_dict[f"curriculum_pred/{branch_name}/pred/{comp}_mean"] = float(branch_comp.mean())
+        except Exception:
+            pass
+
+        # --- Scatter plots + bar chart (temporal colour gradient, matching scalable_oversight) ---
+        # Uses persistent scatter_accum to accumulate [displacement, loss, update_step] across eval windows
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            displacement = metrics.get("displacement", None)
+            pred_metrics_sc = metrics.get("pred_metrics", {})
+            branches = metrics.get("branch", None)
+
+            if displacement is not None and pred_metrics_sc and branches is not None:
+                # Lazy-init persistent accumulator
+                if not hasattr(self, '_scatter_accum'):
+                    from collections import defaultdict
+                    self._scatter_accum = defaultdict(list)
+
+                branch_names = {0: "random", 1: "replay", 2: "mutate"}
+                branches_np = np.array(branches)
+                current_update = float(metrics.get("update_count", 0))
+                max_updates = self.config.get("num_updates", 50000)
+
+                scatter_pairings = [
+                    ("pairwise/wall_map_hamming/mean", "wall_loss", "wall"),
+                    ("pairwise/goal_pos_l2/mean", "goal_loss", "goal"),
+                    ("pairwise/agent_pos_l2/mean", "agent_pos_loss", "agent_pos"),
+                    ("pairwise/agent_dir_changed/mean", "agent_dir_loss", "agent_dir"),
+                ]
+
+                for branch_id, branch_name in branch_names.items():
+                    mask = (branches_np == branch_id)
+                    if mask.sum() == 0:
+                        continue
+
+                    # Accumulate points from this eval window
+                    for disp_key, loss_key, var_name in scatter_pairings:
+                        disp_vals = displacement.get(disp_key)
+                        loss_vals = pred_metrics_sc.get(loss_key)
+                        if (disp_vals is None or not hasattr(disp_vals, 'shape') or not disp_vals.shape
+                                or loss_vals is None or not hasattr(loss_vals, 'shape') or not loss_vals.shape):
+                            continue
+                        d_arr = np.array(disp_vals)
+                        l_arr = np.array(loss_vals)
+                        m_arr = np.array(mask)
+                        for i in range(len(d_arr)):
+                            if m_arr[i]:
+                                self._scatter_accum[(branch_id, var_name)].append(
+                                    [float(d_arr[i]), float(l_arr[i]), current_update]
+                                )
+
+                    # Log scatter plots (continuous vars) and bar chart (agent_dir)
+                    for disp_key, loss_key, var_name in scatter_pairings:
+                        points = self._scatter_accum.get((branch_id, var_name))
+                        if not points or len(points) < 2:
+                            continue
+                        arr = np.array(points)
+                        xs, ys, steps = arr[:, 0], arr[:, 1], arr[:, 2]
+
+                        # Compute Spearman rank correlation
+                        def _rankdata(a):
+                            order = np.argsort(a)
+                            ranks = np.empty_like(order, dtype=float)
+                            ranks[order] = np.arange(1, len(a) + 1, dtype=float)
+                            return ranks
+                        n = len(xs)
+                        rx, ry = _rankdata(xs), _rankdata(ys)
+                        mx, my = rx.mean(), ry.mean()
+                        cov = ((rx - mx) * (ry - my)).sum()
+                        denom = max(np.sqrt(((rx - mx)**2).sum() * ((ry - my)**2).sum()), 1e-8)
+                        spearman = float(cov / denom)
+
+                        if var_name == "agent_dir":
+                            # Bar chart: mean loss for dir_unchanged vs dir_changed
+                            unchanged_losses = ys[xs == 0.0]
+                            changed_losses = ys[xs > 0.0]
+                            bar_data = []
+                            if len(unchanged_losses) > 0:
+                                bar_data.append(["dir_unchanged", float(unchanged_losses.mean())])
+                            if len(changed_losses) > 0:
+                                bar_data.append(["dir_changed", float(changed_losses.mean())])
+                            if bar_data:
+                                bar_table = wandb.Table(data=bar_data, columns=["condition", "mean_loss"])
+                                log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.plot.bar(
+                                    bar_table, "condition", "mean_loss",
+                                    title=f"{branch_name}: agent_dir_loss by direction change (rho={spearman:.3f}, n={n})"
+                                )
+                        else:
+                            # Scatter plot with temporal colour gradient
+                            fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+                            sc = ax.scatter(xs, ys, c=steps, cmap='Reds', s=12, alpha=0.7,
+                                            vmin=0, vmax=max_updates, edgecolors='none')
+                            cbar = plt.colorbar(sc, ax=ax)
+                            cbar.set_label('Training Update')
+                            ax.set_xlabel(f'{var_name} displacement')
+                            ax.set_ylabel(loss_key)
+                            ax.set_title(f"{branch_name}: {var_name} vs {loss_key} (rho={spearman:.3f}, n={n})")
+                            fig.tight_layout()
+                            log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
+                            plt.close(fig)
+        except Exception:
+            pass
 
         # Curriculum prediction visualizations, calibration, and divergence
         self._log_curriculum_visualizations(train_state, update_count, log_dict)

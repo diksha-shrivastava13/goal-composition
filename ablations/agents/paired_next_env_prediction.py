@@ -44,6 +44,7 @@ from ..common.training import (
 from ..common.metrics import (
     compute_calibration_metrics,
     compute_distribution_divergence,
+    compute_batch_displacement_metrics,
 )
 from ..common.visualization import (
     create_wall_prediction_heatmap,
@@ -241,6 +242,10 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
 
         levels = adv_extras["last_env_state"].level
 
+        # Compute displacement from previous adversary-generated levels
+        prev_levels = train_state.last_adversary_level if train_state.last_adversary_level is not None else levels
+        displacement = compute_batch_displacement_metrics(levels, prev_levels)
+
         # 2. Protagonist rollout WITH curriculum features
         student_init_hstate = self._get_student_init_hstate(train_state)
         pro_rollout, pro_extras = self._rollout(
@@ -352,8 +357,9 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
         probe_opt_state = train_state.probe_opt_state
         probe_tracking = train_state.probe_tracking
 
+        probe_loss = jnp.float32(0.0)
         if probe_params is not None:
-            probe_params, probe_opt_state, probe_tracking = self._update_probe(
+            probe_params, probe_opt_state, probe_tracking, probe_loss = self._update_probe(
                 step_rngs[6], probe_params, probe_opt_state, probe_tracking,
                 pro_extras["final_hstate"], levels,
                 pro_extras["rewards"], pro_extras["dones"],
@@ -372,6 +378,9 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
             "est_regret": est_regret,
             "pro_eps": pro_eps,
             "ant_eps": ant_eps,
+            "displacement": displacement,
+            "branch": jnp.int32(3),  # adversary branch
+            "probe_loss": probe_loss,
         }
 
         # 9. Update memory (curriculum state + nl_state)
@@ -444,6 +453,8 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
             level_history_wall_maps=new_level_history,
             history_ptr=history_ptr,
             history_total=history_total,
+            # Displacement tracking
+            last_adversary_level=levels,
         )
 
         return (rng, train_state), metrics
@@ -586,5 +597,135 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
             log_dict["curriculum_pred/openendedness/score"] = oe_score
             for key, value in novelty_details.items():
                 log_dict[f"curriculum_pred/openendedness/{key}"] = value
+
+        # =====================================================================
+        # PREDICTION-SPECIFIC: Spearman correlations (adversary branch)
+        # =====================================================================
+        try:
+            displacement = metrics.get("displacement", None)
+            if displacement is not None and nl_state is not None and nl_state.total_samples > 3:
+                from scipy.stats import spearmanr
+
+                # Pair displacement with recent prediction losses from NL state
+                n = min(int(nl_state.total_samples), nl_state.loss_over_time.shape[0])
+                if n >= 3:
+                    pred_losses = np.array(nl_state.loss_over_time[:n])
+                    # Use aggregated displacement means as summary scalars
+                    wall_disp_vals = displacement.get("pairwise/wall_map_hamming/mean")
+                    if wall_disp_vals is not None:
+                        wall_disp_np = np.array(wall_disp_vals)
+                        # Use eval window displacement if same length
+                        disp_len = len(wall_disp_np)
+                        pred_recent = pred_losses[-disp_len:] if n >= disp_len else pred_losses
+                        use_len = min(disp_len, len(pred_recent))
+                        if use_len >= 3:
+                            rho, p = spearmanr(wall_disp_np[:use_len], pred_recent[:use_len])
+                            if np.isfinite(rho):
+                                log_dict["curriculum_pred/adversary/spearman/wall_vs_pred_loss"] = float(rho)
+
+                    goal_disp_vals = displacement.get("pairwise/goal_pos_l2/mean")
+                    if goal_disp_vals is not None:
+                        goal_disp_np = np.array(goal_disp_vals)
+                        disp_len = len(goal_disp_np)
+                        pred_recent = pred_losses[-disp_len:] if n >= disp_len else pred_losses
+                        use_len = min(disp_len, len(pred_recent))
+                        if use_len >= 3:
+                            rho, _ = spearmanr(goal_disp_np[:use_len], pred_recent[:use_len])
+                            if np.isfinite(rho):
+                                log_dict["curriculum_pred/adversary/spearman/goal_vs_pred_loss"] = float(rho)
+        except Exception:
+            pass
+
+        # --- Scatter plots + bar chart (temporal colour gradient) ---
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            displacement = metrics.get("displacement", None)
+            pred_metrics_scatter = metrics.get("pred_metrics", {})
+
+            if displacement is not None and pred_metrics_scatter:
+                # Lazy-init persistent accumulator
+                if not hasattr(self, '_scatter_accum'):
+                    from collections import defaultdict
+                    self._scatter_accum = defaultdict(list)
+
+                branch_id = 3  # adversary
+                branch_name = "adversary"
+                current_update = float(metrics.get("update_count", 0))
+                max_updates = self.config.get("num_updates", 50000)
+
+                scatter_pairings = [
+                    ("pairwise/wall_map_hamming/mean", "wall_loss", "wall"),
+                    ("pairwise/goal_pos_l2/mean", "goal_loss", "goal"),
+                    ("pairwise/agent_pos_l2/mean", "agent_pos_loss", "agent_pos"),
+                    ("pairwise/agent_dir_changed/mean", "agent_dir_loss", "agent_dir"),
+                ]
+
+                # Accumulate points from this eval window
+                for disp_key, loss_key, var_name in scatter_pairings:
+                    disp_vals = displacement.get(disp_key)
+                    loss_vals = pred_metrics_scatter.get(loss_key)
+                    if (disp_vals is None or not hasattr(disp_vals, 'shape') or not disp_vals.shape
+                            or loss_vals is None or not hasattr(loss_vals, 'shape') or not loss_vals.shape):
+                        continue
+                    d_arr = np.array(disp_vals)
+                    l_arr = np.array(loss_vals)
+                    for i in range(len(d_arr)):
+                        self._scatter_accum[(branch_id, var_name)].append(
+                            [float(d_arr[i]), float(l_arr[i]), current_update]
+                        )
+
+                # Log scatter plots (continuous vars) and bar chart (agent_dir)
+                for disp_key, loss_key, var_name in scatter_pairings:
+                    points = self._scatter_accum.get((branch_id, var_name))
+                    if not points or len(points) < 2:
+                        continue
+                    arr = np.array(points)
+                    xs, ys, steps = arr[:, 0], arr[:, 1], arr[:, 2]
+
+                    # Compute Spearman rank correlation
+                    def _rankdata(a):
+                        order = np.argsort(a)
+                        ranks = np.empty_like(order, dtype=float)
+                        ranks[order] = np.arange(1, len(a) + 1, dtype=float)
+                        return ranks
+                    n = len(xs)
+                    rx, ry = _rankdata(xs), _rankdata(ys)
+                    mx, my = rx.mean(), ry.mean()
+                    cov = ((rx - mx) * (ry - my)).sum()
+                    denom = max(np.sqrt(((rx - mx)**2).sum() * ((ry - my)**2).sum()), 1e-8)
+                    spearman = float(cov / denom)
+
+                    if var_name == "agent_dir":
+                        unchanged_losses = ys[xs == 0.0]
+                        changed_losses = ys[xs > 0.0]
+                        bar_data = []
+                        if len(unchanged_losses) > 0:
+                            bar_data.append(["dir_unchanged", float(unchanged_losses.mean())])
+                        if len(changed_losses) > 0:
+                            bar_data.append(["dir_changed", float(changed_losses.mean())])
+                        if bar_data:
+                            bar_table = wandb.Table(data=bar_data, columns=["condition", "mean_loss"])
+                            log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.plot.bar(
+                                bar_table, "condition", "mean_loss",
+                                title=f"{branch_name}: agent_dir_loss by direction change (rho={spearman:.3f}, n={n})"
+                            )
+                    else:
+                        # Scatter plot with temporal colour gradient
+                        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+                        sc = ax.scatter(xs, ys, c=steps, cmap='Reds', s=12, alpha=0.7,
+                                        vmin=0, vmax=max_updates, edgecolors='none')
+                        cbar = plt.colorbar(sc, ax=ax)
+                        cbar.set_label('Training Update')
+                        ax.set_xlabel(f'{var_name} displacement')
+                        ax.set_ylabel(loss_key)
+                        ax.set_title(f"{branch_name}: {var_name} vs {loss_key} (rho={spearman:.3f}, n={n})")
+                        fig.tight_layout()
+                        log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
+                        plt.close(fig)
+        except Exception:
+            pass
 
         return log_dict

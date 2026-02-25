@@ -477,6 +477,26 @@ def log_curriculum_prediction_metrics(
         f"curriculum_pred/all/total_loss": float(metrics.get("total_loss", 0.0)),
     }
 
+    # Zone evaluation losses (from compute_curriculum_prediction_loss with wall_mask)
+    for zone in ["observed", "adjacent", "distant"]:
+        key = f"zone_loss/{zone}"
+        if key in metrics:
+            log_dict[f"curriculum_pred/{branch_name}/{key}"] = float(metrics[key])
+            log_dict[f"curriculum_pred/all/{key}"] = float(metrics[key])
+
+    # Zone membership
+    for key in ["goal_in_observed", "goal_in_adjacent", "goal_in_distant",
+                "agent_in_observed", "agent_in_distant"]:
+        full_key = f"zone_membership/{key}"
+        if full_key in metrics:
+            log_dict[f"curriculum_pred/{branch_name}/{full_key}"] = float(metrics[full_key])
+
+    # Zone coverage
+    for key in ["observed_frac", "adjacent_frac", "distant_frac"]:
+        full_key = f"zone_coverage/{key}"
+        if full_key in metrics:
+            log_dict[f"curriculum_pred/{branch_name}/{full_key}"] = float(metrics[full_key])
+
     return log_dict
 
 
@@ -2071,3 +2091,235 @@ def create_paired_openendedness_plot(
     plt.close(fig)
 
     return img
+
+
+# =============================================================================
+# DISPLACEMENT + ZONE LOGGING (shared across all agents)
+# =============================================================================
+
+def build_curriculum_pred_log_dict(metrics, train_state=None):
+    """
+    Build wandb log dict entries for displacement histograms and zone metrics.
+
+    Called from _build_log_dict in both BaseAgent and PAIREDBaseAgent.
+    Operates on the scan-stacked metrics dict where displacement values
+    have shape (eval_freq,) and branch IDs have shape (eval_freq,).
+
+    Args:
+        metrics: Dict from jax.lax.scan with stacked arrays
+        train_state: Train state (unused for now, reserved for zone decomposition)
+
+    Returns:
+        Dict of wandb-ready log entries
+    """
+    import wandb
+
+    log_dict = {}
+    displacement = metrics.get("displacement", None)
+    branches = metrics.get("branch", None)
+
+    if displacement is None or branches is None:
+        return log_dict
+
+    branch_names = {0: "random", 1: "replay", 2: "mutate", 3: "adversary"}
+
+    # Convert to numpy for wandb histogram creation
+    branches_np = np.array(branches)
+
+    # --- Displacement histograms (per branch) ---
+    for branch_id, branch_name in branch_names.items():
+        mask = (branches_np == branch_id)
+        if mask.sum() == 0:
+            continue
+
+        # Pairwise histograms (continuous vars)
+        for var in ["wall_map_hamming", "goal_pos_l2", "agent_pos_l2"]:
+            key = f"pairwise/{var}/mean"
+            vals = displacement.get(key)
+            if vals is not None:
+                branch_vals = np.array(vals)[mask]
+                if len(branch_vals) > 0:
+                    log_dict[f"curriculum_pred/{branch_name}/pairwise_hist/{var}"] = wandb.Histogram(branch_vals)
+                    log_dict[f"curriculum_pred/{branch_name}/pairwise/{var}_mean"] = float(branch_vals.mean())
+
+        # agent_dir_changed as fraction (binary)
+        adc = displacement.get("pairwise/agent_dir_changed/mean")
+        if adc is not None:
+            branch_adc = np.array(adc)[mask]
+            if len(branch_adc) > 0:
+                log_dict[f"curriculum_pred/{branch_name}/pairwise/agent_dir_changed_frac"] = float(branch_adc.mean())
+
+        # Batch histograms
+        for metric_name in ["wall_density_shift", "wall_iou", "goal_centroid_shift",
+                            "agent_pos_centroid_shift", "agent_dir_distribution_shift"]:
+            key = f"batch/{metric_name}"
+            vals = displacement.get(key)
+            if vals is not None:
+                branch_vals = np.array(vals)[mask]
+                if len(branch_vals) > 0:
+                    log_dict[f"curriculum_pred/{branch_name}/batch_hist/{metric_name}"] = wandb.Histogram(branch_vals)
+                    log_dict[f"curriculum_pred/{branch_name}/batch/{metric_name}_mean"] = float(branch_vals.mean())
+
+    # --- Aggregated displacement across all branches ---
+    for var in ["wall_map_hamming", "goal_pos_l2", "agent_pos_l2"]:
+        key = f"pairwise/{var}/mean"
+        vals = displacement.get(key)
+        if vals is not None:
+            all_vals = np.array(vals)
+            if len(all_vals) > 0:
+                log_dict[f"curriculum_pred/all/pairwise/{var}_mean"] = float(all_vals.mean())
+
+    for metric_name in ["wall_density_shift", "wall_iou", "goal_centroid_shift",
+                        "agent_pos_centroid_shift", "agent_dir_distribution_shift"]:
+        key = f"batch/{metric_name}"
+        vals = displacement.get(key)
+        if vals is not None:
+            all_vals = np.array(vals)
+            if len(all_vals) > 0:
+                log_dict[f"curriculum_pred/all/batch/{metric_name}_mean"] = float(all_vals.mean())
+
+    adc = displacement.get("pairwise/agent_dir_changed/mean")
+    if adc is not None:
+        log_dict[f"curriculum_pred/all/pairwise/agent_dir_changed_frac"] = float(np.array(adc).mean())
+
+    # --- Scatter plots: displacement vs probe loss (for probe agents) ---
+    probe_loss = metrics.get("probe_loss", None)
+    if probe_loss is not None and displacement is not None:
+        try:
+            probe_loss_np = np.array(probe_loss)
+            # Only produce scatter plots if probe is active (non-zero losses)
+            if np.any(probe_loss_np > 0):
+                # Use module-level accumulator for persistence across eval windows
+                if not hasattr(build_curriculum_pred_log_dict, '_scatter_accum'):
+                    from collections import defaultdict
+                    build_curriculum_pred_log_dict._scatter_accum = defaultdict(list)
+                accum = build_curriculum_pred_log_dict._scatter_accum
+
+                update_count = float(metrics.get("update_count", 0))
+                max_updates = float(metrics.get("max_updates", 50000))
+
+                scatter_pairings = [
+                    ("pairwise/wall_map_hamming/mean", "wall"),
+                    ("pairwise/goal_pos_l2/mean", "goal"),
+                    ("pairwise/agent_pos_l2/mean", "agent_pos"),
+                    ("pairwise/agent_dir_changed/mean", "agent_dir"),
+                ]
+
+                for branch_id, branch_name in branch_names.items():
+                    mask = (branches_np == branch_id)
+                    if mask.sum() == 0:
+                        continue
+
+                    # Accumulate [displacement, probe_loss, step] triples
+                    for disp_key, var_name in scatter_pairings:
+                        disp_vals = displacement.get(disp_key)
+                        if disp_vals is None:
+                            continue
+                        d_arr = np.array(disp_vals)
+                        m_arr = mask
+                        for i in range(len(d_arr)):
+                            if m_arr[i] and probe_loss_np[i] > 0:
+                                accum[(branch_id, var_name)].append(
+                                    [float(d_arr[i]), float(probe_loss_np[i]), update_count]
+                                )
+
+                    # Log scatter plots and bar chart
+                    for disp_key, var_name in scatter_pairings:
+                        points = accum.get((branch_id, var_name))
+                        if not points or len(points) < 2:
+                            continue
+                        arr = np.array(points)
+                        xs, ys, steps = arr[:, 0], arr[:, 1], arr[:, 2]
+
+                        # Spearman rank correlation
+                        n = len(xs)
+                        order_x = np.argsort(xs)
+                        rx = np.empty_like(order_x, dtype=float)
+                        rx[order_x] = np.arange(1, n + 1, dtype=float)
+                        order_y = np.argsort(ys)
+                        ry = np.empty_like(order_y, dtype=float)
+                        ry[order_y] = np.arange(1, n + 1, dtype=float)
+                        mx, my = rx.mean(), ry.mean()
+                        cov = ((rx - mx) * (ry - my)).sum()
+                        denom = max(np.sqrt(((rx - mx)**2).sum() * ((ry - my)**2).sum()), 1e-8)
+                        spearman = float(cov / denom)
+                        log_dict[f"curriculum_pred/{branch_name}/corr/{var_name}_spearman"] = spearman
+
+                        if var_name == "agent_dir":
+                            # Bar chart: mean probe loss for dir_unchanged vs dir_changed
+                            unchanged_losses = ys[xs == 0.0]
+                            changed_losses = ys[xs > 0.0]
+                            bar_data = []
+                            if len(unchanged_losses) > 0:
+                                bar_data.append(["dir_unchanged", float(unchanged_losses.mean())])
+                            if len(changed_losses) > 0:
+                                bar_data.append(["dir_changed", float(changed_losses.mean())])
+                            if bar_data:
+                                bar_table = wandb.Table(data=bar_data, columns=["condition", "mean_loss"])
+                                log_dict[f"curriculum_pred/{branch_name}/scatter/agent_dir"] = wandb.plot.bar(
+                                    bar_table, "condition", "mean_loss",
+                                    title=f"{branch_name}: probe_loss by dir change (rho={spearman:.3f}, n={n})"
+                                )
+                        else:
+                            # Scatter plot with temporal colour gradient
+                            fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+                            sc = ax.scatter(xs, ys, c=steps, cmap='Reds', s=12, alpha=0.7,
+                                            vmin=0, vmax=max_updates, edgecolors='none')
+                            cbar = plt.colorbar(sc, ax=ax)
+                            cbar.set_label('Training Update')
+                            ax.set_xlabel(f'{var_name} displacement')
+                            ax.set_ylabel('probe_loss')
+                            ax.set_title(f"{branch_name}: {var_name} vs probe_loss (rho={spearman:.3f}, n={n})")
+                            fig.tight_layout()
+                            log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
+                            plt.close(fig)
+        except Exception:
+            pass
+
+    # --- Agent direction bar chart ---
+    try:
+        dir_changed_by_branch = {}
+        dir_shift_by_branch = {}
+        branch_names_present = []
+
+        for branch_id, branch_name in branch_names.items():
+            mask = (branches_np == branch_id)
+            if mask.sum() == 0:
+                continue
+
+            adc = displacement.get("pairwise/agent_dir_changed/mean")
+            ads = displacement.get("batch/agent_dir_distribution_shift")
+            if adc is not None:
+                dir_changed_by_branch[branch_name] = float(np.array(adc)[mask].mean())
+            if ads is not None:
+                dir_shift_by_branch[branch_name] = float(np.array(ads)[mask].mean())
+            if adc is not None or ads is not None:
+                branch_names_present.append(branch_name)
+
+        if branch_names_present:
+            fig, axes = plt.subplots(1, 2, figsize=(8, 3))
+
+            # Bar 1: dir changed fraction per branch
+            if dir_changed_by_branch:
+                names = list(dir_changed_by_branch.keys())
+                vals = [dir_changed_by_branch[n] for n in names]
+                axes[0].bar(names, vals, color=['#2196F3', '#4CAF50', '#FF9800', '#9C27B0'][:len(names)])
+                axes[0].set_ylabel("Fraction")
+                axes[0].set_title("Agent Dir Changed Frac")
+                axes[0].set_ylim(0, 1)
+
+            # Bar 2: dir distribution shift per branch
+            if dir_shift_by_branch:
+                names = list(dir_shift_by_branch.keys())
+                vals = [dir_shift_by_branch[n] for n in names]
+                axes[1].bar(names, vals, color=['#2196F3', '#4CAF50', '#FF9800', '#9C27B0'][:len(names)])
+                axes[1].set_ylabel("Shift")
+                axes[1].set_title("Agent Dir Distribution Shift")
+
+            fig.tight_layout()
+            log_dict["curriculum_pred/agent_dir_bar_chart"] = wandb.Image(fig)
+            plt.close(fig)
+    except Exception:
+        pass  # Bar chart generation failed, skip silently
+
+    return log_dict

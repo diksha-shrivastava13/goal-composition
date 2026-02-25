@@ -78,6 +78,10 @@ from ..common.metrics import (
     compute_agent_learnability_from_tracking,
     compute_agent_openendedness_from_tracking,
     update_agent_tracking,
+    # Displacement metrics
+    compute_batch_displacement_metrics,
+    # Zone decomposition
+    compute_visited_mask_from_positions,
 )
 from ..common.visualization import (
     create_probe_loss_by_branch_plot,
@@ -96,6 +100,7 @@ from ..common.visualization import (
     create_wall_prediction_heatmap,
     create_position_prediction_heatmap,
     create_matched_pairs_visualization,
+    build_curriculum_pred_log_dict,
 )
 from ..common.utils import (
     setup_checkpointing,
@@ -383,6 +388,7 @@ class BaseAgent(ABC):
             train_state.num_replay_updates +
             train_state.num_mutation_updates
         )
+        metrics["max_updates"] = jnp.float32(self.config.get("num_updates", 50000))
 
         return (rng, train_state), metrics
 
@@ -510,9 +516,10 @@ class BaseAgent(ABC):
 
         # Update probe (if enabled)
         rng, rng_probe = jax.random.split(rng)
-        train_state = self.update_probe(
+        train_state, probe_loss = self.update_probe(
             rng_probe, train_state, final_hstate, new_levels,
             branch=0, rewards=rewards, dones=dones, is_replay_to_mutate=False,
+            traj_info=info,
         )
 
         # Update memory (context vector / episodic buffer) after rollout
@@ -523,9 +530,17 @@ class BaseAgent(ABC):
             train_state, episode_return, episode_length, episode_solved, final_hstate,
         )
 
+        # Compute displacement from previous DR batch
+        displacement = compute_batch_displacement_metrics(
+            new_levels, train_state.dr_last_level_batch
+        )
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
+            "displacement": displacement,
+            "branch": jnp.int32(0),
+            "probe_loss": probe_loss,
         }
 
         train_state = train_state.replace(
@@ -599,9 +614,10 @@ class BaseAgent(ABC):
 
         # Update probe (if enabled)
         rng, rng_probe = jax.random.split(rng)
-        train_state = self.update_probe(
+        train_state, probe_loss = self.update_probe(
             rng_probe, train_state, final_hstate, levels,
             branch=1, rewards=rewards, dones=dones, is_replay_to_mutate=False,
+            traj_info=info,
         )
 
         # Update memory (context vector / episodic buffer) after rollout
@@ -612,9 +628,17 @@ class BaseAgent(ABC):
             train_state, episode_return, episode_length, episode_solved, final_hstate,
         )
 
+        # Compute displacement from previous replay batch
+        displacement = compute_batch_displacement_metrics(
+            levels, train_state.replay_last_level_batch
+        )
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
+            "displacement": displacement,
+            "branch": jnp.int32(1),
+            "probe_loss": probe_loss,
         }
 
         train_state = train_state.replace(
@@ -690,9 +714,10 @@ class BaseAgent(ABC):
 
         # Update probe (if enabled)
         rng, rng_probe = jax.random.split(rng)
-        train_state = self.update_probe(
+        train_state, probe_loss = self.update_probe(
             rng_probe, train_state, final_hstate, child_levels,
             branch=2, rewards=rewards, dones=dones, is_replay_to_mutate=True,
+            traj_info=info,
         )
 
         # Update memory (context vector / episodic buffer) after rollout
@@ -703,9 +728,17 @@ class BaseAgent(ABC):
             train_state, episode_return, episode_length, episode_solved, final_hstate,
         )
 
+        # Compute displacement from previous mutation batch
+        displacement = compute_batch_displacement_metrics(
+            child_levels, train_state.mutation_last_level_batch
+        )
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
+            "displacement": displacement,
+            "branch": jnp.int32(2),
+            "probe_loss": probe_loss,
         }
 
         train_state = train_state.replace(
@@ -773,10 +806,12 @@ class BaseAgent(ABC):
 
         # Update probe (if enabled and levels available)
         rng, rng_probe = jax.random.split(rng)
+        probe_loss = jnp.float32(0.0)
         if current_levels is not None:
-            train_state = self.update_probe(
+            train_state, probe_loss = self.update_probe(
                 rng_probe, train_state, final_hstate, current_levels,
                 branch=0, rewards=rewards, dones=dones, is_replay_to_mutate=False,
+                traj_info=info,
             )
 
         # Update memory (context vector / episodic buffer) after rollout
@@ -787,9 +822,26 @@ class BaseAgent(ABC):
             train_state, episode_return, episode_length, episode_solved, final_hstate,
         )
 
+        # For pure DR mode, displacement is zeros (no previous level batch to compare)
+        _zero = jnp.float32(0.0)
+        displacement = {
+            'pairwise/wall_map_hamming/mean': _zero, 'pairwise/wall_map_hamming/min': _zero,
+            'pairwise/wall_map_hamming/max': _zero, 'pairwise/goal_pos_l2/mean': _zero,
+            'pairwise/goal_pos_l2/min': _zero, 'pairwise/goal_pos_l2/max': _zero,
+            'pairwise/agent_pos_l2/mean': _zero, 'pairwise/agent_pos_l2/min': _zero,
+            'pairwise/agent_pos_l2/max': _zero, 'pairwise/agent_dir_changed/mean': _zero,
+            'pairwise/agent_dir_changed/min': _zero, 'pairwise/agent_dir_changed/max': _zero,
+            'batch/wall_density_shift': _zero, 'batch/wall_iou': _zero,
+            'batch/goal_centroid_shift': _zero, 'batch/agent_pos_centroid_shift': _zero,
+            'batch/agent_dir_distribution_shift': _zero,
+        }
+
         metrics = {
             "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
             "mean_return": rewards.sum(axis=0).mean(),
+            "displacement": displacement,
+            "branch": jnp.int32(0),
+            "probe_loss": probe_loss,
         }
 
         # Update train state with continuous rollout state
@@ -814,7 +866,8 @@ class BaseAgent(ABC):
         rewards: chex.Array,
         dones: chex.Array,
         is_replay_to_mutate: bool = False,
-    ) -> ProbeTrainState:
+        traj_info=None,
+    ) -> tuple:
         """
         Update probe network on current hidden state.
 
@@ -833,12 +886,12 @@ class BaseAgent(ABC):
             is_replay_to_mutate: Whether this is R->M transition (1-to-1 correspondence)
 
         Returns:
-            Updated train state with new probe params and tracking state
+            Tuple of (updated train state, probe loss scalar)
         """
         config = self.config
 
         if train_state.probe_params is None:
-            return train_state
+            return train_state, jnp.float32(0.0)
 
         # Flatten hidden state: (c, h) -> (batch, 512)
         hstate_flat = flatten_hstate(hstate)
@@ -875,6 +928,40 @@ class BaseAgent(ABC):
         (loss, loss_components), grads = jax.value_and_grad(
             probe_loss_fn, has_aux=True
         )(train_state.probe_params)
+
+        # Compute zone-decomposed wall losses if trajectory info available
+        zone_wall_loss_observed = jnp.float32(0.0)
+        zone_wall_loss_adjacent = jnp.float32(0.0)
+        zone_wall_loss_distant = jnp.float32(0.0)
+        zone_wall_accuracy_observed = jnp.float32(0.0)
+        zone_wall_accuracy_adjacent = jnp.float32(0.0)
+        zone_wall_accuracy_distant = jnp.float32(0.0)
+
+        if traj_info is not None and 'agent_pos' in traj_info and 'agent_dir' in traj_info:
+            agent_positions = traj_info['agent_pos']  # (T, N, 2)
+            agent_dirs = traj_info['agent_dir']        # (T, N)
+            agent_view_size = self.config.get("agent_view_size", 5)
+
+            observed_mask, adjacent_mask, distant_mask = compute_visited_mask_from_positions(
+                agent_positions, agent_dirs, agent_view_size
+            )
+
+            wall_targets = levels.wall_map.astype(jnp.float32)  # (B, H, W)
+            wall_bce = optax.sigmoid_binary_cross_entropy(
+                predictions['wall_logits'], wall_targets
+            )  # (B, H, W)
+            wall_correct = ((jax.nn.sigmoid(predictions['wall_logits']) > 0.5) == wall_targets).astype(jnp.float32)
+
+            def _zone_metrics(mask):
+                mask_f = mask.astype(jnp.float32)
+                safe_count = jnp.maximum(mask_f.sum(), 1.0)
+                per_env_loss = (wall_bce * mask_f[None]).sum(axis=(-2, -1)) / safe_count
+                per_env_acc = (wall_correct * mask_f[None]).sum(axis=(-2, -1)) / safe_count
+                return per_env_loss.mean(), per_env_acc.mean()
+
+            zone_wall_loss_observed, zone_wall_accuracy_observed = _zone_metrics(observed_mask)
+            zone_wall_loss_adjacent, zone_wall_accuracy_adjacent = _zone_metrics(adjacent_mask)
+            zone_wall_loss_distant, zone_wall_accuracy_distant = _zone_metrics(distant_mask)
 
         # Update probe params
         probe_tx = optax.adam(learning_rate=config.get("probe_lr", 1e-3))
@@ -1001,6 +1088,14 @@ class BaseAgent(ABC):
             new_branch_agent_pos_loss = probe_tracking.branch_agent_pos_loss_history.at[branch, branch_ptr].set(loss_components['agent_pos_loss'])
             new_branch_agent_dir_loss = probe_tracking.branch_agent_dir_loss_history.at[branch, branch_ptr].set(loss_components['agent_dir_loss'])
 
+            # Per-branch zone-decomposed wall losses
+            new_branch_zone_wall_loss_observed = probe_tracking.branch_zone_wall_loss_observed.at[branch, branch_ptr].set(zone_wall_loss_observed)
+            new_branch_zone_wall_loss_adjacent = probe_tracking.branch_zone_wall_loss_adjacent.at[branch, branch_ptr].set(zone_wall_loss_adjacent)
+            new_branch_zone_wall_loss_distant = probe_tracking.branch_zone_wall_loss_distant.at[branch, branch_ptr].set(zone_wall_loss_distant)
+            new_branch_zone_wall_accuracy_observed = probe_tracking.branch_zone_wall_accuracy_observed.at[branch, branch_ptr].set(zone_wall_accuracy_observed)
+            new_branch_zone_wall_accuracy_adjacent = probe_tracking.branch_zone_wall_accuracy_adjacent.at[branch, branch_ptr].set(zone_wall_accuracy_adjacent)
+            new_branch_zone_wall_accuracy_distant = probe_tracking.branch_zone_wall_accuracy_distant.at[branch, branch_ptr].set(zone_wall_accuracy_distant)
+
             # Per-branch aggregated accuracy (from dist_calibration)
             new_dist_acc_agent_pos = probe_tracking.dist_accuracy_agent_pos_history.at[branch, branch_ptr].set(
                 dist_calibration.get('agent_pos_dist_mode_match', 0.0)
@@ -1044,6 +1139,13 @@ class BaseAgent(ABC):
                 branch_goal_loss_history=new_branch_goal_loss,
                 branch_agent_pos_loss_history=new_branch_agent_pos_loss,
                 branch_agent_dir_loss_history=new_branch_agent_dir_loss,
+                # Zone-decomposed wall losses
+                branch_zone_wall_loss_observed=new_branch_zone_wall_loss_observed,
+                branch_zone_wall_loss_adjacent=new_branch_zone_wall_loss_adjacent,
+                branch_zone_wall_loss_distant=new_branch_zone_wall_loss_distant,
+                branch_zone_wall_accuracy_observed=new_branch_zone_wall_accuracy_observed,
+                branch_zone_wall_accuracy_adjacent=new_branch_zone_wall_accuracy_adjacent,
+                branch_zone_wall_accuracy_distant=new_branch_zone_wall_accuracy_distant,
                 # Per-instance tracking
                 per_instance_wall_accuracy_history=new_per_instance_wall,
                 per_instance_goal_accuracy_history=new_per_instance_goal,
@@ -1100,7 +1202,7 @@ class BaseAgent(ABC):
             hstate_samples=hstate_samples,
             hstate_sample_branches=hstate_sample_branches,
             hstate_sample_ptr=hstate_sample_ptr,
-        )
+        ), loss
 
     # =========================================================================
     # AGENT-CENTRIC TRACKING (NOT PROBE-BASED)
@@ -1743,6 +1845,33 @@ class BaseAgent(ABC):
             log_dict["probe/samples/mutate_count"] = int(probe_tracking.branch_sample_counts[2])
             log_dict["probe/samples/total"] = int(probe_tracking.total_samples)
 
+            # --- Zone-decomposed wall losses ---
+            if hasattr(probe_tracking, 'branch_zone_wall_loss_observed'):
+                for b, bname in enumerate(["random", "replay", "mutate"]):
+                    n_samples = int(probe_tracking.branch_sample_counts[b])
+                    if n_samples > 0:
+                        ptr = int(probe_tracking.branch_ptrs[b])
+                        n = min(n_samples, buffer_size)
+                        start = max(0, ptr - n)
+                        log_dict[f"probe/{bname}/zone_loss/observed"] = float(
+                            probe_tracking.branch_zone_wall_loss_observed[b, start:ptr].mean()
+                        )
+                        log_dict[f"probe/{bname}/zone_loss/adjacent"] = float(
+                            probe_tracking.branch_zone_wall_loss_adjacent[b, start:ptr].mean()
+                        )
+                        log_dict[f"probe/{bname}/zone_loss/distant"] = float(
+                            probe_tracking.branch_zone_wall_loss_distant[b, start:ptr].mean()
+                        )
+                        log_dict[f"probe/{bname}/zone_accuracy/observed"] = float(
+                            probe_tracking.branch_zone_wall_accuracy_observed[b, start:ptr].mean()
+                        )
+                        log_dict[f"probe/{bname}/zone_accuracy/adjacent"] = float(
+                            probe_tracking.branch_zone_wall_accuracy_adjacent[b, start:ptr].mean()
+                        )
+                        log_dict[f"probe/{bname}/zone_accuracy/distant"] = float(
+                            probe_tracking.branch_zone_wall_accuracy_distant[b, start:ptr].mean()
+                        )
+
         # =====================================================================
         # AGENT-CENTRIC METRICS (NOT probe-based)
         # =====================================================================
@@ -1772,6 +1901,15 @@ class BaseAgent(ABC):
                 log_dict["agent/regime"] = regime
 
             log_dict["agent/total_samples"] = int(agent_tracking.total_samples)
+
+        # =====================================================================
+        # DISPLACEMENT + ZONE METRICS (curriculum_pred/)
+        # =====================================================================
+        try:
+            curriculum_log = build_curriculum_pred_log_dict(metrics, train_state)
+            log_dict.update(curriculum_log)
+        except Exception:
+            pass
 
         # =====================================================================
         # VISUALIZATIONS (every eval call)
