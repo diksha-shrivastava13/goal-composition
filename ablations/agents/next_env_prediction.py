@@ -46,6 +46,7 @@ from ..common.curriculum_state import (
     compute_learnability as compute_learnability_from_nl_state,
     compute_novelty as compute_novelty_from_nl_state,
     compute_openendedness_score as compute_openendedness_from_nl_state,
+    compute_tier_targets,
 )
 from ..common.metrics import (
     compute_curriculum_prediction_loss,
@@ -217,7 +218,7 @@ class NextEnvPredictionAgent(BaseAgent):
             x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, last_done))
 
             # Pass curriculum features to network
-            hstate, pi, value, _ = train_state.apply_fn(
+            hstate, pi, value = train_state.apply_fn(
                 train_state.params, x, hstate,
                 curriculum_features=curriculum_features,
                 predict_curriculum=False,  # Don't need predictions during rollout
@@ -248,7 +249,7 @@ class NextEnvPredictionAgent(BaseAgent):
 
         # Get final value estimate
         x = jax.tree_util.tree_map(lambda x: x[None, ...], (last_obs, last_done))
-        _, _, last_value, _ = train_state.apply_fn(
+        _, _, last_value = train_state.apply_fn(
             train_state.params, x, hstate,
             curriculum_features=curriculum_features,
             predict_curriculum=False,
@@ -284,7 +285,7 @@ class NextEnvPredictionAgent(BaseAgent):
                 init_hstate_mb, obs, actions, last_dones, log_probs, values, targets, advantages = minibatch
 
                 def loss_fn(params):
-                    _, pi, values_pred, _ = train_state.apply_fn(
+                    _, pi, values_pred = train_state.apply_fn(
                         params, (obs, last_dones), init_hstate_mb,
                         curriculum_features=curriculum_features,
                         predict_curriculum=False,
@@ -343,6 +344,7 @@ class NextEnvPredictionAgent(BaseAgent):
         levels,  # The actual levels that were used
         branch: int,
         traj_info=None,  # Optional: trajectory info dict with agent_pos/agent_dir
+        tier_targets: dict = None,
     ) -> Tuple[NextEnvPredictionTrainState, dict]:
         """
         Compute prediction loss and update novelty/learnability tracking.
@@ -400,6 +402,11 @@ class NextEnvPredictionAgent(BaseAgent):
             agent_dir_weight=config.get("curriculum_agent_dir_weight", 1.0),
             wall_mask=wall_mask,
             wall_loss_region=config.get("wall_loss_region", "full"),
+            tier_targets=tier_targets,
+            is_paired=False,
+            tier1_weight=config.get("tier1_weight", 1.0),
+            tier2_weight=config.get("tier2_weight", 1.0),
+            tier3_weight=config.get("tier3_weight", 1.0),
         )
 
         # Compute calibration metrics
@@ -485,9 +492,18 @@ class NextEnvPredictionAgent(BaseAgent):
             update_grad=config["exploratory_grad_updates"],
         )
 
+        # Compute tier targets
+        level_0 = jax.tree_util.tree_map(lambda x: x[0], new_levels)
+        episode_return = rewards.sum(axis=0).mean()
+        tier_targets = compute_tier_targets(
+            train_state.curriculum_state, level_0,
+            episode_return=episode_return, score=scores[0], branch=0,
+        )
+
         # Compute prediction loss and update tracking (with zone decomposition)
         train_state, pred_metrics = self.compute_prediction_loss_and_update(
-            train_state, curriculum_features, new_levels, branch=0, traj_info=info,
+            train_state, curriculum_features, new_levels, branch=0,
+            traj_info=info, tier_targets=tier_targets,
         )
 
         # Update curriculum state
@@ -496,13 +512,15 @@ class NextEnvPredictionAgent(BaseAgent):
             'mean_score': sampler['scores'].mean(),
             'max_score': sampler['scores'].max(),
         }
-        level_0 = jax.tree_util.tree_map(lambda x: x[0], new_levels)
         curriculum_state = update_curriculum_state(
             train_state.curriculum_state,
             level_0,
             branch=0,
             score=scores[0],
             sampler_stats=sampler_stats,
+            episode_return=episode_return,
+            path_length=tier_targets['_path_length'],
+            goal_distance=tier_targets['_goal_distance'],
         )
 
         # Compute displacement from previous DR batch
@@ -588,9 +606,18 @@ class NextEnvPredictionAgent(BaseAgent):
             update_grad=True,
         )
 
+        # Compute tier targets
+        level_0 = jax.tree_util.tree_map(lambda x: x[0], levels)
+        episode_return = rewards.sum(axis=0).mean()
+        tier_targets = compute_tier_targets(
+            train_state.curriculum_state, level_0,
+            episode_return=episode_return, score=scores[0], branch=1,
+        )
+
         # Compute prediction loss and update tracking (with zone decomposition)
         train_state, pred_metrics = self.compute_prediction_loss_and_update(
-            train_state, curriculum_features, levels, branch=1, traj_info=info,
+            train_state, curriculum_features, levels, branch=1,
+            traj_info=info, tier_targets=tier_targets,
         )
 
         # Update curriculum state
@@ -599,13 +626,15 @@ class NextEnvPredictionAgent(BaseAgent):
             'mean_score': sampler['scores'].mean(),
             'max_score': sampler['scores'].max(),
         }
-        level_0 = jax.tree_util.tree_map(lambda x: x[0], levels)
         curriculum_state = update_curriculum_state(
             train_state.curriculum_state,
             level_0,
             branch=1,
             score=scores[0],
             sampler_stats=sampler_stats,
+            episode_return=episode_return,
+            path_length=tier_targets['_path_length'],
+            goal_distance=tier_targets['_goal_distance'],
         )
 
         # Compute displacement from previous replay batch
@@ -692,9 +721,18 @@ class NextEnvPredictionAgent(BaseAgent):
             update_grad=config["exploratory_grad_updates"],
         )
 
+        # Compute tier targets
+        level_0 = jax.tree_util.tree_map(lambda x: x[0], child_levels)
+        episode_return = rewards.sum(axis=0).mean()
+        tier_targets = compute_tier_targets(
+            train_state.curriculum_state, level_0,
+            episode_return=episode_return, score=scores[0], branch=2,
+        )
+
         # Compute prediction loss and update tracking (with zone decomposition)
         train_state, pred_metrics = self.compute_prediction_loss_and_update(
-            train_state, curriculum_features, child_levels, branch=2, traj_info=info,
+            train_state, curriculum_features, child_levels, branch=2,
+            traj_info=info, tier_targets=tier_targets,
         )
 
         # Update curriculum state
@@ -703,13 +741,15 @@ class NextEnvPredictionAgent(BaseAgent):
             'mean_score': sampler['scores'].mean(),
             'max_score': sampler['scores'].max(),
         }
-        level_0 = jax.tree_util.tree_map(lambda x: x[0], child_levels)
         curriculum_state = update_curriculum_state(
             train_state.curriculum_state,
             level_0,
             branch=2,
             score=scores[0],
             sampler_stats=sampler_stats,
+            episode_return=episode_return,
+            path_length=tier_targets['_path_length'],
+            goal_distance=tier_targets['_goal_distance'],
         )
 
         # Compute displacement from previous mutation batch
@@ -898,11 +938,19 @@ class NextEnvPredictionAgent(BaseAgent):
                 log_dict["curriculum_state/recent_mean_score"] = float(cs.recent_scores.mean())
 
         # Per-branch prediction metrics from train step
+        # Note: metrics come from jax.lax.scan so values are stacked (eval_freq,)
+        # We take the mean for losses and the last value for the branch index.
         pred_metrics = metrics.get("pred_metrics", {})
         if pred_metrics:
-            branch = int(pred_metrics.get("branch", 0))
+            branch_val = pred_metrics.get("branch", 0)
+            branch = int(branch_val[-1]) if hasattr(branch_val, 'shape') and branch_val.shape else int(branch_val)
+            # Mean-reduce stacked metrics for logging
+            pred_metrics_reduced = {
+                k: (v.mean() if hasattr(v, 'mean') and hasattr(v, 'shape') and v.shape else v)
+                for k, v in pred_metrics.items()
+            }
             formatted = log_curriculum_prediction_metrics(
-                pred_metrics, branch, update_count,
+                pred_metrics_reduced, branch, update_count,
             )
             log_dict.update(formatted)
 

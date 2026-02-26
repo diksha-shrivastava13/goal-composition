@@ -36,6 +36,7 @@ from ..common.curriculum_state import (
     compute_learnability as compute_learnability_from_nl_state,
     compute_novelty as compute_novelty_from_nl_state,
     compute_openendedness_score as compute_openendedness_from_nl_state,
+    compute_tier_targets,
 )
 from ..common.training import (
     sample_trajectories_rnn_with_curriculum,
@@ -73,6 +74,11 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
     def get_actor_critic_class(self) -> type:
         """Use ActorCriticWithCurriculumPrediction."""
         return ActorCriticWithCurriculumPrediction
+
+    def _get_student_init_kwargs(self) -> dict:
+        """Pass dummy curriculum_features during init so all params are created."""
+        dummy_features = get_curriculum_features(create_curriculum_state())
+        return {"curriculum_features": dummy_features, "predict_curriculum": True}
 
     def initialize_hidden_state(self, batch_size: int) -> chex.ArrayTree:
         """Initialize LSTM hidden state to zeros."""
@@ -112,6 +118,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
             level_history_wall_maps=train_state.level_history_wall_maps,
             history_ptr=train_state.history_ptr,
             history_total=train_state.history_total,
+            last_adversary_level=train_state.last_adversary_level,
         )
 
     def _get_curriculum_features(self, train_state: PAIREDTrainState) -> Optional[chex.Array]:
@@ -184,6 +191,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
                 rng, env, env_params, train_state,
                 init_hstate, init_obs, init_env_state,
                 config["num_train_envs"], num_steps,
+                track_positions=hasattr(init_env_state, 'agent_pos'),
             )
 
         advantages, targets = compute_gae(
@@ -200,6 +208,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
             "last_value": last_value,
             "last_env_state": last_env_state,
             "final_hstate": final_hstate,
+            "info": info,
         }
 
         return rollout, extras
@@ -243,7 +252,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
         levels = adv_extras["last_env_state"].level
 
         # Compute displacement from previous adversary-generated levels
-        prev_levels = train_state.last_adversary_level if train_state.last_adversary_level is not None else levels
+        prev_levels = train_state.last_adversary_level
         displacement = compute_batch_displacement_metrics(levels, prev_levels)
 
         # 2. Protagonist rollout WITH curriculum features
@@ -328,15 +337,49 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
 
         # 6. Apply curriculum prediction gradient (protagonist only)
         if curriculum_features is not None:
-            from ..common.metrics import apply_curriculum_prediction_gradient
+            from ..common.metrics import apply_curriculum_prediction_gradient, compute_visited_mask_from_positions
+
+            # Compute tier targets for PAIRED
+            representative_level = jax.tree_util.tree_map(lambda x: x[0], levels)
+            pro_episode_return = pro_extras["rewards"].sum(axis=0).mean()
+            # Approximate adversary entropy from log_probs
+            adv_obs, adv_actions, adv_dones, adv_log_probs, _, _, _ = adv_rollout
+            adv_entropy = (-adv_log_probs).mean()
+
+            tier_targets = compute_tier_targets(
+                train_state.memory_state["curriculum_state"] if train_state.memory_state is not None else create_curriculum_state(),
+                representative_level,
+                episode_return=pro_episode_return,
+                score=est_regret.mean(),
+                branch=3,  # adversary branch for PAIRED
+                is_paired=True,
+                ant_return=ant_max_returns.mean(),
+                pro_return=pro_mean_returns.mean(),
+                adversary_entropy=adv_entropy,
+            )
+
+            # Build wall_mask from protagonist trajectory if wall_loss_region != "full"
+            wall_mask = None
+            pro_info = pro_extras.get("info")
+            if pro_info is not None and config.get("wall_loss_region", "full") != "full":
+                if "agent_pos" in pro_info and "agent_dir" in pro_info:
+                    observed_mask, _, _ = compute_visited_mask_from_positions(
+                        pro_info["agent_pos"], pro_info["agent_dir"],
+                        agent_view_size=config.get("agent_view_size", 5),
+                    )
+                    wall_mask = observed_mask
+
             pro_train_state, pred_metrics = apply_curriculum_prediction_gradient(
                 pro_train_state,
                 curriculum_features,
-                levels,
+                representative_level,
                 self.env,
                 self.env_params,
                 self.sample_random_level,
                 config,
+                tier_targets=tier_targets,
+                is_paired=True,
+                wall_mask=wall_mask,
             )
 
         # 7. Agent-centric tracking
@@ -359,11 +402,13 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
 
         probe_loss = jnp.float32(0.0)
         if probe_params is not None:
+            _probe_tier_targets = tier_targets if curriculum_features is not None else None
             probe_params, probe_opt_state, probe_tracking, probe_loss = self._update_probe(
                 step_rngs[6], probe_params, probe_opt_state, probe_tracking,
                 pro_extras["final_hstate"], levels,
                 pro_extras["rewards"], pro_extras["dones"],
                 train_state.update_count,
+                tier_targets=_probe_tier_targets,
             )
 
         metrics = {
@@ -386,6 +431,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
         # 9. Update memory (curriculum state + nl_state)
         updated_memory = self._update_curriculum_memory(
             train_state, levels, pro_extras,
+            tier_targets=tier_targets if curriculum_features is not None else None,
         )
 
         # 10. History tracking (same as base PAIRED)
@@ -415,17 +461,19 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
                 novelty = compute_level_novelty(
                     levels.wall_map,
                     new_level_history,
-                    min(history_total, level_history_size),
+                    jnp.minimum(history_total, level_history_size),
                 )
                 new_novelty_history = new_novelty_history.at[history_ptr].set(novelty)
 
-            if probe_tracking is not None and probe_tracking.total_samples > 10:
+            if probe_tracking is not None:
                 learnability, _ = compute_learnability(
                     probe_tracking.loss_history,
                     probe_tracking.training_step_history,
                     probe_tracking.total_samples,
                     probe_tracking.current_training_step,
                 )
+                # Only write if we have enough samples (traced condition)
+                learnability = jnp.where(probe_tracking.total_samples > 10, learnability, 0.0)
                 new_learnability_history = new_learnability_history.at[history_ptr].set(learnability)
 
             history_ptr = (history_ptr + 1) % history_size
@@ -464,6 +512,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
         train_state: PAIREDTrainState,
         levels,
         pro_extras: dict,
+        tier_targets: dict = None,
     ):
         """Update curriculum state with adversary-generated level statistics.
 
@@ -482,6 +531,10 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
         # Use the first level as representative for curriculum state update
         representative_level = jax.tree_util.tree_map(lambda x: x[0], levels)
 
+        # Get path_length and goal_distance from tier_targets if available
+        path_length = tier_targets['_path_length'] if tier_targets is not None else jnp.float32(0.0)
+        goal_distance = tier_targets['_goal_distance'] if tier_targets is not None else jnp.float32(0.0)
+
         # Update curriculum state with actual level data
         # In PAIRED, the adversary IS the curriculum — use branch=0
         curriculum_state = update_curriculum_state(
@@ -494,6 +547,9 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
                 'mean_score': episode_return,
                 'max_score': episode_return,
             },
+            episode_return=episode_return,
+            path_length=path_length,
+            goal_distance=goal_distance,
         )
 
         return {

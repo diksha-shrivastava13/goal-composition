@@ -238,6 +238,8 @@ def compute_agent_prediction_loss(
     level: Dict[str, Any],
     rng: jax.random.PRNGKey,
     curriculum_features: Optional[jnp.ndarray] = None,
+    tier_targets: Optional[Dict[str, Any]] = None,
+    is_paired: bool = False,
 ) -> Tuple[float, Dict[str, float]]:
     """
     Compute prediction/probe loss for any agent type.
@@ -298,7 +300,11 @@ def compute_agent_prediction_loss(
 
             # Compute prediction loss
             level_obj = create_level_object(level)
-            loss, metrics = compute_curriculum_prediction_loss(predictions, level_obj)
+            loss, metrics = compute_curriculum_prediction_loss(
+                predictions, level_obj,
+                tier_targets=tier_targets,
+                is_paired=is_paired,
+            )
 
             return float(loss), {k: float(v) for k, v in metrics.items()}
 
@@ -341,7 +347,11 @@ def compute_agent_prediction_loss(
 
                 # Compute probe loss
                 level_obj = create_level_object(level)
-                loss, metrics = compute_probe_loss(predictions, level_obj)
+                loss, metrics = compute_probe_loss(
+                    predictions, level_obj,
+                    tier_targets=tier_targets,
+                    is_paired=is_paired,
+                )
 
                 return float(loss), {k: float(v) for k, v in metrics.items()}
             else:

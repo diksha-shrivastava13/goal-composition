@@ -56,6 +56,13 @@ class CurriculumState:
     total_replay_steps: int      # Count of replay/mutate steps (curriculum steps)
     total_random_steps: int      # Count of random generation steps
 
+    # Tier 1 ground truth tracking
+    recent_path_lengths: chex.Array      # (history_length,) — JIT BFS shortest path (normalized)
+    recent_goal_distances: chex.Array    # (history_length,) — Manhattan distance (normalized)
+
+    # Tier 2 ground truth tracking
+    recent_returns: chex.Array           # (history_length,) — agent episode returns
+
     # Circular buffer pointer
     head_pointer: int
     history_filled: bool         # Whether buffer has been filled at least once
@@ -72,6 +79,9 @@ def create_curriculum_state(
         recent_agent_dirs=jnp.zeros(history_length, dtype=jnp.int32),
         recent_scores=jnp.zeros(history_length, dtype=jnp.float32),
         recent_branches=jnp.zeros(history_length, dtype=jnp.int32),
+        recent_path_lengths=jnp.zeros(history_length, dtype=jnp.float32),
+        recent_goal_distances=jnp.zeros(history_length, dtype=jnp.float32),
+        recent_returns=jnp.zeros(history_length, dtype=jnp.float32),
         buffer_size=0,
         buffer_mean_score=0.0,
         buffer_score_std=0.0,
@@ -92,6 +102,9 @@ def update_curriculum_state(
     sampler_stats: dict,
     env_height: int = DEFAULT_ENV_HEIGHT,
     env_width: int = DEFAULT_ENV_WIDTH,
+    episode_return: float = 0.0,
+    path_length: float = 0.0,
+    goal_distance: float = 0.0,
 ) -> CurriculumState:
     """
     Update curriculum state with a new level observation.
@@ -104,6 +117,9 @@ def update_curriculum_state(
         sampler_stats: Statistics from the level sampler
         env_height: Environment height for wall density calculation
         env_width: Environment width for wall density calculation
+        episode_return: Agent's actual episode return
+        path_length: Normalized shortest path length (from BFS)
+        goal_distance: Normalized Manhattan distance from agent to goal
 
     Returns:
         Updated CurriculumState
@@ -121,6 +137,9 @@ def update_curriculum_state(
     new_agent_dirs = curriculum_state.recent_agent_dirs.at[ptr].set(level.agent_dir)
     new_scores = curriculum_state.recent_scores.at[ptr].set(score)
     new_branches = curriculum_state.recent_branches.at[ptr].set(branch)
+    new_path_lengths = curriculum_state.recent_path_lengths.at[ptr].set(path_length)
+    new_goal_distances = curriculum_state.recent_goal_distances.at[ptr].set(goal_distance)
+    new_returns = curriculum_state.recent_returns.at[ptr].set(episode_return)
 
     # Update pointer (circular)
     new_ptr = (ptr + 1) % history_length
@@ -140,6 +159,9 @@ def update_curriculum_state(
         recent_agent_dirs=new_agent_dirs,
         recent_scores=new_scores,
         recent_branches=new_branches,
+        recent_path_lengths=new_path_lengths,
+        recent_goal_distances=new_goal_distances,
+        recent_returns=new_returns,
         buffer_size=sampler_stats.get('size', 0),
         buffer_mean_score=sampler_stats.get('mean_score', 0.0),
         buffer_score_std=sampler_stats.get('score_std', 0.0),
@@ -196,14 +218,17 @@ def get_curriculum_features(
         (curriculum_state.recent_branches == 2).sum(),
     ], dtype=jnp.float32) / history_length
 
-    # Combine into feature vector
+    # Combine into feature vector (including new tier history)
     features = jnp.concatenate([
         jnp.array([normalized_step, replay_fraction, buffer_fill]),
         jnp.array([normalized_mean_score, normalized_max_score]),
         jnp.array([mean_wall_density, std_wall_density, mean_score]),
         branch_counts,
-        curriculum_state.recent_wall_densities,  # Full history
-        curriculum_state.recent_scores,          # Full history
+        curriculum_state.recent_wall_densities,  # Full history (64,)
+        curriculum_state.recent_scores,          # Full history (64,)
+        curriculum_state.recent_returns,         # Full history (64,)
+        curriculum_state.recent_goal_distances,  # Full history (64,)
+        curriculum_state.recent_path_lengths,    # Full history (64,)
     ])
 
     return features
@@ -424,6 +449,241 @@ def update_novelty_learnability_state(
         buffer_ptr=(ptr + 1) % buffer_size,
         total_samples=nl_state.total_samples + 1,
     )
+
+
+# =============================================================================
+# TIER TARGET COMPUTATION (JIT-compatible)
+# =============================================================================
+
+def compute_shortest_path_length(
+    wall_map: chex.Array,
+    agent_pos: chex.Array,
+    goal_pos: chex.Array,
+    env_height: int = DEFAULT_ENV_HEIGHT,
+    env_width: int = DEFAULT_ENV_WIDTH,
+    max_iters: int = 169,
+) -> float:
+    """JIT-compatible BFS on grid using jax.lax.fori_loop.
+
+    Returns normalized shortest path length (distance / max_possible).
+    Returns 1.0 if goal is unreachable.
+    """
+    max_dist = jnp.float32(env_height * env_width)
+    # Initialize distance array: inf everywhere, 0 at agent position
+    dist = jnp.full((env_height, env_width), max_dist, dtype=jnp.float32)
+    agent_y, agent_x = agent_pos[1], agent_pos[0]
+    dist = dist.at[agent_y, agent_x].set(0.0)
+
+    # BFS via iterative relaxation (Bellman-Ford style, converges in grid diameter iterations)
+    def relax_step(_, dist):
+        # For each cell, check if any neighbor offers a shorter path
+        # Shift in 4 directions and take min
+        up = jnp.roll(dist, -1, axis=0).at[-1, :].set(max_dist)
+        down = jnp.roll(dist, 1, axis=0).at[0, :].set(max_dist)
+        left = jnp.roll(dist, -1, axis=1).at[:, -1].set(max_dist)
+        right = jnp.roll(dist, 1, axis=1).at[:, 0].set(max_dist)
+
+        neighbor_min = jnp.minimum(jnp.minimum(up, down), jnp.minimum(left, right))
+        # New distance: min of current or (neighbor + 1), but only for passable cells
+        passable = ~wall_map.astype(jnp.bool_)
+        new_dist = jnp.where(passable, jnp.minimum(dist, neighbor_min + 1.0), max_dist)
+        # Agent position always has distance 0
+        new_dist = new_dist.at[agent_y, agent_x].set(0.0)
+        return new_dist
+
+    dist = jax.lax.fori_loop(0, max_iters, relax_step, dist)
+    goal_y, goal_x = goal_pos[1], goal_pos[0]
+    path_len = dist[goal_y, goal_x]
+    # Normalize by max possible distance
+    max_possible = jnp.float32(env_height + env_width)
+    return jnp.clip(path_len / max_possible, 0.0, 1.0)
+
+
+def compute_tier_novelty(
+    curriculum_state: CurriculumState,
+    current_difficulty: chex.Array,
+) -> float:
+    """Min Euclidean distance in (density, path_len, goal_dist) space to recent levels.
+
+    Args:
+        curriculum_state: Current curriculum state with history buffers
+        current_difficulty: (3,) array of [wall_density, path_length, goal_distance]
+
+    Returns:
+        Novelty score (min distance to recent levels)
+    """
+    history_length = curriculum_state.recent_wall_densities.shape[0]
+    recent = jnp.stack([
+        curriculum_state.recent_wall_densities,
+        curriculum_state.recent_path_lengths,
+        curriculum_state.recent_goal_distances,
+    ], axis=-1)  # (history_length, 3)
+    dists = jnp.sqrt(((current_difficulty[None, :] - recent) ** 2).sum(axis=-1))
+    # Mask invalid entries (unfilled buffer positions)
+    valid_count = jnp.where(
+        curriculum_state.history_filled,
+        history_length,
+        curriculum_state.head_pointer,
+    )
+    valid_mask = jnp.arange(history_length) < valid_count
+    return jnp.where(valid_mask, dists, jnp.float32(jnp.inf)).min()
+
+
+def compute_tier_unusualness(
+    curriculum_state: CurriculumState,
+    current_difficulty: chex.Array,
+) -> float:
+    """Mean z-score across difficulty features.
+
+    Args:
+        curriculum_state: Current curriculum state
+        current_difficulty: (3,) array of [wall_density, path_length, goal_distance]
+
+    Returns:
+        Unusualness score (mean absolute z-score)
+    """
+    means = jnp.array([
+        curriculum_state.recent_wall_densities.mean(),
+        curriculum_state.recent_path_lengths.mean(),
+        curriculum_state.recent_goal_distances.mean(),
+    ])
+    stds = jnp.array([
+        curriculum_state.recent_wall_densities.std(),
+        curriculum_state.recent_path_lengths.std(),
+        curriculum_state.recent_goal_distances.std(),
+    ])
+    z_scores = jnp.abs(current_difficulty - means) / (stds + 1e-8)
+    return z_scores.mean()
+
+
+def compute_drift_direction(
+    curriculum_state: CurriculumState,
+    k: int = 16,
+) -> chex.Array:
+    """Diff of rolling means of difficulty stats.
+
+    Returns (3,) vector: mean(last_k) - mean(prev_k) for
+    [wall_density, path_length, goal_distance].
+    """
+    history_length = curriculum_state.recent_wall_densities.shape[0]
+    ptr = curriculum_state.head_pointer
+
+    # Build masks using vectorized index comparison
+    indices = jnp.arange(history_length)
+
+    # Last K entries: positions ptr-1, ptr-2, ..., ptr-K (circular)
+    last_k_positions = (ptr - 1 - jnp.arange(k)) % history_length
+    last_k_mask = jnp.isin(indices, last_k_positions)
+
+    # Prev K entries: positions ptr-K-1, ptr-K-2, ..., ptr-2K (circular)
+    prev_k_positions = (ptr - 1 - k - jnp.arange(k)) % history_length
+    prev_k_mask = jnp.isin(indices, prev_k_positions)
+
+    # Compute means for each difficulty feature
+    def masked_mean(arr, mask):
+        safe_count = jnp.maximum(mask.astype(jnp.float32).sum(), 1.0)
+        return (arr * mask.astype(jnp.float32)).sum() / safe_count
+
+    last_density = masked_mean(curriculum_state.recent_wall_densities, last_k_mask)
+    prev_density = masked_mean(curriculum_state.recent_wall_densities, prev_k_mask)
+    last_path = masked_mean(curriculum_state.recent_path_lengths, last_k_mask)
+    prev_path = masked_mean(curriculum_state.recent_path_lengths, prev_k_mask)
+    last_goal = masked_mean(curriculum_state.recent_goal_distances, last_k_mask)
+    prev_goal = masked_mean(curriculum_state.recent_goal_distances, prev_k_mask)
+
+    return jnp.array([
+        last_density - prev_density,
+        last_path - prev_path,
+        last_goal - prev_goal,
+    ])
+
+
+def compute_tier_targets(
+    curriculum_state: CurriculumState,
+    level,
+    episode_return: float,
+    score: float,
+    branch: int,
+    is_paired: bool = False,
+    ant_return: Optional[float] = None,
+    pro_return: Optional[float] = None,
+    adversary_entropy: Optional[float] = None,
+    env_height: int = DEFAULT_ENV_HEIGHT,
+    env_width: int = DEFAULT_ENV_WIDTH,
+) -> dict:
+    """Assemble ground truth dict for all tier targets. Fully JIT-compatible.
+
+    Args:
+        curriculum_state: Current curriculum state
+        level: The level dataclass
+        episode_return: Agent's actual episode return
+        score: Level sampler score
+        branch: Branch index (0=DR, 1=replay, 2=mutate)
+        is_paired: Whether using PAIRED training
+        ant_return: Antagonist return (PAIRED only)
+        pro_return: Protagonist return (PAIRED only)
+        adversary_entropy: Adversary policy entropy (PAIRED only)
+        env_height: Environment height
+        env_width: Environment width
+
+    Returns:
+        Dict with all tier target values
+    """
+    # Tier 1: Curriculum Dynamics
+    wall_density = level.wall_map.sum() / (env_height * env_width)
+    goal_distance = jnp.abs(level.goal_pos.astype(jnp.float32) - level.agent_pos.astype(jnp.float32)).sum() / (env_height + env_width)
+    path_length = compute_shortest_path_length(
+        level.wall_map, level.agent_pos, level.goal_pos,
+        env_height=env_height, env_width=env_width,
+    )
+    difficulty = jnp.array([wall_density, path_length, goal_distance])
+
+    # Regret
+    ant_return_safe = ant_return if ant_return is not None else jnp.float32(0.0)
+    pro_return_safe = pro_return if pro_return is not None else jnp.float32(0.0)
+    regret = jnp.where(
+        jnp.bool_(is_paired),
+        ant_return_safe - pro_return_safe,
+        -episode_return,  # Approximate: negative return as proxy for non-PAIRED
+    )
+
+    # Tier 2: Agent-Curriculum Interaction
+    novelty = compute_tier_novelty(curriculum_state, difficulty)
+    unusualness = compute_tier_unusualness(curriculum_state, difficulty)
+
+    # Regret source (PAIRED only): pro_weakness / (pro_weakness + ant_strength + eps)
+    # pro_weakness = max(0, -pro_return), ant_strength = max(0, ant_return)
+    pro_weakness = jnp.maximum(-pro_return_safe, 0.0)
+    ant_strength = jnp.maximum(ant_return_safe, 0.0)
+    regret_source = jnp.where(
+        jnp.bool_(is_paired),
+        pro_weakness / (pro_weakness + ant_strength + 1e-8),
+        jnp.float32(0.0),
+    )
+
+    # Tier 3: Meta-Curriculum
+    drift = compute_drift_direction(curriculum_state)
+    adv_entropy = jnp.where(
+        jnp.bool_(is_paired),
+        adversary_entropy if adversary_entropy is not None else jnp.float32(0.0),
+        jnp.float32(0.0),
+    )
+
+    return {
+        't1_regret': regret,
+        't1_difficulty': difficulty,
+        't1_branch': jnp.int32(branch),
+        't1_score': jnp.float32(score),
+        't2_return': jnp.float32(episode_return),
+        't2_regret_source': regret_source,
+        't2_novelty': novelty,
+        't2_unusualness': unusualness,
+        't3_drift': drift,
+        't3_adv_entropy': adv_entropy,
+        # Also return computed values for curriculum state update
+        '_path_length': path_length,
+        '_goal_distance': goal_distance,
+    }
 
 
 def compute_distribution_divergence(

@@ -163,6 +163,29 @@ class ProbeTrackingState:
     last_levels_agent_dir: chex.Array                  # (batch_size,)
     last_branch: int                                   # Branch of last update
 
+    # =====================================================================
+    # Tier 1/2/3 prediction loss tracking
+    # =====================================================================
+    # Per-tier aggregate loss histories
+    tier1_loss_history: chex.Array                     # (buffer_size,)
+    tier2_loss_history: chex.Array                     # (buffer_size,)
+    tier3_loss_history: chex.Array                     # (buffer_size,)
+
+    # Per-component loss histories
+    tier1_regret_loss_history: chex.Array              # (buffer_size,)
+    tier1_difficulty_loss_history: chex.Array           # (buffer_size,)
+    tier1_branch_loss_history: chex.Array              # (buffer_size,)
+    tier1_score_loss_history: chex.Array               # (buffer_size,)
+    tier2_return_loss_history: chex.Array              # (buffer_size,)
+    tier2_novelty_loss_history: chex.Array             # (buffer_size,)
+    tier2_unusualness_loss_history: chex.Array         # (buffer_size,)
+    tier3_drift_loss_history: chex.Array               # (buffer_size,)
+
+    # Per-branch per-tier losses
+    branch_tier1_loss_history: chex.Array              # (3, buffer_size)
+    branch_tier2_loss_history: chex.Array              # (3, buffer_size)
+    branch_tier3_loss_history: chex.Array              # (3, buffer_size)
+
 
 def create_probe_tracking_state(
     buffer_size: int = 500,
@@ -245,6 +268,21 @@ def create_probe_tracking_state(
         last_levels_agent_pos=jnp.zeros((batch_size, 2), dtype=jnp.uint32),
         last_levels_agent_dir=jnp.zeros(batch_size, dtype=jnp.uint32),
         last_branch=0,
+        # Tier 1/2/3 loss tracking
+        tier1_loss_history=jnp.zeros(buffer_size),
+        tier2_loss_history=jnp.zeros(buffer_size),
+        tier3_loss_history=jnp.zeros(buffer_size),
+        tier1_regret_loss_history=jnp.zeros(buffer_size),
+        tier1_difficulty_loss_history=jnp.zeros(buffer_size),
+        tier1_branch_loss_history=jnp.zeros(buffer_size),
+        tier1_score_loss_history=jnp.zeros(buffer_size),
+        tier2_return_loss_history=jnp.zeros(buffer_size),
+        tier2_novelty_loss_history=jnp.zeros(buffer_size),
+        tier2_unusualness_loss_history=jnp.zeros(buffer_size),
+        tier3_drift_loss_history=jnp.zeros(buffer_size),
+        branch_tier1_loss_history=jnp.zeros((3, buffer_size)),
+        branch_tier2_loss_history=jnp.zeros((3, buffer_size)),
+        branch_tier3_loss_history=jnp.zeros((3, buffer_size)),
     )
 
 

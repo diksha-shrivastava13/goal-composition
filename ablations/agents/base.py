@@ -867,6 +867,7 @@ class BaseAgent(ABC):
         dones: chex.Array,
         is_replay_to_mutate: bool = False,
         traj_info=None,
+        tier_targets: dict = None,
     ) -> tuple:
         """
         Update probe network on current hidden state.
@@ -922,7 +923,14 @@ class BaseAgent(ABC):
                 episode_solved=episode_solved,
                 episode_length=episode_lengths,
             )
-            loss, loss_dict = compute_probe_loss_batch(preds, levels)
+            loss, loss_dict = compute_probe_loss_batch(
+                preds, levels,
+                tier_targets=tier_targets,
+                is_paired=False,
+                tier1_weight=config.get("tier1_weight", 1.0),
+                tier2_weight=config.get("tier2_weight", 1.0),
+                tier3_weight=config.get("tier3_weight", 1.0),
+            )
             return loss, loss_dict
 
         (loss, loss_components), grads = jax.value_and_grad(
@@ -1111,6 +1119,38 @@ class BaseAgent(ABC):
             combined_acc = dist_calibration.get('combined_accuracy', 0.0)
             new_probe_accuracy = probe_tracking.probe_accuracy_history.at[ptr].set(combined_acc)
 
+            # Tier loss tracking
+            new_tier1_loss = probe_tracking.tier1_loss_history.at[ptr].set(
+                loss_components.get('tier1_loss', jnp.float32(0.0)))
+            new_tier2_loss = probe_tracking.tier2_loss_history.at[ptr].set(
+                loss_components.get('tier2_loss', jnp.float32(0.0)))
+            new_tier3_loss = probe_tracking.tier3_loss_history.at[ptr].set(
+                loss_components.get('tier3_loss', jnp.float32(0.0)))
+            # Per-component tier losses
+            new_t1_regret_loss = probe_tracking.tier1_regret_loss_history.at[ptr].set(
+                loss_components.get('tier1/regret', jnp.float32(0.0)))
+            new_t1_difficulty_loss = probe_tracking.tier1_difficulty_loss_history.at[ptr].set(
+                loss_components.get('tier1/difficulty', jnp.float32(0.0)))
+            new_t1_branch_loss = probe_tracking.tier1_branch_loss_history.at[ptr].set(
+                loss_components.get('tier1/branch', jnp.float32(0.0)))
+            new_t1_score_loss = probe_tracking.tier1_score_loss_history.at[ptr].set(
+                loss_components.get('tier1/score', jnp.float32(0.0)))
+            new_t2_return_loss = probe_tracking.tier2_return_loss_history.at[ptr].set(
+                loss_components.get('tier2/return', jnp.float32(0.0)))
+            new_t2_novelty_loss = probe_tracking.tier2_novelty_loss_history.at[ptr].set(
+                loss_components.get('tier2/novelty', jnp.float32(0.0)))
+            new_t2_unusualness_loss = probe_tracking.tier2_unusualness_loss_history.at[ptr].set(
+                loss_components.get('tier2/unusualness', jnp.float32(0.0)))
+            new_t3_drift_loss = probe_tracking.tier3_drift_loss_history.at[ptr].set(
+                loss_components.get('tier3/drift', jnp.float32(0.0)))
+            # Per-branch tier losses
+            new_branch_tier1_loss = probe_tracking.branch_tier1_loss_history.at[branch, branch_ptr].set(
+                loss_components.get('tier1_loss', jnp.float32(0.0)))
+            new_branch_tier2_loss = probe_tracking.branch_tier2_loss_history.at[branch, branch_ptr].set(
+                loss_components.get('tier2_loss', jnp.float32(0.0)))
+            new_branch_tier3_loss = probe_tracking.branch_tier3_loss_history.at[branch, branch_ptr].set(
+                loss_components.get('tier3_loss', jnp.float32(0.0)))
+
             probe_tracking = probe_tracking.replace(
                 loss_history=new_loss_history,
                 training_step_history=new_step_history,
@@ -1179,6 +1219,21 @@ class BaseAgent(ABC):
                 last_levels_agent_pos=levels.agent_pos,
                 last_levels_agent_dir=levels.agent_dir,
                 last_branch=branch,
+                # Tier loss tracking
+                tier1_loss_history=new_tier1_loss,
+                tier2_loss_history=new_tier2_loss,
+                tier3_loss_history=new_tier3_loss,
+                tier1_regret_loss_history=new_t1_regret_loss,
+                tier1_difficulty_loss_history=new_t1_difficulty_loss,
+                tier1_branch_loss_history=new_t1_branch_loss,
+                tier1_score_loss_history=new_t1_score_loss,
+                tier2_return_loss_history=new_t2_return_loss,
+                tier2_novelty_loss_history=new_t2_novelty_loss,
+                tier2_unusualness_loss_history=new_t2_unusualness_loss,
+                tier3_drift_loss_history=new_t3_drift_loss,
+                branch_tier1_loss_history=new_branch_tier1_loss,
+                branch_tier2_loss_history=new_branch_tier2_loss,
+                branch_tier3_loss_history=new_branch_tier3_loss,
             )
 
         # Update hidden state samples for t-SNE visualization
@@ -1921,7 +1976,8 @@ class BaseAgent(ABC):
     def log_metrics(self, metrics: dict, train_state: BaseTrainState):
         """Log metrics to wandb. Override _build_log_dict to extend."""
         log_dict = self._build_log_dict(metrics, train_state)
-        wandb.log(log_dict)
+        if self.config.get("use_wandb", True):
+            wandb.log(log_dict)
 
     def _log_periodic_visualizations(
         self,

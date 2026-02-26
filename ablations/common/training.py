@@ -76,6 +76,7 @@ def sample_trajectories_rnn(
     init_env_state: EnvState,
     num_envs: int,
     max_episode_length: int,
+    track_positions: bool = True,
 ) -> Tuple[
     Tuple[chex.PRNGKey, chex.ArrayTree, Observation, EnvState, chex.Array],
     Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict]
@@ -93,19 +94,24 @@ def sample_trajectories_rnn(
         init_env_state: Initial environment states
         num_envs: Number of parallel environments
         max_episode_length: Number of steps to collect
+        track_positions: Whether to extract agent_pos/agent_dir from env_state.
+            Set False for environments (e.g. MazeEditor) whose EnvState lacks these fields.
 
     Returns:
         Final carry: (rng, hstate, last_obs, last_env_state, last_value)
         Trajectory: (obs, actions, rewards, dones, log_probs, values, info)
             info includes 'agent_pos' (T, N, 2) and 'agent_dir' (T, N) from env_state
+            when track_positions=True
     """
     def sample_step(carry, _):
         rng, hstate, obs, env_state, last_done = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
         # Extract agent positions/directions before stepping
-        step_agent_pos = env_state.agent_pos  # (N, 2)
-        step_agent_dir = env_state.agent_dir  # (N,)
+        if track_positions:
+            inner = env_state.env_state if hasattr(env_state, 'env_state') else env_state
+            step_agent_pos = inner.agent_pos  # (N, 2)
+            step_agent_dir = inner.agent_dir  # (N,)
 
         # Add time dimension for network
         x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, last_done))
@@ -125,8 +131,9 @@ def sample_trajectories_rnn(
         )(jax.random.split(rng_step, num_envs), env_state, action, env_params)
 
         # Inject agent position/direction into info
-        info['agent_pos'] = step_agent_pos
-        info['agent_dir'] = step_agent_dir
+        if track_positions:
+            info['agent_pos'] = step_agent_pos
+            info['agent_dir'] = step_agent_dir
 
         carry = (rng, hstate, next_obs, env_state, done)
         return carry, (obs, action, reward, done, log_prob, value, info)
@@ -170,8 +177,10 @@ def sample_trajectories_rnn_with_context(
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
         # Extract agent positions/directions before stepping
-        step_agent_pos = env_state.agent_pos  # (N, 2)
-        step_agent_dir = env_state.agent_dir  # (N,)
+        # env_state may be wrapped in AutoReplayState
+        inner = env_state.env_state if hasattr(env_state, 'env_state') else env_state
+        step_agent_pos = inner.agent_pos  # (N, 2)
+        step_agent_dir = inner.agent_dir  # (N,)
 
         x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, last_done))
         # Pass context to network
@@ -240,11 +249,13 @@ def sample_trajectories_rnn_with_curriculum(
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
         # Extract agent positions/directions before stepping
-        step_agent_pos = env_state.agent_pos  # (N, 2)
-        step_agent_dir = env_state.agent_dir  # (N,)
+        # env_state may be wrapped in AutoReplayState
+        inner = env_state.env_state if hasattr(env_state, 'env_state') else env_state
+        step_agent_pos = inner.agent_pos  # (N, 2)
+        step_agent_dir = inner.agent_dir  # (N,)
 
         x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, last_done))
-        hstate, pi, value, _ = train_state.apply_fn(
+        hstate, pi, value = train_state.apply_fn(
             train_state.params, x, hstate,
             curriculum_features=curriculum_features,
             predict_curriculum=False,
@@ -277,7 +288,7 @@ def sample_trajectories_rnn_with_curriculum(
     )
 
     x = jax.tree_util.tree_map(lambda x: x[None, ...], (last_obs, last_done))
-    _, _, last_value, _ = train_state.apply_fn(
+    _, _, last_value = train_state.apply_fn(
         train_state.params, x, hstate,
         curriculum_features=curriculum_features,
         predict_curriculum=False,

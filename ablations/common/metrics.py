@@ -54,20 +54,121 @@ def compute_random_baselines(
 # PROBE LOSS COMPUTATION
 # =============================================================================
 
+def _compute_tier_losses(
+    predictions: dict,
+    tier_targets: dict,
+    is_paired: bool,
+    loss_dict: dict,
+) -> tuple:
+    """Compute tier 1/2/3 losses from predictions and targets.
+
+    Populates loss_dict with per-component tier losses under tier1/, tier2/, tier3/ prefixes.
+    Returns (tier1_loss, tier2_loss, tier3_loss) scalars.
+    """
+    if tier_targets is None:
+        loss_dict['tier1/regret'] = jnp.float32(0.0)
+        loss_dict['tier1/difficulty'] = jnp.float32(0.0)
+        loss_dict['tier1/branch'] = jnp.float32(0.0)
+        loss_dict['tier1/score'] = jnp.float32(0.0)
+        loss_dict['tier2/return'] = jnp.float32(0.0)
+        loss_dict['tier2/regret_source'] = jnp.float32(0.0)
+        loss_dict['tier2/novelty'] = jnp.float32(0.0)
+        loss_dict['tier2/unusualness'] = jnp.float32(0.0)
+        loss_dict['tier3/drift'] = jnp.float32(0.0)
+        loss_dict['tier3/adv_entropy'] = jnp.float32(0.0)
+        return jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)
+
+    paired_mask = jnp.float32(is_paired)
+
+    # --- Tier 1: Curriculum Dynamics ---
+    t1_regret_loss = jnp.float32(0.0)
+    t1_difficulty_loss = jnp.float32(0.0)
+    t1_branch_loss = jnp.float32(0.0)
+    t1_score_loss = jnp.float32(0.0)
+
+    if 't1_regret' in predictions:
+        t1_regret_loss = (predictions['t1_regret'] - tier_targets['t1_regret']) ** 2
+    if 't1_difficulty' in predictions:
+        t1_difficulty_loss = ((predictions['t1_difficulty'] - tier_targets['t1_difficulty']) ** 2).mean()
+    if 't1_branch' in predictions:
+        t1_branch_loss = optax.softmax_cross_entropy_with_integer_labels(
+            predictions['t1_branch'], tier_targets['t1_branch']
+        )
+    if 't1_score' in predictions:
+        t1_score_loss = (predictions['t1_score'] - tier_targets['t1_score']) ** 2
+
+    tier1_loss = t1_regret_loss + t1_difficulty_loss + t1_branch_loss + t1_score_loss
+
+    # --- Tier 2: Agent-Curriculum Interaction ---
+    t2_return_loss = jnp.float32(0.0)
+    t2_regret_source_loss = jnp.float32(0.0)
+    t2_novelty_loss = jnp.float32(0.0)
+    t2_unusualness_loss = jnp.float32(0.0)
+
+    if 't2_return' in predictions:
+        t2_return_loss = (predictions['t2_return'] - tier_targets['t2_return']) ** 2
+    if 't2_regret_source' in predictions:
+        t2_regret_source_loss = optax.sigmoid_binary_cross_entropy(
+            predictions['t2_regret_source'], tier_targets['t2_regret_source']
+        ) * paired_mask
+    if 't2_novelty' in predictions:
+        t2_novelty_loss = (predictions['t2_novelty'] - tier_targets['t2_novelty']) ** 2
+    if 't2_unusualness' in predictions:
+        t2_unusualness_loss = (predictions['t2_unusualness'] - tier_targets['t2_unusualness']) ** 2
+
+    tier2_loss = t2_return_loss + t2_regret_source_loss + t2_novelty_loss + t2_unusualness_loss
+
+    # --- Tier 3: Meta-Curriculum ---
+    t3_drift_loss = jnp.float32(0.0)
+    t3_adv_entropy_loss = jnp.float32(0.0)
+
+    if 't3_drift' in predictions:
+        t3_drift_loss = ((predictions['t3_drift'] - tier_targets['t3_drift']) ** 2).mean()
+    if 't3_adv_entropy' in predictions:
+        t3_adv_entropy_loss = (predictions['t3_adv_entropy'] - tier_targets['t3_adv_entropy']) ** 2 * paired_mask
+
+    tier3_loss = t3_drift_loss + t3_adv_entropy_loss
+
+    # Populate loss dict
+    loss_dict['tier1/regret'] = t1_regret_loss
+    loss_dict['tier1/difficulty'] = t1_difficulty_loss
+    loss_dict['tier1/branch'] = t1_branch_loss
+    loss_dict['tier1/score'] = t1_score_loss
+    loss_dict['tier2/return'] = t2_return_loss
+    loss_dict['tier2/regret_source'] = t2_regret_source_loss
+    loss_dict['tier2/novelty'] = t2_novelty_loss
+    loss_dict['tier2/unusualness'] = t2_unusualness_loss
+    loss_dict['tier3/drift'] = t3_drift_loss
+    loss_dict['tier3/adv_entropy'] = t3_adv_entropy_loss
+
+    return tier1_loss, tier2_loss, tier3_loss
+
+
 def compute_probe_loss(
     predictions: dict,
     actual_level,
     env_height: int = DEFAULT_ENV_HEIGHT,
     env_width: int = DEFAULT_ENV_WIDTH,
+    tier_targets: dict = None,
+    is_paired: bool = False,
+    tier1_weight: float = 1.0,
+    tier2_weight: float = 1.0,
+    tier3_weight: float = 1.0,
 ) -> tuple:
     """
     Compute probe loss for a single prediction/level pair.
 
     Args:
-        predictions: Dict with wall_logits, goal_logits, agent_pos_logits, agent_dir_logits
+        predictions: Dict with wall_logits, goal_logits, agent_pos_logits, agent_dir_logits,
+                     and optional tier 1/2/3 predictions
         actual_level: Level dataclass with wall_map, goal_pos, agent_pos, agent_dir
         env_height: Environment height
         env_width: Environment width
+        tier_targets: Optional dict with tier 1/2/3 ground truth targets
+        is_paired: Whether using PAIRED training
+        tier1_weight: Weight for Tier 1 loss
+        tier2_weight: Weight for Tier 2 loss
+        tier3_weight: Weight for Tier 3 loss
 
     Returns:
         total_loss: Scalar loss
@@ -97,15 +198,31 @@ def compute_probe_loss(
     agent_dir_log_probs = jax.nn.log_softmax(predictions['agent_dir_logits'])
     agent_dir_loss = -agent_dir_log_probs[actual_level.agent_dir]
 
-    total_loss = wall_loss + goal_loss + agent_pos_loss + agent_dir_loss
+    tier0_loss = wall_loss + goal_loss + agent_pos_loss + agent_dir_loss
 
     loss_dict = {
         'wall_loss': wall_loss,
         'goal_loss': goal_loss,
         'agent_pos_loss': agent_pos_loss,
         'agent_dir_loss': agent_dir_loss,
-        'total_loss': total_loss,
+        'tier0_loss': tier0_loss,
     }
+
+    # Tier 1/2/3 losses
+    tier1_loss, tier2_loss, tier3_loss = _compute_tier_losses(
+        predictions, tier_targets, is_paired, loss_dict,
+    )
+
+    total_loss = (
+        tier0_loss
+        + tier1_weight * tier1_loss
+        + tier2_weight * tier2_loss
+        + tier3_weight * tier3_loss
+    )
+    loss_dict['tier1_loss'] = tier1_loss
+    loss_dict['tier2_loss'] = tier2_loss
+    loss_dict['tier3_loss'] = tier3_loss
+    loss_dict['total_loss'] = total_loss
 
     return total_loss, loss_dict
 
@@ -115,6 +232,11 @@ def compute_probe_loss_batch(
     actual_levels_batch,
     env_height: int = DEFAULT_ENV_HEIGHT,
     env_width: int = DEFAULT_ENV_WIDTH,
+    tier_targets: dict = None,
+    is_paired: bool = False,
+    tier1_weight: float = 1.0,
+    tier2_weight: float = 1.0,
+    tier3_weight: float = 1.0,
 ) -> tuple:
     """
     Compute probe loss for a batch of predictions/levels.
@@ -147,15 +269,36 @@ def compute_probe_loss_batch(
     agent_dir_log_probs = jax.nn.log_softmax(predictions_batch['agent_dir_logits'])
     agent_dir_loss = -jnp.mean(jax.vmap(lambda lp, idx: lp[idx])(agent_dir_log_probs, actual_levels_batch.agent_dir))
 
-    total_loss = wall_loss + goal_loss + agent_pos_loss + agent_dir_loss
+    tier0_loss = wall_loss + goal_loss + agent_pos_loss + agent_dir_loss
 
     loss_dict = {
         'wall_loss': wall_loss,
         'goal_loss': goal_loss,
         'agent_pos_loss': agent_pos_loss,
         'agent_dir_loss': agent_dir_loss,
-        'total_loss': total_loss,
+        'tier0_loss': tier0_loss,
     }
+
+    # For tier losses, use first element of batch predictions (tier outputs are not batched in probe)
+    # The probe produces per-batch tier predictions; use mean of batch
+    tier_preds = {}
+    for key in ['t1_regret', 't1_difficulty', 't1_branch', 't1_score',
+                't2_return', 't2_regret_source', 't2_novelty', 't2_unusualness',
+                't3_drift', 't3_adv_entropy']:
+        if key in predictions_batch:
+            val = predictions_batch[key]
+            # Take mean across batch dimension if batched
+            tier_preds[key] = val.mean(axis=0) if val.ndim > 0 and val.shape[0] == batch_size else val
+
+    t1_loss, t2_loss, t3_loss = _compute_tier_losses(
+        tier_preds, tier_targets, is_paired, loss_dict,
+    )
+    loss_dict['tier1_loss'] = t1_loss
+    loss_dict['tier2_loss'] = t2_loss
+    loss_dict['tier3_loss'] = t3_loss
+
+    total_loss = tier0_loss + tier1_weight * t1_loss + tier2_weight * t2_loss + tier3_weight * t3_loss
+    loss_dict['total_loss'] = total_loss
 
     return total_loss, loss_dict
 
@@ -297,8 +440,8 @@ def compute_per_instance_calibration_batch(
 def compute_learnability(
     loss_history: chex.Array,
     step_history: chex.Array,
-    total_samples: int,
-    current_step: int,
+    total_samples,
+    current_step,
 ) -> tuple:
     """
     Compute learnability: does the probe learn to predict better over time?
@@ -306,9 +449,11 @@ def compute_learnability(
     High learnability = agent's hidden state encodes more curriculum
     information as training progresses.
 
+    JIT-compatible: no Python float()/int() on traced values.
+
     Returns:
-        learnability: Scalar (positive = improving)
-        details: Dict with trend info
+        learnability: Scalar JAX array (positive = improving)
+        details: Dict with trend info (JAX arrays)
     """
     buffer_size = loss_history.shape[0]
     valid_samples = jnp.minimum(total_samples, buffer_size)
@@ -336,15 +481,15 @@ def compute_learnability(
     learnability = early_loss - late_loss
 
     details = {
-        "early_loss": float(early_loss),
-        "late_loss": float(late_loss),
-        "improvement": float(learnability),
-        "early_samples": int(early_count),
-        "late_samples": int(late_count),
-        "median_step": int(median_step),
+        "early_loss": early_loss,
+        "late_loss": late_loss,
+        "improvement": learnability,
+        "early_samples": early_count,
+        "late_samples": late_count,
+        "median_step": median_step,
     }
 
-    return float(learnability), details
+    return learnability, details
 
 
 def compute_novelty(
@@ -441,6 +586,11 @@ def compute_curriculum_prediction_loss(
     env_width: int = DEFAULT_ENV_WIDTH,
     wall_mask=None,
     wall_loss_region: str = "full",
+    tier_targets: dict = None,
+    is_paired: bool = False,
+    tier1_weight: float = 1.0,
+    tier2_weight: float = 1.0,
+    tier3_weight: float = 1.0,
 ) -> Tuple[jnp.ndarray, dict]:
     """
     Compute loss between predicted distributions and actual level.
@@ -562,8 +712,8 @@ def compute_curriculum_prediction_loss(
         actual_level.agent_dir
     )
 
-    # Weighted total loss
-    total_loss = (
+    # Tier 0 weighted loss
+    tier0_loss = (
         wall_weight * wall_loss +
         goal_weight * goal_loss +
         agent_pos_weight * agent_pos_loss +
@@ -575,7 +725,7 @@ def compute_curriculum_prediction_loss(
         'goal_loss': goal_loss,
         'agent_pos_loss': agent_pos_loss,
         'agent_dir_loss': agent_dir_loss,
-        'total_loss': total_loss,
+        'tier0_loss': tier0_loss,
         # Also compute NLL (same as CE for these)
         'wall_nll': wall_loss,
         'goal_nll': goal_loss,
@@ -596,6 +746,17 @@ def compute_curriculum_prediction_loss(
         'zone_coverage/adjacent_frac': adjacent_frac,
         'zone_coverage/distant_frac': distant_frac,
     }
+
+    # Tier 1/2/3 losses
+    t1_loss, t2_loss, t3_loss = _compute_tier_losses(
+        predictions, tier_targets, is_paired, metrics,
+    )
+    metrics['tier1_loss'] = t1_loss
+    metrics['tier2_loss'] = t2_loss
+    metrics['tier3_loss'] = t3_loss
+
+    total_loss = tier0_loss + tier1_weight * t1_loss + tier2_weight * t2_loss + tier3_weight * t3_loss
+    metrics['total_loss'] = total_loss
 
     return total_loss, metrics
 
@@ -858,6 +1019,9 @@ def apply_curriculum_prediction_gradient(
     config: dict,
     env_height: int = DEFAULT_ENV_HEIGHT,
     env_width: int = DEFAULT_ENV_WIDTH,
+    tier_targets: dict = None,
+    is_paired: bool = False,
+    wall_mask=None,
 ) -> Tuple[object, dict]:
     """
     Compute curriculum prediction loss and apply gradients.
@@ -876,6 +1040,9 @@ def apply_curriculum_prediction_gradient(
         config: Training configuration dict
         env_height: Environment height
         env_width: Environment width
+        tier_targets: Optional dict with tier 1/2/3 ground truth targets
+        is_paired: Whether using PAIRED training
+        wall_mask: Optional (H, W) boolean observed mask from previous trajectory
 
     Returns:
         Updated train_state and metrics dict
@@ -910,6 +1077,13 @@ def apply_curriculum_prediction_gradient(
             agent_dir_weight=config.get("curriculum_agent_dir_weight", 1.0),
             env_height=env_height,
             env_width=env_width,
+            wall_mask=wall_mask,
+            wall_loss_region=config.get("wall_loss_region", "full"),
+            tier_targets=tier_targets,
+            is_paired=is_paired,
+            tier1_weight=config.get("tier1_weight", 1.0),
+            tier2_weight=config.get("tier2_weight", 1.0),
+            tier3_weight=config.get("tier3_weight", 1.0),
         )
 
         # Scale by coefficient
@@ -1297,41 +1471,44 @@ def compute_paired_regret_metrics(
 def compute_level_novelty(
     current_wall_maps: chex.Array,
     history_wall_maps: chex.Array,
-    history_count: int,
-) -> float:
+    history_count,
+) -> chex.Array:
     """
     Compute novelty of current levels compared to history.
 
     Novelty = mean minimum distance to historical levels.
+    JIT-compatible: all control flow uses JAX primitives.
 
     Args:
         current_wall_maps: Current level wall maps (batch, H, W)
         history_wall_maps: Historical wall maps buffer (buffer_size, H, W)
-        history_count: Number of valid entries in history
+        history_count: Number of valid entries in history (may be traced)
 
     Returns:
         novelty: Mean novelty score (higher = more novel)
     """
-    if history_count < 1:
-        return 1.0  # First levels are maximally novel
-
     batch_size = current_wall_maps.shape[0]
     buffer_size = history_wall_maps.shape[0]
-    n_history = min(history_count, buffer_size)
 
     # Flatten wall maps for distance computation
     current_flat = current_wall_maps.reshape(batch_size, -1).astype(jnp.float32)
-    history_flat = history_wall_maps[:n_history].reshape(n_history, -1).astype(jnp.float32)
+    history_flat = history_wall_maps.reshape(buffer_size, -1).astype(jnp.float32)
+
+    # Mask invalid history entries with large distance (so they don't affect min)
+    valid_mask = jnp.arange(buffer_size) < history_count  # (buffer_size,)
 
     # Compute pairwise Hamming distances (as fraction)
     def min_distance_to_history(current_level):
         distances = jnp.abs(current_level[None, :] - history_flat).mean(axis=1)
+        # Set invalid entries to large value so they don't win the min
+        distances = jnp.where(valid_mask, distances, jnp.float32(2.0))
         return distances.min()
 
     min_distances = jax.vmap(min_distance_to_history)(current_flat)
-    novelty = float(min_distances.mean())
+    novelty = min_distances.mean()
 
-    return novelty
+    # If no history, return 1.0 (maximally novel)
+    return jnp.where(history_count < 1, jnp.float32(1.0), novelty)
 
 
 def compute_paired_openendedness(

@@ -13,6 +13,33 @@ from typing import Dict, Any, Optional
 import jax
 
 
+class _PAIREDTrainStateWrapper:
+    """Wraps PAIREDTrainState to expose protagonist's apply_fn/params for experiments.
+
+    Experiments access self.train_state.apply_fn and self.train_state.params,
+    which don't exist on PAIREDTrainState. This wrapper delegates those to the
+    protagonist's train state while preserving access to ant_train_state/adv_train_state.
+    """
+
+    def __init__(self, paired_state):
+        self._paired_state = paired_state
+        # Expose protagonist's apply_fn and params at top level
+        self.apply_fn = paired_state.pro_train_state.apply_fn
+        self.params = paired_state.pro_train_state.params
+        # Expose sub-states for experiments that access them via getattr
+        self.pro_train_state = paired_state.pro_train_state
+        self.ant_train_state = paired_state.ant_train_state
+        self.adv_train_state = paired_state.adv_train_state
+
+    def __getattr__(self, name):
+        # Fall back to the underlying PAIREDTrainState for other attributes
+        return getattr(self._paired_state, name)
+
+
+def _wrap_paired_train_state(paired_state):
+    return _PAIREDTrainStateWrapper(paired_state)
+
+
 def get_experiment_class(experiment_name: str):
     """Get experiment class by name."""
     from . import (
@@ -195,15 +222,30 @@ def run_experiment(
     # Get experiment class
     ExperimentClass = get_experiment_class(experiment_name)
 
-    # Load agent first (needed for checkpoint template)
-    agent = load_agent(agent_type)
+    # Read config from checkpoint dir first so agent gets proper config
+    config_path = os.path.join(checkpoint_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+    else:
+        config = {}
+    config['training_method'] = training_method
+
+    # Load agent with checkpoint config (needed for checkpoint template)
+    agent = load_agent(agent_type, config)
 
     # Load checkpoint (uses agent for train_state template)
     train_state, checkpoint_config = load_checkpoint(checkpoint_path, agent=agent, seed=seed)
 
-    # Merge checkpoint config with any overrides
-    config = checkpoint_config or {}
-    config['training_method'] = training_method
+    # Merge any additional checkpoint config
+    if checkpoint_config:
+        config.update(checkpoint_config)
+
+    # For PAIRED agents, wrap the train_state so experiments can access
+    # apply_fn/params (protagonist) while still accessing ant_train_state etc.
+    from ..common.types import PAIREDTrainState
+    if isinstance(train_state, PAIREDTrainState):
+        train_state = _wrap_paired_train_state(train_state)
 
     # Create experiment with required config arg
     kwargs = experiment_kwargs or {}

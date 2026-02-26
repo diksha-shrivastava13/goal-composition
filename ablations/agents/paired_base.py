@@ -34,8 +34,6 @@ from jaxued.environments.underspecified_env import EnvParams
 from jaxued.environments.maze import Level
 from jaxued.environments.maze.env_editor import MazeEditor
 from jaxued.utils import compute_max_mean_returns_epcount
-from jaxued.wrappers import AutoReplayWrapper
-
 from ..common.types import (
     PAIREDTrainState,
     ProbeTrackingState,
@@ -139,8 +137,7 @@ class PAIREDBaseAgent(ABC):
                 n_walls=config["n_walls"],
             )
 
-        # Wrap with AutoReplayWrapper for automatic episode reset
-        self.env = AutoReplayWrapper(self.env)
+        # env is already wrapped with AutoReplayWrapper by setup_environment()
         self.env_params = self.env.default_params
 
         # Setup MazeEditor for adversary
@@ -168,6 +165,10 @@ class PAIREDBaseAgent(ABC):
     def get_actor_critic_class(self) -> type:
         """Return the ActorCritic class to use for protagonist/antagonist."""
         pass
+
+    def _get_student_init_kwargs(self) -> dict:
+        """Return extra kwargs for student network init. Override for networks needing extra args."""
+        return {}
 
     @abstractmethod
     def initialize_hidden_state(self, batch_size: int) -> chex.ArrayTree:
@@ -207,10 +208,13 @@ class PAIREDBaseAgent(ABC):
             network_cls,
             prefix: str,
             network_kwargs: dict = None,
+            init_kwargs: dict = None,
         ) -> FlaxTrainState:
             """Create train state for a single network."""
             if network_kwargs is None:
                 network_kwargs = {}
+            if init_kwargs is None:
+                init_kwargs = {}
 
             def linear_schedule(count):
                 frac = (
@@ -236,7 +240,8 @@ class PAIREDBaseAgent(ABC):
             rng, init_rng = jax.random.split(rng)
             network_params = network.init(
                 init_rng, init_x,
-                network_cls.initialize_carry((config["num_train_envs"],))
+                network_cls.initialize_carry((config["num_train_envs"],)),
+                **init_kwargs,
             )
 
             tx = optax.chain(
@@ -254,11 +259,14 @@ class PAIREDBaseAgent(ABC):
 
         # Create protagonist and antagonist (same architecture)
         actor_critic_cls = self.get_actor_critic_class()
+        student_init_kwargs = self._get_student_init_kwargs()
         pro_train_state = create_network_state(
-            rng_pro, self.env, self.env_params, actor_critic_cls, "student_"
+            rng_pro, self.env, self.env_params, actor_critic_cls, "student_",
+            init_kwargs=student_init_kwargs,
         )
         ant_train_state = create_network_state(
-            rng_ant, self.env, self.env_params, actor_critic_cls, "student_"
+            rng_ant, self.env, self.env_params, actor_critic_cls, "student_",
+            init_kwargs=student_init_kwargs,
         )
 
         # Create adversary
@@ -293,12 +301,27 @@ class PAIREDBaseAgent(ABC):
         # Initialize PAIRED-specific history tracking
         history_size = config.get("paired_history_size", 500)
 
+        # Initialize agent tracking (must not be None for scan pytree consistency)
+        agent_tracking = create_agent_tracking_state(
+            buffer_size=config.get("agent_tracking_buffer_size", 1000)
+        )
+
+        # Initialize last_adversary_level with batched empty levels
+        # (must not be None for scan pytree consistency)
+        empty_level = self.sample_empty_level()
+        num_envs = config["num_train_envs"]
+        init_last_adv_level = jax.tree_util.tree_map(
+            lambda x: jnp.broadcast_to(jnp.asarray(x), (num_envs, *jnp.asarray(x).shape)),
+            empty_level,
+        )
+
         return PAIREDTrainState(
             update_count=0,
             pro_train_state=pro_train_state,
             ant_train_state=ant_train_state,
             adv_train_state=adv_train_state,
             memory_state=None,
+            agent_tracking=agent_tracking,
             probe_params=probe_params,
             probe_opt_state=probe_opt_state,
             probe_tracking=probe_tracking,
@@ -312,6 +335,7 @@ class PAIREDBaseAgent(ABC):
             level_history_wall_maps=jnp.zeros((min(history_size, 100), 13, 13), dtype=jnp.bool_),
             history_ptr=0,
             history_total=0,
+            last_adversary_level=init_last_adv_level,
         )
 
     def train(self):
@@ -425,7 +449,7 @@ class PAIREDBaseAgent(ABC):
 
         # Compute displacement from previous adversary-generated levels
         # On first step, last_adversary_level is None so compare with self (zero displacement)
-        prev_levels = train_state.last_adversary_level if train_state.last_adversary_level is not None else levels
+        prev_levels = train_state.last_adversary_level
         displacement = compute_batch_displacement_metrics(levels, prev_levels)
 
         # 2. Protagonist rollout
@@ -586,18 +610,20 @@ class PAIREDBaseAgent(ABC):
                 novelty = compute_level_novelty(
                     levels.wall_map,
                     new_level_history,
-                    min(history_total, level_history_size),
+                    jnp.minimum(history_total, level_history_size),
                 )
                 new_novelty_history = new_novelty_history.at[history_ptr].set(novelty)
 
             # Compute learnability from probe tracking
-            if probe_tracking is not None and probe_tracking.total_samples > 10:
+            if probe_tracking is not None:
                 learnability, _ = compute_learnability(
                     probe_tracking.loss_history,
                     probe_tracking.training_step_history,
                     probe_tracking.total_samples,
                     probe_tracking.current_training_step,
                 )
+                # Only write if we have enough samples (traced condition)
+                learnability = jnp.where(probe_tracking.total_samples > 10, learnability, 0.0)
                 new_learnability_history = new_learnability_history.at[history_ptr].set(learnability)
 
             history_ptr = (history_ptr + 1) % history_size
@@ -678,6 +704,7 @@ class PAIREDBaseAgent(ABC):
                 rng, env, env_params, train_state,
                 init_hstate, init_obs, init_env_state,
                 config["num_train_envs"], num_steps,
+                track_positions=hasattr(init_env_state, 'agent_pos'),
             )
 
         advantages, targets = compute_gae(
@@ -784,6 +811,7 @@ class PAIREDBaseAgent(ABC):
         rewards: chex.Array,
         dones: chex.Array,
         training_step: int,
+        tier_targets: dict = None,
     ) -> Tuple[chex.ArrayTree, chex.ArrayTree, ProbeTrackingState]:
         """
         Update probe network on protagonist hidden state.
@@ -825,10 +853,19 @@ class PAIREDBaseAgent(ABC):
                 episode_solved=episode_solved,
                 episode_length=episode_lengths,
             )
-            loss, _ = compute_probe_loss_batch(preds, levels)
-            return loss
+            loss, loss_dict = compute_probe_loss_batch(
+                preds, levels,
+                tier_targets=tier_targets,
+                is_paired=True,
+                tier1_weight=config.get("tier1_weight", 1.0),
+                tier2_weight=config.get("tier2_weight", 1.0),
+                tier3_weight=config.get("tier3_weight", 1.0),
+            )
+            return loss, loss_dict
 
-        loss, grads = jax.value_and_grad(probe_loss_fn)(probe_params)
+        (loss, loss_components), grads = jax.value_and_grad(
+            probe_loss_fn, has_aux=True
+        )(probe_params)
 
         # Update probe params
         probe_tx = optax.adam(learning_rate=config.get("probe_lr", 1e-3))
@@ -876,6 +913,30 @@ class PAIREDBaseAgent(ABC):
             new_per_instance_loss = probe_tracking.per_instance_loss_history.at[pi_ptr].set(loss)
             new_is_valid = probe_tracking.is_per_instance_valid.at[pi_ptr].set(True)
 
+            # Tier loss tracking
+            new_tier1_loss = probe_tracking.tier1_loss_history.at[ptr].set(
+                loss_components.get('tier1_loss', jnp.float32(0.0)))
+            new_tier2_loss = probe_tracking.tier2_loss_history.at[ptr].set(
+                loss_components.get('tier2_loss', jnp.float32(0.0)))
+            new_tier3_loss = probe_tracking.tier3_loss_history.at[ptr].set(
+                loss_components.get('tier3_loss', jnp.float32(0.0)))
+            new_t1_regret_loss = probe_tracking.tier1_regret_loss_history.at[ptr].set(
+                loss_components.get('tier1/regret', jnp.float32(0.0)))
+            new_t1_difficulty_loss = probe_tracking.tier1_difficulty_loss_history.at[ptr].set(
+                loss_components.get('tier1/difficulty', jnp.float32(0.0)))
+            new_t1_branch_loss = probe_tracking.tier1_branch_loss_history.at[ptr].set(
+                loss_components.get('tier1/branch', jnp.float32(0.0)))
+            new_t1_score_loss = probe_tracking.tier1_score_loss_history.at[ptr].set(
+                loss_components.get('tier1/score', jnp.float32(0.0)))
+            new_t2_return_loss = probe_tracking.tier2_return_loss_history.at[ptr].set(
+                loss_components.get('tier2/return', jnp.float32(0.0)))
+            new_t2_novelty_loss = probe_tracking.tier2_novelty_loss_history.at[ptr].set(
+                loss_components.get('tier2/novelty', jnp.float32(0.0)))
+            new_t2_unusualness_loss = probe_tracking.tier2_unusualness_loss_history.at[ptr].set(
+                loss_components.get('tier2/unusualness', jnp.float32(0.0)))
+            new_t3_drift_loss = probe_tracking.tier3_drift_loss_history.at[ptr].set(
+                loss_components.get('tier3/drift', jnp.float32(0.0)))
+
             probe_tracking = probe_tracking.replace(
                 loss_history=new_loss_history,
                 training_step_history=new_step_history,
@@ -894,6 +955,18 @@ class PAIREDBaseAgent(ABC):
                 per_instance_ptr=pi_ptr + 1,
                 per_instance_total=probe_tracking.per_instance_total + 1,
                 is_per_instance_valid=new_is_valid,
+                # Tier losses
+                tier1_loss_history=new_tier1_loss,
+                tier2_loss_history=new_tier2_loss,
+                tier3_loss_history=new_tier3_loss,
+                tier1_regret_loss_history=new_t1_regret_loss,
+                tier1_difficulty_loss_history=new_t1_difficulty_loss,
+                tier1_branch_loss_history=new_t1_branch_loss,
+                tier1_score_loss_history=new_t1_score_loss,
+                tier2_return_loss_history=new_t2_return_loss,
+                tier2_novelty_loss_history=new_t2_novelty_loss,
+                tier2_unusualness_loss_history=new_t2_unusualness_loss,
+                tier3_drift_loss_history=new_t3_drift_loss,
             )
 
         return new_probe_params, new_opt_state, probe_tracking, loss
@@ -1001,7 +1074,7 @@ class PAIREDBaseAgent(ABC):
         # ADVERSARY METRICS (level generator)
         # =====================================================================
         log_dict["paired/adversary/success_rate"] = regret_metrics['adversary_success_rate']
-        log_dict["paired/adversary/wall_density"] = float(metrics.get("mean_num_blocks", 0)) / 169.0
+        log_dict["paired/adversary/wall_density"] = float(metrics.get("mean_num_blocks", jnp.zeros(1)).mean()) / 169.0
 
         # Adversary-generated level features
         if train_state.level_history_wall_maps is not None and train_state.history_total > 0:
@@ -1286,7 +1359,8 @@ class PAIREDBaseAgent(ABC):
     def log_metrics(self, metrics: dict, train_state: PAIREDTrainState):
         """Log all PAIRED metrics to wandb. Calls _build_log_dict then logs."""
         log_dict = self._build_log_dict(metrics, train_state)
-        wandb.log(log_dict)
+        if self.config.get("use_wandb", True):
+            wandb.log(log_dict)
 
     def _log_paired_visualizations(
         self,

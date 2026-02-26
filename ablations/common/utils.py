@@ -90,11 +90,28 @@ def load_checkpoint(
         step = checkpoint_manager.latest_step()
 
     loaded_checkpoint = checkpoint_manager.restore(step)
-    params = loaded_checkpoint["params"]
-    train_state = train_state_template.replace(params=params)
 
-    # Load probe params if present
-    if "probe_params" in loaded_checkpoint:
+    if "params" in loaded_checkpoint:
+        # Standard (non-PAIRED) checkpoint
+        train_state = train_state_template.replace(params=loaded_checkpoint["params"])
+    elif "pro_params" in loaded_checkpoint:
+        # PAIRED checkpoint with 3 network params
+        train_state = train_state_template.replace(
+            pro_train_state=train_state_template.pro_train_state.replace(
+                params=loaded_checkpoint["pro_params"]
+            ),
+            ant_train_state=train_state_template.ant_train_state.replace(
+                params=loaded_checkpoint["ant_params"]
+            ),
+            adv_train_state=train_state_template.adv_train_state.replace(
+                params=loaded_checkpoint["adv_params"]
+            ),
+        )
+    else:
+        train_state = train_state_template
+
+    # Load probe params if present and train state supports it
+    if "probe_params" in loaded_checkpoint and hasattr(train_state, 'probe_params'):
         train_state = train_state.replace(probe_params=loaded_checkpoint["probe_params"])
 
     return train_state, config
@@ -229,6 +246,7 @@ def get_default_config() -> dict:
         "n_env_predictions": 100,
 
         # Curriculum prediction config (for next_env_prediction agent)
+        "wall_loss_region": "full",
         "prediction_coeff": 0.1,
         "curriculum_history_length": 64,
         "curriculum_wall_weight": 1.0,

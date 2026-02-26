@@ -392,7 +392,7 @@ class CurriculumProbe(nn.Module):
 
         x = jnp.concatenate(features, axis=-1) if len(features) > 1 else hidden_state
 
-        # Probe encoder
+        # Probe encoder (shared trunk, kept at 128 for probe)
         x = nn.Dense(
             128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0),
             name="probe_encoder_0"
@@ -405,8 +405,7 @@ class CurriculumProbe(nn.Module):
         )(x)
         x = nn.relu(x)
 
-        # Prediction heads
-
+        # === Tier 0: Prediction heads (existing) ===
         # Wall prediction: per-cell probability
         wall_logits = nn.Dense(
             self.env_height * self.env_width,
@@ -435,11 +434,69 @@ class CurriculumProbe(nn.Module):
             name="probe_agent_dir"
         )(x)
 
+        # === Tier 1: Curriculum Dynamics ===
+        t1_h = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0),
+            name="probe_tier1_hidden"
+        )(x)
+        t1_h = nn.relu(t1_h)
+
+        t1_regret = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                             name="probe_t1_regret")(t1_h).squeeze(-1)
+        t1_difficulty = nn.Dense(3, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                                 name="probe_t1_difficulty")(t1_h)
+        t1_branch = nn.Dense(3, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                             name="probe_t1_branch")(t1_h)
+        t1_score = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                            name="probe_t1_score")(t1_h).squeeze(-1)
+
+        # === Tier 2: Agent-Curriculum Interaction ===
+        t2_h = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0),
+            name="probe_tier2_hidden"
+        )(x)
+        t2_h = nn.relu(t2_h)
+
+        t2_return = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                             name="probe_t2_return")(t2_h).squeeze(-1)
+        t2_regret_source = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                                    name="probe_t2_regret_source")(t2_h).squeeze(-1)
+        t2_novelty = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                              name="probe_t2_novelty")(t2_h).squeeze(-1)
+        t2_unusualness = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                                  name="probe_t2_unusualness")(t2_h).squeeze(-1)
+
+        # === Tier 3: Meta-Curriculum ===
+        t3_h = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0),
+            name="probe_tier3_hidden"
+        )(x)
+        t3_h = nn.relu(t3_h)
+
+        t3_drift = nn.Dense(3, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                            name="probe_t3_drift")(t3_h)
+        t3_adv_entropy = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                                  name="probe_t3_adv_entropy")(t3_h).squeeze(-1)
+
         return {
+            # Tier 0
             'wall_logits': wall_logits,
             'goal_logits': goal_logits,
             'agent_pos_logits': agent_pos_logits,
             'agent_dir_logits': agent_dir_logits,
+            # Tier 1
+            't1_regret': t1_regret,
+            't1_difficulty': t1_difficulty,
+            't1_branch': t1_branch,
+            't1_score': t1_score,
+            # Tier 2
+            't2_return': t2_return,
+            't2_regret_source': t2_regret_source,
+            't2_novelty': t2_novelty,
+            't2_unusualness': t2_unusualness,
+            # Tier 3
+            't3_drift': t3_drift,
+            't3_adv_entropy': t3_adv_entropy,
         }
 
 
@@ -579,9 +636,9 @@ class CurriculumEncoder(nn.Module):
         Returns:
             curriculum_embedding: (hidden_size,) encoding of curriculum state
         """
-        # First layer: process raw features
+        # First layer: process raw features (512 to handle larger feature vector)
         x = nn.Dense(
-            256,
+            512,
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
             name="curriculum_encoder_0"
@@ -641,8 +698,8 @@ class CurriculumPredictionHead(nn.Module):
         )(hidden)
         hidden = nn.relu(hidden)
 
+        # === Tier 0: Environment variable predictions (existing) ===
         # Wall prediction: per-cell binary probability
-        # Output logits for BCE loss
         wall_logits = nn.Dense(
             self.env_height * self.env_width,
             kernel_init=orthogonal(1.0),
@@ -675,11 +732,96 @@ class CurriculumPredictionHead(nn.Module):
             name="pred_agent_dir"
         )(hidden)
 
+        # === Tier 1: Curriculum Dynamics ===
+        t1_hidden = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0), name="pred_tier1_hidden"
+        )(hidden)
+        t1_hidden = nn.relu(t1_hidden)
+
+        t1_regret = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t1_regret"
+        )(t1_hidden).squeeze(-1)
+
+        t1_difficulty = nn.Dense(
+            3, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t1_difficulty"
+        )(t1_hidden)
+
+        t1_branch = nn.Dense(
+            3, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t1_branch"
+        )(t1_hidden)
+
+        t1_score = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t1_score"
+        )(t1_hidden).squeeze(-1)
+
+        # === Tier 2: Agent-Curriculum Interaction ===
+        t2_hidden = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0), name="pred_tier2_hidden"
+        )(hidden)
+        t2_hidden = nn.relu(t2_hidden)
+
+        t2_return = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t2_return"
+        )(t2_hidden).squeeze(-1)
+
+        t2_regret_source = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t2_regret_source"
+        )(t2_hidden).squeeze(-1)  # Raw logit for BCE
+
+        t2_novelty = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t2_novelty"
+        )(t2_hidden).squeeze(-1)
+
+        t2_unusualness = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t2_unusualness"
+        )(t2_hidden).squeeze(-1)
+
+        # === Tier 3: Meta-Curriculum ===
+        t3_hidden = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0), name="pred_tier3_hidden"
+        )(hidden)
+        t3_hidden = nn.relu(t3_hidden)
+
+        t3_drift = nn.Dense(
+            3, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t3_drift"
+        )(t3_hidden)
+
+        t3_adv_entropy = nn.Dense(
+            1, kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0), name="pred_t3_adv_entropy"
+        )(t3_hidden).squeeze(-1)
+
         return {
+            # Tier 0
             'wall_logits': wall_logits,           # (H, W)
             'goal_logits': goal_logits,           # (H * W,)
             'agent_pos_logits': agent_pos_logits, # (H * W,)
             'agent_dir_logits': agent_dir_logits, # (4,)
+            # Tier 1
+            't1_regret': t1_regret,               # ()
+            't1_difficulty': t1_difficulty,        # (3,)
+            't1_branch': t1_branch,               # (3,)
+            't1_score': t1_score,                  # ()
+            # Tier 2
+            't2_return': t2_return,                # ()
+            't2_regret_source': t2_regret_source,  # ()
+            't2_novelty': t2_novelty,              # ()
+            't2_unusualness': t2_unusualness,      # ()
+            # Tier 3
+            't3_drift': t3_drift,                  # (3,)
+            't3_adv_entropy': t3_adv_entropy,      # ()
         }
 
 
@@ -828,26 +970,24 @@ class ActorCriticWithCurriculumPrediction(nn.Module):
         # before we've seen it.
         curriculum_predictions = None
         if predict_curriculum and curriculum_embed is not None:
-            # Use the curriculum embedding computed earlier (shared with main network)
-            # This is the "shared backbone" - the curriculum understanding is integrated
-            # into the agent's representations
+            # Shared prediction trunk (widened to 256 for tier surface)
             pred_hidden = nn.Dense(
-                128,
+                256,
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
                 name="pred_hidden0"
-            )(curriculum_embed)  # Uses curriculum_embed from shared encoding above
+            )(curriculum_embed)
             pred_hidden = nn.relu(pred_hidden)
 
             pred_hidden = nn.Dense(
-                128,
+                256,
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
                 name="pred_hidden1"
             )(pred_hidden)
             pred_hidden = nn.relu(pred_hidden)
 
-            # Wall prediction: per-cell probability
+            # === Tier 0: Environment variable predictions ===
             wall_logits = nn.Dense(
                 self.env_height * self.env_width,
                 kernel_init=orthogonal(1.0),
@@ -856,7 +996,6 @@ class ActorCriticWithCurriculumPrediction(nn.Module):
             )(pred_hidden)
             wall_logits = wall_logits.reshape(self.env_height, self.env_width)
 
-            # Goal position distribution
             goal_logits = nn.Dense(
                 self.env_height * self.env_width,
                 kernel_init=orthogonal(1.0),
@@ -864,7 +1003,6 @@ class ActorCriticWithCurriculumPrediction(nn.Module):
                 name="pred_goal"
             )(pred_hidden)
 
-            # Agent position distribution
             agent_pos_logits = nn.Dense(
                 self.env_height * self.env_width,
                 kernel_init=orthogonal(1.0),
@@ -872,7 +1010,6 @@ class ActorCriticWithCurriculumPrediction(nn.Module):
                 name="pred_agent_pos"
             )(pred_hidden)
 
-            # Agent direction distribution
             agent_dir_logits = nn.Dense(
                 4,
                 kernel_init=orthogonal(1.0),
@@ -880,14 +1017,61 @@ class ActorCriticWithCurriculumPrediction(nn.Module):
                 name="pred_agent_dir"
             )(pred_hidden)
 
+            # === Tier 1: Curriculum Dynamics ===
+            t1_h = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)),
+                            bias_init=constant(0.0), name="pred_tier1_hidden")(pred_hidden)
+            t1_h = nn.relu(t1_h)
+            t1_regret = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                 bias_init=constant(0.0), name="pred_t1_regret")(t1_h).squeeze(-1)
+            t1_difficulty = nn.Dense(3, kernel_init=orthogonal(1.0),
+                                     bias_init=constant(0.0), name="pred_t1_difficulty")(t1_h)
+            t1_branch = nn.Dense(3, kernel_init=orthogonal(1.0),
+                                 bias_init=constant(0.0), name="pred_t1_branch")(t1_h)
+            t1_score = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                bias_init=constant(0.0), name="pred_t1_score")(t1_h).squeeze(-1)
+
+            # === Tier 2: Agent-Curriculum Interaction ===
+            t2_h = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)),
+                            bias_init=constant(0.0), name="pred_tier2_hidden")(pred_hidden)
+            t2_h = nn.relu(t2_h)
+            t2_return = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                 bias_init=constant(0.0), name="pred_t2_return")(t2_h).squeeze(-1)
+            t2_regret_source = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                        bias_init=constant(0.0), name="pred_t2_regret_source")(t2_h).squeeze(-1)
+            t2_novelty = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                  bias_init=constant(0.0), name="pred_t2_novelty")(t2_h).squeeze(-1)
+            t2_unusualness = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                      bias_init=constant(0.0), name="pred_t2_unusualness")(t2_h).squeeze(-1)
+
+            # === Tier 3: Meta-Curriculum ===
+            t3_h = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)),
+                            bias_init=constant(0.0), name="pred_tier3_hidden")(pred_hidden)
+            t3_h = nn.relu(t3_h)
+            t3_drift = nn.Dense(3, kernel_init=orthogonal(1.0),
+                                bias_init=constant(0.0), name="pred_t3_drift")(t3_h)
+            t3_adv_entropy = nn.Dense(1, kernel_init=orthogonal(1.0),
+                                      bias_init=constant(0.0), name="pred_t3_adv_entropy")(t3_h).squeeze(-1)
+
             curriculum_predictions = {
                 'wall_logits': wall_logits,
                 'goal_logits': goal_logits,
                 'agent_pos_logits': agent_pos_logits,
                 'agent_dir_logits': agent_dir_logits,
+                't1_regret': t1_regret,
+                't1_difficulty': t1_difficulty,
+                't1_branch': t1_branch,
+                't1_score': t1_score,
+                't2_return': t2_return,
+                't2_regret_source': t2_regret_source,
+                't2_novelty': t2_novelty,
+                't2_unusualness': t2_unusualness,
+                't3_drift': t3_drift,
+                't3_adv_entropy': t3_adv_entropy,
             }
 
-        return hidden, pi, jnp.squeeze(value, axis=-1), curriculum_predictions
+        if predict_curriculum:
+            return hidden, pi, jnp.squeeze(value, axis=-1), curriculum_predictions
+        return hidden, pi, jnp.squeeze(value, axis=-1)
 
     @staticmethod
     def initialize_carry(batch_dims):

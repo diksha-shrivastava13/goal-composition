@@ -323,7 +323,17 @@ def train_with_experiments(
         })
 
         # Save checkpoint
-        checkpoint_manager.save(eval_step, args={"params": runner_state[1].params})
+        train_state = runner_state[1]
+        if hasattr(train_state, 'params'):
+            checkpoint_items = {"params": train_state.params}
+        else:
+            # PAIREDTrainState: save all three network params
+            checkpoint_items = {
+                "pro_params": train_state.pro_train_state.params,
+                "ant_params": train_state.ant_train_state.params,
+                "adv_params": train_state.adv_train_state.params,
+            }
+        checkpoint_manager.save(eval_step, items=checkpoint_items)
         checkpoint_manager.wait_until_finished()
 
         print(f"\n[Step {step_num}/{num_updates}] Train time: {train_time:.1f}s")
@@ -486,6 +496,13 @@ Examples:
     probe_group.add_argument("--probe_lr", type=float, default=1e-3)
     probe_group.add_argument("--probe_tracking_buffer_size", type=int, default=500)
 
+    # ---- Prediction / masking ----
+    pred_group = parser.add_argument_group("Prediction params")
+    pred_group.add_argument("--wall_loss_region", type=str, default="full",
+                            choices=["full", "explored", "frontier"],
+                            help="Wall loss masking region (full=all cells, "
+                                 "explored=observed cells, frontier=observed+adjacent)")
+
     # ---- Experiment selection ----
     exp_group = parser.add_argument_group("Experiment selection")
     exp_group.add_argument("--experiments", type=str, nargs="+", default=None,
@@ -594,6 +611,8 @@ Examples:
         "use_probe": args.use_probe,
         "probe_lr": args.probe_lr,
         "probe_tracking_buffer_size": args.probe_tracking_buffer_size,
+        # Prediction masking
+        "wall_loss_region": args.wall_loss_region,
     }
     base_config.update(cli_overrides)
 
