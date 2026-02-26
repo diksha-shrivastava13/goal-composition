@@ -19,11 +19,16 @@ This experiment:
 """
 
 from typing import Dict, Any, List, Optional, Tuple
+import time
+import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
 import chex
 from scipy import stats
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from .base import CheckpointExperiment
 from .probes.property_probe import (
@@ -85,168 +90,193 @@ class LevelProbingExperiment(CheckpointExperiment):
         return "level_probing"
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Collect hidden states at multiple points and level properties."""
+        """Collect hidden states at multiple points and level properties (GPU-batched)."""
         n_levels = self.config.get("n_levels", 500)
         collection_steps = self.config.get("collection_steps", [1, 10, 50, -1])  # -1 = end
         max_episode_length = self.config.get("max_episode_length", 256)
+        timings = {}
 
-        # Data containers - universal properties
-        hidden_states_by_step = {str(s): [] for s in collection_steps}
-        level_properties = {
-            "wall_density": [],
-            "goal_distance": [],
-            "path_length": [],
-            "is_solvable": [],
-            "training_phase": [],
-            "episode_return": [],
-            "episode_solved": [],
-        }
+        # Try to import wandb for optional logging
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
 
-        # Add method-specific properties
-        if self.has_branches:
-            level_properties["branch_type"] = []
-            if self.has_mutations:
-                level_properties["mutation_distance"] = []
+        def _log_timing(phase: str, elapsed: float):
+            timings[phase] = elapsed
+            logger.info(f"[level_probing] {phase}: {elapsed:.2f}s")
+            if _wandb_active:
+                wandb.log({f"level_probing/timing/{phase}": elapsed})
 
-        if self.has_regret:
-            level_properties["regret_estimate"] = []
-            level_properties["adversary_difficulty"] = []
-            level_properties["adversary_strategy_cluster"] = []
-            level_properties["opponent_return_estimate"] = []
+        # --- 1. Generate all levels in batch ---
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n_levels)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log_timing("generate_levels", time.time() - t0)
 
-        # PAIRED bilateral data containers
-        bilateral_data = None
-        if self.has_regret:
-            bilateral_data = {
-                "antagonist_hstates_by_step": {str(s): [] for s in collection_steps},
-                "antagonist_returns": [],
-                "protagonist_returns": [],
-                "policy_divergences": [],
-                "regret_actual": [],
-            }
+        # --- 2. Compute CPU-side level properties ---
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)  # (n_levels, H, W)
+        goal_positions = np.array(levels.goal_pos)  # (n_levels, 2)
+        agent_positions = np.array(levels.agent_pos)  # (n_levels, 2)
+
+        wall_density = wall_maps.mean(axis=(1, 2))  # (n_levels,)
+        goal_distance = np.sqrt(np.sum((goal_positions - agent_positions) ** 2, axis=-1))
+
+        # BFS path lengths (sequential, fast on 13x13)
+        path_lengths = np.array([
+            self._compute_path_length(jax.tree_util.tree_map(lambda x: x[i], levels))
+            for i in tqdm(range(n_levels), desc="BFS path lengths", leave=False)
+        ])
+        is_solvable = path_lengths > 0
 
         training_step = getattr(self.train_state, 'training_step', 0)
         total_training_steps = self.config.get("total_training_steps", 30000)
+        training_phase = np.full(n_levels, training_step / max(total_training_steps, 1))
+        _log_timing("cpu_level_properties", time.time() - t0)
 
-        for i in range(n_levels):
-            rng, rng_level, rng_rollout = jax.random.split(rng, 3)
+        # --- 3. Batched protagonist rollout ---
+        t0 = time.time()
+        rng, rng_pro = jax.random.split(rng)
+        hidden_states_by_step, episode_returns, episode_solved = self._batched_rollout(
+            rng_pro, levels, collection_steps, max_episode_length,
+            self.train_state.apply_fn, self.train_state.params,
+        )
+        _log_timing("protagonist_rollout", time.time() - t0)
 
-            # Generate level
-            level = self.agent.sample_random_level(rng_level)
+        if _wandb_active:
+            wandb.log({
+                "level_probing/protagonist_mean_return": float(episode_returns.mean()),
+                "level_probing/protagonist_solve_rate": float(episode_solved.mean()),
+            })
 
-            # Compute universal level properties
-            wall_density = float(level.wall_map.mean())
-            goal_pos = np.array(level.goal_pos)
-            agent_pos = np.array(level.agent_pos)
-            goal_distance = float(np.sqrt(np.sum((goal_pos - agent_pos) ** 2)))
-
-            # Compute path length (BFS)
-            path_length = self._compute_path_length(level)
-            is_solvable = path_length > 0
-
-            # Training phase (normalized)
-            training_phase = training_step / max(total_training_steps, 1)
-
-            # Run rollout and collect hidden states at specified points
-            rng_rollout, rng_reset = jax.random.split(rng_rollout)
-            hstates_at_steps, episode_return, episode_solved = self._collect_episode_hstates(
-                rng_rollout, level, collection_steps, max_episode_length
-            )
-
-            # Store data
-            for step_key, hstate in hstates_at_steps.items():
-                hidden_states_by_step[step_key].append(hstate)
-
-            # Universal properties
-            level_properties["wall_density"].append(wall_density)
-            level_properties["goal_distance"].append(goal_distance)
-            level_properties["path_length"].append(path_length)
-            level_properties["is_solvable"].append(is_solvable)
-            level_properties["training_phase"].append(training_phase)
-            level_properties["episode_return"].append(episode_return)
-            level_properties["episode_solved"].append(episode_solved)
-
-            # Method-specific properties
-            if self.has_branches:
-                # ACCEL/PLR: branch_type and optionally mutation_distance
-                branch_type = i % self.branch_count  # Cycle through available branches
-                level_properties["branch_type"].append(branch_type)
-
-                if self.has_mutations:
-                    # Mutation distance: 0 for DR/Replay, random for Mutate
-                    mutation_distance = 0.0 if branch_type != 2 else np.random.uniform(1, 5)
-                    level_properties["mutation_distance"].append(mutation_distance)
-
-            if self.has_regret:
-                # PAIRED: regret_estimate and adversary_difficulty
-                regret_estimate = self._estimate_regret_from_result(
-                    level, {'solved': episode_solved, 'return': episode_return}
-                )
-                level_properties["regret_estimate"].append(regret_estimate)
-
-                # Adversary difficulty: proxy based on wall density and path complexity
-                adversary_difficulty = self._estimate_adversary_difficulty(level)
-                level_properties["adversary_difficulty"].append(adversary_difficulty)
-
-                # PAIRED bilateral: collect antagonist data on same level
-                rng, rng_ant = jax.random.split(rng)
-                ant_hstates, ant_return, ant_solved = self._collect_antagonist_episode(
-                    rng_ant, level, collection_steps, max_episode_length
-                )
-
-                for step_key, hstate in ant_hstates.items():
-                    bilateral_data["antagonist_hstates_by_step"][step_key].append(hstate)
-
-                bilateral_data["antagonist_returns"].append(ant_return)
-                bilateral_data["protagonist_returns"].append(episode_return)
-
-                # Compute actual regret
-                regret_actual = ant_return - episode_return
-                bilateral_data["regret_actual"].append(regret_actual)
-                level_properties["regret_estimate"][-1] = regret_actual  # Use actual
-
-                # Compute policy divergence (agent-centric metric)
-                policy_div = self._compute_bilateral_policy_divergence(
-                    hstates_at_steps, ant_hstates
-                )
-                bilateral_data["policy_divergences"].append(policy_div)
-
-                # Adversary strategy cluster (placeholder - actual clustering in C3)
-                strategy_cluster = self._estimate_strategy_cluster(level, adversary_difficulty)
-                level_properties["adversary_strategy_cluster"].append(strategy_cluster)
-
-                # Theory of mind: protagonist's estimate of opponent's return
-                opponent_return_est = self._estimate_opponent_return(
-                    hstates_at_steps.get("-1", hstates_at_steps.get(str(collection_steps[-1]))),
-                    level
-                )
-                level_properties["opponent_return_estimate"].append(opponent_return_est)
-
-        # Convert to arrays
-        hidden_states_by_step = {
-            k: np.stack(v) for k, v in hidden_states_by_step.items() if len(v) > 0
+        # --- 4. Assemble level properties ---
+        level_properties = {
+            "wall_density": wall_density,
+            "goal_distance": goal_distance,
+            "path_length": path_lengths,
+            "is_solvable": is_solvable,
+            "training_phase": training_phase,
+            "episode_return": episode_returns,
+            "episode_solved": episode_solved,
         }
-        level_properties = {k: np.array(v) for k, v in level_properties.items()}
 
+        # Method-specific properties
+        if self.has_branches:
+            branch_types = np.arange(n_levels) % self.branch_count
+            level_properties["branch_type"] = branch_types
+
+            if self.has_mutations:
+                mutation_distance = np.where(
+                    branch_types != 2, 0.0, np.random.uniform(1, 5, size=n_levels)
+                )
+                level_properties["mutation_distance"] = mutation_distance
+
+        # --- 5. PAIRED bilateral ---
+        bilateral_data = None
+        if self.has_regret:
+            t0 = time.time()
+            # Per-level CPU-side estimates (fast)
+            regret_estimates = np.array([
+                self._estimate_regret_from_result(
+                    jax.tree_util.tree_map(lambda x: x[i], levels),
+                    {'solved': bool(episode_solved[i]), 'return': float(episode_returns[i])}
+                ) for i in tqdm(range(n_levels), desc="Regret estimates", leave=False)
+            ])
+            adversary_difficulties = np.array([
+                self._estimate_adversary_difficulty(
+                    jax.tree_util.tree_map(lambda x: x[i], levels)
+                ) for i in tqdm(range(n_levels), desc="Adversary difficulty", leave=False)
+            ])
+            level_properties["adversary_difficulty"] = adversary_difficulties
+            _log_timing("paired_cpu_estimates", time.time() - t0)
+
+            # Batched antagonist rollout
+            ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+            if ant_train_state is not None:
+                t0 = time.time()
+                rng, rng_ant = jax.random.split(rng)
+                ant_hstates_by_step, ant_returns, ant_solved = self._batched_rollout(
+                    rng_ant, levels, collection_steps, max_episode_length,
+                    ant_train_state.apply_fn, ant_train_state.params,
+                )
+                _log_timing("antagonist_rollout", time.time() - t0)
+
+                # Actual regret replaces estimate
+                regret_actual = ant_returns - episode_returns
+                level_properties["regret_estimate"] = regret_actual
+
+                # Vectorized policy divergence
+                policy_divergences = self._compute_batch_policy_divergence(
+                    hidden_states_by_step, ant_hstates_by_step,
+                )
+
+                bilateral_data = {
+                    "antagonist_hstates_by_step": ant_hstates_by_step,
+                    "antagonist_returns": ant_returns,
+                    "protagonist_returns": episode_returns,
+                    "policy_divergences": policy_divergences,
+                    "regret_actual": regret_actual,
+                }
+
+                if _wandb_active:
+                    wandb.log({
+                        "level_probing/antagonist_mean_return": float(ant_returns.mean()),
+                        "level_probing/mean_regret": float(regret_actual.mean()),
+                        "level_probing/mean_policy_divergence": float(policy_divergences.mean()),
+                    })
+            else:
+                level_properties["regret_estimate"] = regret_estimates
+
+            # Strategy clusters and opponent return estimates
+            t0 = time.time()
+            strategy_clusters = np.array([
+                self._estimate_strategy_cluster(
+                    jax.tree_util.tree_map(lambda x: x[i], levels),
+                    float(adversary_difficulties[i]),
+                ) for i in tqdm(range(n_levels), desc="Strategy clusters", leave=False)
+            ])
+            level_properties["adversary_strategy_cluster"] = strategy_clusters
+
+            opponent_return_estimates = np.array([
+                self._estimate_opponent_return(
+                    hidden_states_by_step.get(
+                        "-1", hidden_states_by_step.get(str(collection_steps[-1]))
+                    )[i] if hidden_states_by_step.get(
+                        "-1", hidden_states_by_step.get(str(collection_steps[-1]))
+                    ) is not None else None,
+                    jax.tree_util.tree_map(lambda x: x[i], levels),
+                ) for i in tqdm(range(n_levels), desc="Opponent return est.", leave=False)
+            ])
+            level_properties["opponent_return_estimate"] = opponent_return_estimates
+            _log_timing("paired_cpu_clusters_and_tom", time.time() - t0)
+
+        # --- 6. Assemble result ---
         result = {
             "hidden_states_by_step": hidden_states_by_step,
             "level_properties": level_properties,
             "collection_steps": collection_steps,
             "n_levels": n_levels,
             "training_method": self.training_method,
+            "timings": timings,
         }
 
-        # Add bilateral data for PAIRED
         if bilateral_data is not None:
-            result["bilateral_data"] = {
-                "antagonist_hstates_by_step": {
-                    k: np.stack(v) for k, v in bilateral_data["antagonist_hstates_by_step"].items() if len(v) > 0
-                },
-                "antagonist_returns": np.array(bilateral_data["antagonist_returns"]),
-                "protagonist_returns": np.array(bilateral_data["protagonist_returns"]),
-                "policy_divergences": np.array(bilateral_data["policy_divergences"]),
-                "regret_actual": np.array(bilateral_data["regret_actual"]),
-            }
+            result["bilateral_data"] = bilateral_data
+
+        # Log total and summary
+        total_time = sum(timings.values())
+        logger.info(f"[level_probing] TOTAL collect_data: {total_time:.2f}s")
+        logger.info(f"[level_probing] Timing breakdown: {timings}")
+        if _wandb_active:
+            wandb.log({
+                "level_probing/timing/total_collect_data": total_time,
+                "level_probing/n_levels": n_levels,
+                "level_probing/max_episode_length": max_episode_length,
+            })
 
         return result
 
@@ -280,111 +310,208 @@ class LevelProbingExperiment(CheckpointExperiment):
         difficulty = 0.5 * wall_density + 0.5 * normalized_path
         return float(difficulty)
 
-    def _collect_antagonist_episode(
+    def _batched_rollout(
         self,
         rng: chex.PRNGKey,
-        level,
+        levels,
         collection_steps: List[int],
         max_steps: int,
-    ) -> Tuple[Dict[str, np.ndarray], float, bool]:
-        """Run antagonist episode and collect hidden states at specified steps.
+        apply_fn,
+        params,
+    ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+        """GPU-batched rollout over all levels simultaneously using jax.lax.scan.
 
-        PAIRED bilateral: Collect antagonist h-states on same levels as protagonist.
+        Args:
+            rng: PRNG key.
+            levels: Batched Level pytree with leading dim n_levels.
+            collection_steps: List of timesteps at which to collect hidden states.
+                              -1 means terminal (first done or end of episode).
+            max_steps: Maximum episode length.
+            apply_fn: Network apply function.
+            params: Network parameters.
+
+        Returns:
+            hstates_by_step: Dict[str, np.ndarray] with shape (n_levels, hidden_dim).
+            episode_returns: np.ndarray of shape (n_levels,).
+            episode_solved: np.ndarray of shape (n_levels,).
         """
+        n_levels = jax.tree_util.tree_leaves(levels)[0].shape[0]
+
+        # Reset all environments in parallel
         rng, rng_reset = jax.random.split(rng)
+        reset_rngs = jax.random.split(rng_reset, n_levels)
+        obs, env_states = jax.vmap(
+            self.agent.env.reset_to_level, in_axes=(0, 0, None)
+        )(reset_rngs, levels, self.agent.env_params)
 
-        # Get antagonist train state
-        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
-        if ant_train_state is None:
-            # No antagonist available - return empty data
-            empty_hstate = np.zeros(512)  # Default hidden dim
-            return {str(s): empty_hstate for s in collection_steps}, 0.0, False
+        # Initialize hidden states for all levels: tuple of (n_levels, 256) arrays
+        hstate = self.agent.initialize_hidden_state(n_levels)
 
-        # Reset environment
-        obs, env_state = self.agent.env.reset_to_level(
-            rng_reset, level, self.agent.env_params
-        )
+        # Determine positive collection steps and whether we need terminal collection
+        positive_steps = sorted([s for s in collection_steps if s > 0])
+        collect_terminal = -1 in collection_steps
 
-        # Initialize antagonist hidden state
-        hstate = self.agent.initialize_hidden_state(1)
+        # Pre-allocate collection buffers for positive steps
+        # Each buffer: tree with same structure as hstate, but with extra leading dim
+        n_positive = len(positive_steps)
+        collected_positive = jax.tree_util.tree_map(
+            lambda x: jnp.zeros((n_positive,) + x.shape), hstate
+        ) if n_positive > 0 else None
 
-        collected_hstates = {}
-        total_return = 0.0
-        solved = False
+        # Terminal hstate buffer (same structure as hstate)
+        terminal_hstate = jax.tree_util.tree_map(jnp.zeros_like, hstate)
 
-        for step in range(max_steps):
+        # Tracking arrays
+        ep_done = jnp.zeros(n_levels, dtype=bool)
+        total_return = jnp.zeros(n_levels)
+        ep_reward_at_done = jnp.zeros(n_levels)
+        terminal_captured = jnp.zeros(n_levels, dtype=bool)
+
+        # Convert positive_steps to jnp array for scan body
+        positive_steps_arr = jnp.array(positive_steps, dtype=jnp.int32) if n_positive > 0 else jnp.zeros((0,), dtype=jnp.int32)
+
+        def scan_body(carry, step_idx):
+            (hstate, obs, env_states, ep_done, total_return,
+             ep_reward_at_done, terminal_captured,
+             terminal_hstate, collected_positive, rng) = carry
+
             rng, rng_action = jax.random.split(rng)
 
-            # Antagonist forward pass
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-            done_batch = jnp.zeros((1, 1), dtype=bool)
-            hstate, pi, value = ant_train_state.apply_fn(
-                ant_train_state.params, (obs_batch, done_batch), hstate
+            # Forward pass: obs has shape (n_levels, *obs_shape)
+            # Network expects (time, batch, *obs_shape) -> add time dim
+            obs_batch = jax.tree_util.tree_map(lambda x: x[None, ...], obs)
+            done_batch = ep_done[None, :]  # (1, n_levels)
+            hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
+
+            # Collect at positive steps
+            current_step = step_idx + 1  # 1-indexed
+            if n_positive > 0:
+                for i, s in enumerate(positive_steps):
+                    should_collect = (current_step == s)
+                    collected_positive = jax.tree_util.tree_map(
+                        lambda buf, h: buf.at[i].set(
+                            jnp.where(should_collect, h, buf[i])
+                        ),
+                        collected_positive, hstate,
+                    )
+
+            # Sample actions: pi.sample returns (1, n_levels) -> squeeze time dim
+            action = pi.sample(seed=rng_action)[0]  # (n_levels,)
+
+            # Step all environments in parallel
+            step_rngs = jax.random.split(rng_action, n_levels)
+            obs, env_states, reward, done, info = jax.vmap(
+                self.agent.env.step, in_axes=(0, 0, 0, None)
+            )(step_rngs, env_states, action, self.agent.env_params)
+
+            # Accumulate returns only for non-terminated episodes
+            total_return = total_return + reward * (~ep_done).astype(jnp.float32)
+
+            # Capture terminal hstate at first done
+            newly_done = done & (~ep_done)
+            terminal_hstate = jax.tree_util.tree_map(
+                lambda th, h: jnp.where(
+                    newly_done[:, None], h, th
+                ),
+                terminal_hstate, hstate,
             )
+            ep_reward_at_done = jnp.where(newly_done, reward, ep_reward_at_done)
+            terminal_captured = terminal_captured | newly_done
 
-            # Check if we should collect at this step
-            for coll_step in collection_steps:
-                if coll_step == step + 1 or (coll_step == -1 and step == max_steps - 1):
-                    step_key = str(coll_step) if coll_step != -1 else "-1"
-                    h_c, h_h = hstate
-                    hstate_flat = np.concatenate([
-                        np.array(h_c[0]).flatten(),
-                        np.array(h_h[0]).flatten()
-                    ])
-                    collected_hstates[step_key] = hstate_flat
+            # Update episode done tracking
+            ep_done = ep_done | done
 
-            # Sample action and step
-            action = pi.sample(seed=rng_action)[0, 0]
-            obs, env_state, reward, done, info = self.agent.env.step(
-                rng_action, env_state, action, self.agent.env_params
-            )
-            total_return += float(reward)
+            carry = (hstate, obs, env_states, ep_done, total_return,
+                     ep_reward_at_done, terminal_captured,
+                     terminal_hstate, collected_positive, rng)
+            return carry, None
 
-            if done:
-                solved = float(reward) > 0
-                if "-1" not in collected_hstates:
-                    h_c, h_h = hstate
-                    hstate_flat = np.concatenate([
-                        np.array(h_c[0]).flatten(),
-                        np.array(h_h[0]).flatten()
-                    ])
-                    collected_hstates["-1"] = hstate_flat
-                break
+        # Run scan over max_steps
+        init_carry = (hstate, obs, env_states, ep_done, total_return,
+                      ep_reward_at_done, terminal_captured,
+                      terminal_hstate, collected_positive, rng)
+        t_scan = time.time()
+        final_carry, _ = jax.lax.scan(scan_body, init_carry, jnp.arange(max_steps))
 
-        # Ensure all collection points have data
-        if "-1" in collected_hstates:
-            final_hstate = collected_hstates["-1"]
-            for step_key in [str(s) for s in collection_steps]:
-                if step_key not in collected_hstates:
-                    collected_hstates[step_key] = final_hstate
+        (hstate_final, _, _, ep_done_final, total_return_final,
+         ep_reward_at_done_final, terminal_captured_final,
+         terminal_hstate_final, collected_positive_final, _) = final_carry
+        # Block until GPU computation finishes for accurate timing
+        jax.block_until_ready(final_carry)
+        logger.info(f"[level_probing] scan ({max_steps} steps x {n_levels} levels): "
+                    f"{time.time() - t_scan:.2f}s (includes JIT on first call)")
 
-        return collected_hstates, total_return, solved
+        # For levels that never terminated, use final hstate as terminal
+        terminal_hstate_final = jax.tree_util.tree_map(
+            lambda th, h: jnp.where(
+                (~terminal_captured_final)[:, None], h, th
+            ),
+            terminal_hstate_final, hstate_final,
+        )
 
-    def _compute_bilateral_policy_divergence(
+        # Flatten hstates: concatenate c and h -> (n_levels, 512)
+        def flatten_hstate(hs):
+            h_c, h_h = hs
+            return jnp.concatenate([h_c, h_h], axis=-1)
+
+        # Build result dict
+        hstates_by_step = {}
+        step_idx_map = {s: i for i, s in enumerate(positive_steps)}
+
+        for s in collection_steps:
+            if s == -1:
+                hstates_by_step["-1"] = np.array(flatten_hstate(terminal_hstate_final))
+            else:
+                i = step_idx_map[s]
+                hs = jax.tree_util.tree_map(lambda x: x[i], collected_positive_final)
+                hstates_by_step[str(s)] = np.array(flatten_hstate(hs))
+
+        # For levels that ended early, fill uncollected positive steps with terminal
+        terminal_flat = hstates_by_step.get("-1")
+        if terminal_flat is not None:
+            for s_key in [str(s) for s in positive_steps]:
+                # If a level ended before step s, its collected hstate is zeros
+                # Replace zeros with terminal hstate
+                h = hstates_by_step[s_key]
+                is_zero = np.all(h == 0, axis=-1)  # (n_levels,)
+                if np.any(is_zero):
+                    hstates_by_step[s_key] = np.where(
+                        is_zero[:, None], terminal_flat, h
+                    )
+
+        episode_returns = np.array(total_return_final)
+        episode_solved = np.array(ep_reward_at_done_final > 0)
+        # For levels that never terminated, solved = False (already 0)
+
+        return hstates_by_step, episode_returns, episode_solved
+
+    def _compute_batch_policy_divergence(
         self,
-        pro_hstates: Dict[str, np.ndarray],
-        ant_hstates: Dict[str, np.ndarray],
-    ) -> float:
-        """Compute agent-centric policy divergence between protagonist and antagonist.
+        pro_hstates_by_step: Dict[str, np.ndarray],
+        ant_hstates_by_step: Dict[str, np.ndarray],
+    ) -> np.ndarray:
+        """Compute vectorized policy divergence between protagonist and antagonist.
 
-        This is an AGENT-CENTRIC metric: measures actual behavioral difference,
-        not just representation difference.
+        Args:
+            pro_hstates_by_step: Dict with values of shape (n_levels, hidden_dim).
+            ant_hstates_by_step: Dict with values of shape (n_levels, hidden_dim).
+
+        Returns:
+            divergences: np.ndarray of shape (n_levels,).
         """
-        # Use final hidden states
-        pro_h = pro_hstates.get("-1")
-        ant_h = ant_hstates.get("-1")
+        pro_h = pro_hstates_by_step.get("-1")
+        ant_h = ant_hstates_by_step.get("-1")
 
         if pro_h is None or ant_h is None:
-            return 0.0
+            n = len(next(iter(pro_hstates_by_step.values())))
+            return np.zeros(n)
 
-        # Compute KL divergence proxy from hidden state similarity
-        # More sophisticated: could run both through policy heads and compute actual KL
-        # For now: use representation distance as proxy
-        h_diff = np.linalg.norm(pro_h - ant_h)
-        max_norm = max(np.linalg.norm(pro_h), np.linalg.norm(ant_h), 1e-8)
-        divergence = h_diff / max_norm
+        h_diff = np.linalg.norm(pro_h - ant_h, axis=-1)  # (n_levels,)
+        norm_pro = np.linalg.norm(pro_h, axis=-1)
+        norm_ant = np.linalg.norm(ant_h, axis=-1)
+        divergence = h_diff / np.maximum(np.maximum(norm_pro, norm_ant), 1e-8)
 
-        return float(divergence)
+        return divergence
 
     def _estimate_strategy_cluster(self, level, adversary_difficulty: float) -> int:
         """Estimate adversary strategy cluster from level features.
@@ -428,77 +555,6 @@ class LevelProbingExperiment(CheckpointExperiment):
         opponent_return_est = np.tanh(activation_level) * 0.5 + 0.5
 
         return float(opponent_return_est)
-
-    def _collect_episode_hstates(
-        self,
-        rng: chex.PRNGKey,
-        level,
-        collection_steps: List[int],
-        max_steps: int,
-    ) -> Tuple[Dict[str, np.ndarray], float, bool]:
-        """Run episode and collect hidden states at specified steps."""
-        rng, rng_reset = jax.random.split(rng)
-
-        # Reset environment
-        obs, env_state = self.agent.env.reset_to_level(
-            rng_reset, level, self.agent.env_params
-        )
-
-        # Initialize hidden state
-        hstate = self.agent.initialize_hidden_state(1)
-
-        collected_hstates = {}
-        total_return = 0.0
-        solved = False
-
-        for step in range(max_steps):
-            rng, rng_action = jax.random.split(rng)
-
-            # Forward pass
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-            done_batch = jnp.zeros((1, 1), dtype=bool)
-            hstate, pi, value = self.train_state.apply_fn(
-                self.train_state.params, (obs_batch, done_batch), hstate
-            )
-
-            # Check if we should collect at this step
-            for coll_step in collection_steps:
-                if coll_step == step + 1 or (coll_step == -1 and step == max_steps - 1):
-                    step_key = str(coll_step) if coll_step != -1 else "-1"
-                    h_c, h_h = hstate
-                    hstate_flat = np.concatenate([
-                        np.array(h_c[0]).flatten(),
-                        np.array(h_h[0]).flatten()
-                    ])
-                    collected_hstates[step_key] = hstate_flat
-
-            # Sample action and step
-            action = pi.sample(seed=rng_action)[0, 0]
-            obs, env_state, reward, done, info = self.agent.env.step(
-                rng_action, env_state, action, self.agent.env_params
-            )
-            total_return += float(reward)
-
-            if done:
-                solved = float(reward) > 0
-                # Collect final hstate if not already collected
-                if "-1" not in collected_hstates:
-                    h_c, h_h = hstate
-                    hstate_flat = np.concatenate([
-                        np.array(h_c[0]).flatten(),
-                        np.array(h_h[0]).flatten()
-                    ])
-                    collected_hstates["-1"] = hstate_flat
-                break
-
-        # Ensure all collection points have data (use final if episode ended early)
-        if "-1" in collected_hstates:
-            final_hstate = collected_hstates["-1"]
-            for step_key in [str(s) for s in collection_steps]:
-                if step_key not in collected_hstates:
-                    collected_hstates[step_key] = final_hstate
-
-        return collected_hstates, total_return, solved
 
     def _compute_path_length(self, level) -> int:
         """Compute BFS path length from agent to goal."""
