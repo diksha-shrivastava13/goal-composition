@@ -1,7 +1,7 @@
 from typing import Tuple
 from jaxued.environments.maze.level import Level as MazeLevel
 from jaxued.environments.maze.env import OBJECT_TO_INDEX, EnvParams, EnvState as MazeEnvState, EnvState, Maze, make_maze_map
-from core.environments.maze.util import pad_maze_map
+from remidi_reference.core.environments.maze.util import pad_maze_map
 from jaxued.environments.maze.util import make_level_generator as og_level_generator
 import chex
 from chex import PRNGKey

@@ -1,9 +1,9 @@
-from core.environments.lever_game.env import LeverGame, make_lever_level_generator
+from remidi_reference.core.environments.lever_game.env import LeverGame, make_lever_level_generator
 from jaxued.environments.maze.env import Maze
 from jaxued.environments.maze.util import make_level_generator
-from core.environments.maze.variants.blindfold_wrapper import BlindFoldWrapper, make_blind_level_sampler
-from core.environments.maze.variants.tmaze import TMazeGame, make_tmaze_level_generator
-from core.environments.maze.vis import MazeVisualiser
+from remidi_reference.core.environments.maze.variants.blindfold_wrapper import BlindFoldWrapper, make_blind_level_sampler
+from remidi_reference.core.environments.maze.variants.tmaze import TMazeGame, make_tmaze_level_generator
+from remidi_reference.core.environments.maze.vis import MazeVisualiser
 from jaxued.wrappers.autoreplay import AutoReplayWrapper
 
 def get_environment_and_params(config, return_general_kwargs=False):

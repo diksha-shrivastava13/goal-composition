@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import wandb
 from jaxued.environments.maze.level import Level
-from core.environments.maze.vis import MazeVisualiser
+from remidi_reference.core.environments.maze.vis import MazeVisualiser
 from jaxued.utils import accumulate_rollout_stats
 
 def save_compressed_pickle(title: str, data: Any):

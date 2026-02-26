@@ -5,7 +5,7 @@ import chex
 from chex import PRNGKey
 import jax
 from jaxued.environments.underspecified_env import EnvParams, EnvState, Level, Observation, UnderspecifiedEnv
-from core.environments.underspecified_env_wrapper import UnderspecifiedEnvWrapper, WrappedEnvState, WrappedLevel
+from remidi_reference.core.environments.underspecified_env_wrapper import UnderspecifiedEnvWrapper, WrappedEnvState, WrappedLevel
 from flax import struct
 import jax.numpy as jnp
 from jaxued.environments.maze.level import Level as OGMazeLevel

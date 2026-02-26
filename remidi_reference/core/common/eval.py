@@ -7,10 +7,10 @@ import numpy as np
 import wandb
 import orbax.checkpoint as ocp
 
-from core.common.ppo import ActorCritic
+from remidi_reference.core.common.ppo import ActorCritic
 from jaxued.environments.maze.level import Level
 from jaxued.environments.maze.util import make_level_generator
-from core.utils import save_compressed_pickle
+from remidi_reference.core.utils import save_compressed_pickle
 
 def evaluate_single(config, eval_env, env_params, rng, train_state):
     sample_0b_level = make_level_generator(13, 13, 0)
@@ -26,7 +26,7 @@ def evaluate_single(config, eval_env, env_params, rng, train_state):
     num_levels = jax.tree_util.tree_flatten(levels)[0][0].shape[0]
 
     if config["lever_game"]:
-        from core.environments.lever_game.env import Level as LeverLevel
+        from remidi_reference.core.environments.lever_game.env import Level as LeverLevel
         num_levels = 25
         levels = LeverLevel(
             correct_answer=jnp.arange(25),

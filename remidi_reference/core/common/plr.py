@@ -1,6 +1,6 @@
 from jaxued.level_sampler import LevelSampler
 
-from core.utils import compute_max_returns, max_mc, monte_carlo_regret, positive_value_loss
+from remidi_reference.core.utils import compute_max_returns, max_mc, monte_carlo_regret, positive_value_loss
 import jax.numpy as jnp
 import jax
 
