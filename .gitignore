@@ -17,3 +17,7 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Support docs
+.claude
+.serena
