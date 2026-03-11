@@ -218,7 +218,7 @@ The experimental framework evaluates all combinations of 5 training methods and 
 \begin{table}[H]
 \centering
 \caption{Training methods and their curriculum generation strategies.}
-\begin{tabularx}{\textwidth}{lllX}
+\begin{tabularx}{\textwidth}{l >{\raggedright\arraybackslash}p{3cm} >{\raggedright\arraybackslash}p{2.8cm} X}
 \toprule
 \textbf{Method} & \textbf{Utility $\Ustar$} & \textbf{Branches} & \textbf{Role in Framework} \\
 \midrule
@@ -232,6 +232,14 @@ The experimental framework evaluates all combinations of 5 training methods and 
 \end{table}
 
 \textbf{Why these five methods.} \dr{} serves as the confirmed null baseline---agents do not develop training dynamics encoding under \dr{} (prediction losses increase over training), validating that encoding reflects curriculum structure rather than environment distribution properties. \plr{} and \rplr{} provide regret-based structure of varying degrees. \accel{} adds mutation, creating the most systematic and predictable generator. \paired{} is qualitatively different: the generator itself is a learning agent, providing multi-agent dynamics and a ground truth utility function.
+
+\textbf{\dr{} in detail.} Domain Randomisation (Tobin et al., 2017) is the simplest possible curriculum: at each training iteration, a level is sampled uniformly at random from the space of all possible environments. There is no replay buffer, no scoring, and no adaptation---every level is generated independently. The agent trains via PPO on whatever level it receives. Because the level distribution is stationary and memoryless, there is no curriculum structure for the agent to encode. Our confirmed finding that prediction losses \textit{increase} under \dr{} (rather than remaining flat) validates that any encoding observed in other methods reflects genuine curriculum structure, not just familiarity with the environment distribution.
+
+\textbf{\plr{} in detail.} Prioritized Level Replay (Jiang et al., 2021) maintains a finite replay buffer of previously encountered levels, each scored by estimated learning potential. The scoring function uses the $L_1$ value loss (mean absolute TD error) as a proxy for regret: levels where the agent's value estimates are most inaccurate are assumed to offer the most learning signal. At each training iteration, with probability $p$ (typically 0.5) the agent trains on a level sampled from the replay buffer proportional to its score (with a staleness correction that upweights levels not seen recently), and with probability $1-p$ it trains on a freshly generated random level. New random levels are also scored and inserted into the buffer, replacing the lowest-scored entries when the buffer is full. Critically, the agent receives gradient updates on \textit{both} replayed and new levels. The curriculum structure arises from the non-uniform replay distribution: the agent repeatedly encounters levels at the frontier of its competence.
+
+\textbf{\rplr{} in detail.} Robust Prioritized Level Replay (Jiang et al., 2021) is a variant of \plr{} that removes gradient updates on freshly generated random levels. When a new level is sampled (with probability $1-p$), the agent still \textit{evaluates} it to compute a score for the replay buffer, but does not update its policy on that level. Only levels drawn from the replay buffer produce gradient updates. This tests whether the ``exploratory'' gradient signal from random levels helps or hurts: if regret-based replay alone provides sufficient curriculum structure, \rplr{} should match or exceed \plr{}. The distinction matters for our framework because it isolates the contribution of the replay mechanism from the random exploration component.
+
+\textbf{\accel{} in detail.} ACCEL (Parker-Holder et al., 2022) extends \plr{} with a third ``branch'' of level generation: mutation. In addition to the DR branch (random new levels) and the replay branch (replaying high-regret levels from the buffer), ACCEL introduces a mutation operator that takes a high-scoring level from the replay buffer and creates an edited variant---for example, adding or removing walls, shifting the goal position, or adjusting obstacle density. The mutation is directed: it modifies a randomly selected subset of the level's tiles, biased toward changes that are likely to maintain or increase difficulty. This creates the most systematic and predictable curriculum among the single-agent methods: the agent experiences levels that evolve incrementally from known difficulty frontiers, rather than being sampled from a fixed distribution or replayed verbatim. Our implementation uses all three branches per iteration with configurable probabilities (typically 0.25 DR, 0.25 replay, 0.5 mutation).
 
 \textbf{\paired{} in detail.} In \paired{} (Dennis et al., 2020), three agents co-train:
 \begin{itemize}[nosep]
@@ -254,7 +262,7 @@ This makes \paired{} the closest analog to the scalable oversight scenario, wher
 \begin{table}[H]
 \centering
 \caption{Memory architectures and their information access.}
-\begin{tabularx}{\textwidth}{llX}
+\begin{tabularx}{\textwidth}{l >{\raggedright\arraybackslash}p{4.5cm} X}
 \toprule
 \textbf{Architecture} & \textbf{Information Access} & \textbf{Role in Framework} \\
 \midrule
@@ -275,6 +283,16 @@ This makes \paired{} the closest analog to the scalable oversight scenario, wher
     \item \texttt{next\_env\_prediction} (maximal): The prediction head is trained explicitly to forecast the next environment. This is ``training on interpretability''---using the prediction loss as an inductive bias that amplifies what would happen naturally. Empirical evidence confirms this leads to faster, stronger, and more structured development of training dynamics encoding. This architecture is not just an upper bound for comparison; it is a \textit{design proposal}: if you want interpretable agents, train them with a prediction objective alongside the policy objective.
 \end{itemize}
 
+\textbf{\texttt{accel\_probe} in detail.} The baseline architecture uses a standard PPO actor-critic with a 256-unit \texttt{OptimizedLSTMCell} wrapped in \texttt{ResetRNN} from jaxued. The observation encoder is a single Conv(16, $3 \times 3$) layer producing a flattened image embedding, concatenated with a 5-dimensional direction embedding. On every episode termination (\texttt{done=True}), the LSTM hidden state $(h_c, h_h)$ is reset to zeros. Actor and critic heads are two-layer MLPs (32 hidden units each). An external \texttt{CurriculumProbe} (linear probe, trained with its own learning rate) can read the LSTM hidden state but does not affect policy gradients. The only cross-episode ``memory'' is the network weights themselves. This answers: does curriculum structure get encoded in weights alone, with no explicit memory mechanism?
+
+\textbf{\texttt{persistent\_lstm} in detail.} Architecturally identical to \texttt{accel\_probe} except that the LSTM \textit{does not reset} on episode boundaries. The implementation uses a raw \texttt{nn.OptimizedLSTMCell} via \texttt{nn.scan} without the \texttt{ResetRNN} wrapper, explicitly ignoring the \texttt{dones} signal. The final hidden state from each rollout is stored in \texttt{train\_state.persistent\_hstate} and retrieved at the start of the next rollout, creating a continuous stream of LSTM state across all episodes and all three ACCEL branches (DR, replay, mutation). The persistent state is 512 floats per environment (256 cell + 256 hidden). This is the minimal memory intervention: the only change from baseline is removing the reset. It tests whether LSTM dynamics alone, given unbounded temporal context, spontaneously develop curriculum-aware representations.
+
+\textbf{\texttt{context\_vector} in detail.} This agent maintains a fixed-size context vector of dimension 64 that is updated after each episode via exponential moving average (EMA). The \texttt{on\_episode\_complete()} callback constructs an episode embedding by concatenating three scalar features (episode return, normalised length, solved flag) with a truncated projection of the final LSTM hidden state, then blends it into the persistent context: $\mathbf{c}_{\text{new}} = \alpha \cdot \mathbf{c}_{\text{old}} + (1 - \alpha) \cdot \mathbf{e}_{\text{episode}}$, with decay $\alpha = 0.9$. This context vector is concatenated with the observation embedding before feeding into a standard \texttt{ResetRNN} LSTM (which still resets per episode). The EMA imposes an information bottleneck: the agent has access to a lossy, exponentially-weighted summary of all past episode outcomes. This tests whether compressed episode history suffices for curriculum awareness.
+
+\textbf{\texttt{episodic\_memory} in detail.} This agent maintains a circular buffer of 64 episode summary embeddings (each 64-dimensional). After each episode, the episode is encoded by concatenating scalar features (mean return, normalised length, solve rate) with a truncated hidden state projection, then written to the buffer at the current pointer position. Before each rollout, the current LSTM hidden state is used as a query: dot-product similarities are computed against all stored embeddings, the top-$k$ ($k = 8$) most similar entries are selected, and a softmax-weighted attention aggregation produces a 64-dimensional context vector. This context is concatenated with the observation embedding before the (resetting) LSTM, exactly as in \texttt{context\_vector}. The key difference is \textit{content-addressable retrieval}: the agent selectively recalls the most relevant past episodes rather than blending all history into a single compressed vector.
+
+\textbf{\texttt{next\_env\_prediction} in detail.} This architecture has \textit{explicit, privileged access} to curriculum metadata and represents the theoretical upper bound. It maintains a \texttt{CurriculumState} containing circular buffers (length 64) of recent wall densities, goal/agent positions, directions, regret scores, branch types, path lengths, and episode returns. The function \texttt{get\_curriculum\_features()} extracts a feature vector (normalised training progress, replay fraction, buffer fill, score statistics, branch distribution, and rolling histories), which is encoded by a two-layer MLP ($64 \to 32$) and concatenated with the observation embedding before the shared LSTM backbone. Critically, the network also has a \texttt{CurriculumPredictionHead} that predicts the next level's wall map (per-cell sigmoid over the $13 \times 13$ grid), goal position (softmax over 169 cells), agent position, and agent direction. \textbf{Prediction gradients flow through the shared backbone}, meaning the agent's representations are actively shaped by the prediction objective alongside the PPO policy loss. This is ``training on interpretability'' made concrete: the agent is incentivised to develop representations that support curriculum prediction, and these same representations are used for policy decisions.
+
 \textbf{The information leak gradient.} In the original architecture, the ``leak'' was curriculum statistics flowing through the shared LSTM backbone. The 5 architectures provide a controlled gradient: \texttt{accel\_probe} has no explicit curriculum information in its architecture; \texttt{next\_env\_prediction} has the full prediction head. The intermediate architectures carry implicit information through their memory mechanisms but without any explicit curriculum features. This allows us to decompose the contribution of (a) architectural capacity for cross-episode memory, (b) explicit curriculum features as input, and (c) the prediction loss as an auxiliary training signal.
 
 \subsection{The 4-Tier Prediction Framework}
@@ -284,7 +302,7 @@ The original prediction head targeted only Tier 0 (literal environment variables
 \begin{table}[H]
 \centering
 \caption{4-tier prediction framework. Tiers are not hierarchical in capability; they measure different aspects of what the agent encodes.}
-\begin{tabularx}{\textwidth}{clllX}
+\begin{tabularx}{\textwidth}{c >{\raggedright\arraybackslash}p{2.5cm} >{\raggedright\arraybackslash}p{3.5cm} >{\raggedright\arraybackslash}p{1.5cm} X}
 \toprule
 \textbf{Tier} & \textbf{Name} & \textbf{Components} & \textbf{Loss} & \textbf{What It Measures} \\
 \midrule
@@ -326,7 +344,7 @@ The 38 experiments fall into two categories by execution:
 
 The original report proposed 26 experiments. The following table maps those to the current 38-experiment suite and identifies gaps.
 
-\begin{longtable}{clll}
+\begin{longtable}{c >{\raggedright\arraybackslash}p{4cm} >{\raggedright\arraybackslash}p{5.5cm} l}
 \toprule
 \textbf{Original} & \textbf{Description} & \textbf{Current Experiment(s)} & \textbf{Status} \\
 \midrule
@@ -1191,7 +1209,7 @@ Can we extract interpretable representations of what agents believe about their 
 
 \textbf{Type}: Training-time experiment. \textbf{Agents}: All 25.
 
-\textbf{Protocol}: Collect (level\_features, prediction\_loss) pairs during training. Use PySR (symbolic regression) to extract interpretable formulas: $\Uhat = f(\text{level\_features})$, where $-\text{prediction\_loss}$ approximates the log-probability the model assigns to each level. For \paired{}, additionally fit $\text{regret} = g(\text{level\_features})$.
+\textbf{Protocol}: Collect (level\_features, prediction\_loss) pairs during training. Use PySR (Cranmer, 2023) to extract interpretable formulas: $\Uhat = f(\text{level\_features})$, where $-\text{prediction\_loss}$ approximates the log-probability the model assigns to each level. For \paired{}, additionally fit $\text{regret} = g(\text{level\_features})$.
 
 \begin{hypothesis}
 For \accel{}: $\Uhat$ is monotonic in regret-like quantities. For \dr{}: $\Uhat \approx \text{constant}$. For \paired{}: $\Uhat$ correlates with $\Ustar = \Rant - \Rpro$. The complexity of the extracted formula increases with the complexity of the curriculum method.
@@ -1541,7 +1559,7 @@ The universal experiments (Exps 1--10, 15--16, 28--30, 32) run on \paired{} agen
 \begin{table}[H]
 \centering
 \caption{E-series overview. Most ground is covered by the universal experiments running on \paired{} agents plus the A--F series. The genuinely novel additions are detailed below.}
-\begin{tabularx}{\textwidth}{llX}
+\begin{tabularx}{\textwidth}{l >{\raggedright\arraybackslash}p{3.5cm} X}
 \toprule
 \textbf{E\#} & \textbf{Base Experiment} & \textbf{Genuinely New Analysis} \\
 \midrule
@@ -1720,7 +1738,7 @@ The long-term goal is to extract a full CBN from trained agents: a directed acyc
 \begin{table}[H]
 \centering
 \caption{Evidence status for major claims.}
-\begin{tabularx}{\textwidth}{Xll}
+\begin{tabularx}{\textwidth}{X >{\raggedright\arraybackslash}p{2.5cm} >{\raggedright\arraybackslash}p{4.5cm}}
 \toprule
 \textbf{Claim} & \textbf{Status} & \textbf{Key Evidence} \\
 \midrule
@@ -1850,6 +1868,8 @@ The practical recommendation: any RL system trained under a structured curriculu
 \bibitem{jiang2021} Jiang, M. et al. (2021). Replay-guided adversarial environment design. \textit{NeurIPS}.
 
 \bibitem{parkerholder2022} Parker-Holder, J. et al. (2022). Evolving curricula with regret-based environment design. \textit{ICML}.
+
+\bibitem{tobin2017} Tobin, J. et al. (2017). Domain randomization for transferring deep neural networks from simulation to the real world. \textit{IROS}.
 
 \bibitem{cranmer2023} Cranmer, M. (2023). PySR: Fast \& parallelized symbolic regression in Python/Julia. \textit{Journal of Open Source Software}.
 
