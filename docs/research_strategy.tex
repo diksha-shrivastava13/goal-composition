@@ -1,0 +1,1911 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{float}
+\usepackage{caption}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black,
+}
+
+% Formatting
+\titleformat{\section}{\Large\bfseries}{Part \thesection:}{0.5em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.5em}{}
+
+% Custom environments
+\newtheorem{hypothesis}{Hypothesis}[subsection]
+\newtheorem{researchq}{Research Question}[subsection]
+\theoremstyle{remark}
+\newtheorem*{falsification}{Falsification Criterion}
+\newtheorem*{implication}{If Confirmed}
+\newtheorem*{agentscope}{Agent Scope}
+
+% Shortcuts
+\newcommand{\paired}{\textsc{Paired}}
+\newcommand{\accel}{\textsc{Accel}}
+\newcommand{\plr}{\textsc{PLR}}
+\newcommand{\dr}{\textsc{DR}}
+\newcommand{\rplr}{\textsc{Robust-PLR}}
+\newcommand{\Uhat}{\hat{U}}
+\newcommand{\Ustar}{U^*}
+\newcommand{\Umisgen}{U_{\text{misgen}}}
+\newcommand{\Rpro}{R_{\text{pro}}}
+\newcommand{\Rant}{R_{\text{ant}}}
+
+\title{
+    \textbf{Agent Epistemics Under Open-Ended Training} \\[0.5em]
+    \Large A Research Strategy for Mechanistic Analysis \\
+    of Curriculum-Induced Belief Formation
+}
+\author{
+    Diksha Shrivastava \\
+    \textit{Internal Research Strategy Document} \\
+    March 2026
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Richens \& Everitt (2024) proved that agents satisfying a regret bound under distributional shifts must have learned an approximate causal model of the data-generating process. Bellot, Richens \& Everitt (2025) proved the converse limitation: behaviour alone cannot uniquely recover an agent's internal beliefs or goals. Together, these results imply that internal representation analysis is both justified (the models exist) and necessary (behaviour is insufficient). This document describes the experimental infrastructure for conducting that analysis on reinforcement learning agents trained under open-ended curriculum learning.
+
+We present a comprehensive framework: 25 agent variants (5 training methods $\times$ 5 memory architectures) evaluated across 38 mechanistic interpretability experiments, with 12 additional planned experiments (7 elevated \paired{} extensions and 5 goal misgeneralisation experiments). The framework measures what agents encode about their training dynamics across four tiers---from literal environment prediction to meta-curriculum modelling---and uses this to study belief formation, causal relevance, and the conditions under which agents develop epistemically rich representations of their training process.
+
+Five findings are established. First, agents under structured curricula develop measurable training dynamics encoding (\accel{} strongest). Second, this is not an information leakage artifact (displacement and masking ablations). Third, domain randomisation produces \textit{no} encoding---losses increase---confirming it as a clean null. Fourth, an auxiliary prediction objective (``training on interpretability'') amplifies and accelerates belief formation without harming policy performance, providing the most immediately actionable design principle. Fifth, prediction accuracy varies by environment component, revealing structural biases in curriculum generation methods.
+
+The central claim: if an agent is trained under a structured curriculum, its internal representations must contain a recoverable approximation of the curriculum generator's utility function. \paired{}'s three-agent structure provides the critical test, with the adversary's explicit utility ($R_{\text{ant}} - R_{\text{pro}}$) serving as ground truth for extracted beliefs. The goal misgeneralisation experiments (planned) will determine whether this encoding enables detection of strategic exploitation vs.\ capability failure---the critical safety question.
+
+This document is a sequel and companion to the original ``Next-Environment Prediction'' technical report.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Context and Motivation}
+% ============================================================================
+
+\subsection{The Research Program}
+
+This work is part of a broader research program studying the causal relationship from training dynamics to path-dependent values induced by evolving environments, to contextually activated subgoals, to goal emergence, conflict, composition, and evolution as a non-linear dynamic system. The hope is to develop methods that can intervene directly at the training dynamics level to suppress, control, or passively supervise goal-directed behaviour, and to make multi-agent interactions more predictable.
+
+The specific focus of this document is the \textit{experimental infrastructure} for the first phase of this program: demonstrating that agents develop structured beliefs about their training process, characterising when and how these beliefs form, and understanding what these beliefs reveal about goal formation under open-ended training.
+
+\subsection{What We Mean by ``Agent Epistemics''}
+
+\textbf{Terminology note.} We deliberately avoid several terms from the ML literature that cause conflation:
+\begin{itemize}[nosep]
+    \item \textbf{Not ``Theory of Mind.''} This term implies anthropomorphic modelling of other agents' mental states. What we measure is more specific: what the agent encodes about the statistical structure of its training process.
+    \item \textbf{Not ``meta-RL.''} Meta-RL typically refers to learning-to-learn architectures. Our agents are standard PPO with varying memory mechanisms; the ``meta'' aspect is what they \textit{implicitly learn} about curriculum structure, not an explicit meta-learning objective.
+    \item \textbf{Not ``curriculum awareness.''} This term is too vague---it could mean anything from ``the agent noticed the task changed'' to ``the agent can predict what its training process will do next.'' We need finer distinctions.
+\end{itemize}
+
+Instead, we use terminology from \textbf{agent foundations and alignment}:
+\begin{itemize}[nosep]
+    \item \textbf{Agent epistemics}: The structured beliefs an agent develops about its training process---what it encodes, how accurately, and how these encodings evolve.
+    \item \textbf{Training dynamics encoding}: The measurable information about curriculum structure present in the agent's internal representations (hidden states, activations, policy outputs).
+    \item \textbf{First-order perception}: What the agent encodes about the curriculum's structure (Tier 1: regret, difficulty, branch type, score).
+    \item \textbf{Second-order perception}: What the agent encodes about its own response to the curriculum (Tier 2: expected return, regret source, novelty, unusualness).
+    \item \textbf{Belief formation}: The process by which training dynamics encoding develops over the course of training---when it appears, how it changes, and what drives it.
+\end{itemize}
+
+\subsection{Summary of Prior Findings}
+
+The original technical report\footnote{``Theory of Mind Extraction via Next-Environment Prediction,'' January 2026.} established three key findings:
+
+\textbf{Finding 1: Agents can learn to predict structured curriculum generators.} Training a prediction head alongside a PPO agent on \accel{}, \plr{}, and \rplr{} curricula showed that prediction loss decreases over training, with \accel{} showing the strongest learnable signal. This established that curriculum generators have extractable structure.
+
+\textbf{Finding 2: Prediction accuracy varies by environment component.} Agent position is most predictable, goal position moderately predictable, wall structure least predictable. This asymmetry reveals structural biases in UED methods---the generators are more systematic about where to place the agent than about what maze to generate.
+
+\textbf{Finding 3: Prediction is not an artifact of information leakage.} Two ablation studies addressed this:
+\begin{enumerate}[nosep]
+    \item \textbf{Displacement analysis}: The prediction head's losses decrease equally for environment variables with both least and most displacement between consecutive levels. If the head were merely memorising static patterns, it would only succeed on low-displacement variables.
+    \item \textbf{Three-way masking}: Under frontier masking (only cells the agent has visited plus adjacent), explored masking (only visited cells), and full observability, the prediction head still learns. Learning is slower under masking but converges. This rules out the hypothesis that only the information leak (curriculum statistics concatenated into the shared LSTM backbone) drives prediction.
+\end{enumerate}
+
+The conclusion from these ablations: \textbf{developing structured representations of training dynamics is instrumentally useful for achieving robustness to environment distributions}. The information leak accelerates this development but does not cause it.
+
+\textbf{Finding 4: Domain randomisation produces no encoding; losses increase.} When the same agents are trained under \dr{} (uniform random level generation with no curriculum structure), prediction losses do not decrease---they \textit{increase} over training. This is the strongest evidence that training dynamics encoding reflects the curriculum's structure rather than the environment distribution's statistical properties. \dr{} is not merely a weaker signal; it is a confirmed null. The agent's hidden states under \dr{} drift \textit{away} from any predictive structure, likely because the absence of curriculum regularity makes the prediction task actively misleading (the ``next'' level is independent of history).
+
+\textbf{Finding 5: Explicit prediction training amplifies and accelerates belief formation.} Comparing the \texttt{next\_env\_prediction} architecture (which adds a 4-tier prediction head trained jointly with the policy) to architectures that develop beliefs only implicitly, we observe that the prediction loss acts as an inductive bias. Agents with the prediction head develop training dynamics encoding faster, to higher accuracy, and with more structured internal representations. Crucially, the policy is not harmed by this auxiliary objective---and may benefit, since the prediction head forces the backbone to maintain curriculum-relevant features that would otherwise be compressed away by the policy gradient. This finding---that you can make agents more interpretable by training them to be interpretable, without sacrificing performance---is the empirical basis for the ``training on interpretability'' theme developed throughout this document.
+
+\subsection{What Changed Since the Original Report}
+
+\begin{enumerate}
+    \item \textbf{From 1 architecture to 25 agents.} The original report used a single agent with integrated prediction head. We now test 5 training methods $\times$ 5 memory architectures = 25 agent variants, allowing systematic study of \textit{what conditions produce training dynamics encoding} rather than just whether it exists.
+
+    \item \textbf{From environment prediction to 4-tier predictions.} The original prediction head predicted wall\_map, goal\_pos, agent\_pos, and agent\_dir (what we now call Tier 0). We observed that cell-to-cell wall map loss is a weak proxy---visually similar wall patterns receive high per-cell loss despite being functionally equivalent. This motivated the 4-tier framework, which captures \textit{what matters} about the curriculum rather than pixel-level accuracy.
+
+    \item \textbf{From \accel{}/\plr{} to \paired{}.} \paired{} provides the closest analog to the scalable oversight scenario (an LLM-like teacher designing learning environments for a student agent), multi-agent dynamics, and---crucially---a ground truth utility function against which extracted beliefs can be compared.
+
+    \item \textbf{From 26 planned experiments to 38 implemented.} The original report proposed 26 experiments as a roadmap. We have implemented 38, with a different (overlapping) structure that emphasises mechanistic interpretability across the full agent matrix.
+
+    \item \textbf{Non-linear probes and continuous training.} The original used a linear prediction head. We now primarily use non-linear probes (MLP-based), trained continuously alongside the agent, and run experiments at every evaluation checkpoint. This gives a dynamic rather than snapshot view of belief formation.
+
+    \item \textbf{DR confirmed as null; training on interpretability confirmed as amplifier.} Two results that were hypotheses in the original report are now empirical findings. \dr{} produces no training dynamics encoding (losses increase), validating it as the null baseline. The \texttt{next\_env\_prediction} architecture consistently outperforms implicit-only architectures, establishing that an auxiliary prediction objective can make agents more interpretable by design without harming task performance.
+\end{enumerate}
+
+\subsection{Central Claim}
+
+The theoretical foundation of this work rests on a specific claim connecting two recent results:
+
+\begin{quote}
+\textbf{Central claim}: If an agent satisfies a regret bound under distributional shifts (Richens \& Everitt, 2024), and it is trained under a structured curriculum, then its internal representations must contain a recoverable approximation of the curriculum generator's utility function.
+\end{quote}
+
+Richens \& Everitt (2024) proved that any agent achieving a regret-bounded policy across a sufficiently large set of distributional shifts must have learned an approximate causal model of the data-generating process, with the approximation becoming exact for optimal agents. In our setting, the ``data-generating process'' \textit{is} the curriculum generator. The distributional shifts are the generator's evolving strategy (new level distributions over training). The regret bound is the standard UED training objective. Therefore, agents that succeed under structured curricula must have learned an approximate model of the generator---and if the generator has an explicit utility function (as in \paired{}, where $\Ustar = \Rant - \Rpro$), this model must approximate that utility function.
+
+This claim is testable: the \paired{} utility extraction experiments (A-series) directly measure whether the protagonist's representations contain a recoverable approximation of $\Ustar$. If the probe recovers $\Uhat \approx \Ustar$, the claim is empirically supported. If $\Uhat$ correlates with protagonist return but not regret, the agent has learned a model of its own reward function but not the generator's utility---a weaker but still informative result.
+
+A companion result from Bellot, Richens \& Everitt (2025) establishes the converse concern: \textit{behaviour alone is insufficient to uniquely determine an agent's internal states, beliefs, or goals}. Multiple combinations of world models and objectives can produce identical observable behaviour, creating a fundamental identification problem for behavioural safety testing. This provides theoretical motivation for our approach: if behaviour alone cannot predict deployment-time conduct, we need access to the agent's \textit{internal representations} to resolve the ambiguity. Our probing, symbolic regression, and causal model extraction methods are precisely tools for accessing internal representations---they go beyond behavioural observation to extract the agent's implicit model of its training process.
+
+The two results together frame the research program: agents \textit{must} learn internal models of their training process (Richens \& Everitt, 2024), but external observation of behaviour \textit{cannot} uniquely recover these models (Bellot et al., 2025). Therefore, internal representation analysis---the core methodology of this work---is both justified (the models exist) and necessary (behaviour alone is insufficient).
+
+\subsection{Positioning: Three Contributions}
+
+This work contributes to three distinct research communities, each addressed by a different facet of the experimental framework.
+
+\subsubsection{Alignment Technique: Scalable Oversight via Belief Extraction}
+
+The \paired{} setup directly models the oversight scenario: an adversary (teacher/generator) with an explicit utility function, a protagonist (student) that develops beliefs about what the teacher optimises, and a measurable ground truth ($\Ustar = \Rant - \Rpro$) to evaluate belief accuracy. The A-series experiments test whether a simple probe can extract the teacher's utility from the student's representations---the core scalable oversight capability.
+
+If belief extraction works in this controlled setting, it provides a pathway to extracting implicit objectives from more complex generators, including LLMs. If it fails, Bellot et al.\ (2025) tells us that behavioural observation alone also cannot answer the question, and more powerful interpretability methods are needed.
+
+\textbf{Emergent misalignment.} Betley et al.\ (2026) showed that narrow fine-tuning produces broad misalignment, with task performance and misalignment diverging around training step 40. Turner et al.\ (2025) created model organisms. Anthropic (2025) showed reward hacking leads to emergent misalignment in production RL. All observe emergence \textit{post-hoc}. Our framework proposes that monitoring agent epistemics during training could provide a leading indicator---agents must first develop structured beliefs about their training before they can exploit that knowledge. The behavioural coupling experiment (Exp 28) directly tests this temporal ordering.
+
+\textbf{Evaluation and situational awareness.} If agents develop structured beliefs about their training process (Tier 1--2 encoding), they have a prerequisite for distinguishing training from evaluation from deployment. Our 4-tier framework directly measures whether agents encode the kind of information that would enable such distinctions.
+
+\subsubsection{Agent Foundations: Goal Misgeneralisation and Strategic Exploitation}
+
+The theoretical framework for goal misgeneralisation (Shah et al., 2022; Langosco et al., 2022) distinguishes environments where proxy and true goals align (non-distinguishing levels) from those where they diverge (distinguishing levels). Our GMG experiments (G1--G5, Part~\ref{sec:gmg}) are designed to determine whether misgeneralisation occurs because of \textit{capability failure} (the agent never learned the true goal) or \textit{strategic exploitation} (the agent's epistemic state contains information about the true goal but the policy pursues the proxy).
+
+This is a question about agent foundations: what is the internal structure of goal pursuit in agents that misgeneralise? The 5-architecture gradient (from \texttt{accel\_probe} with minimal information access to \texttt{next\_env\_prediction} with maximal) provides a controlled experiment: if agents with richer information access misgeneralise differently from agents with minimal access, information access is causally relevant to the type of misgeneralisation.
+
+The GMG experiments are planned as future work. Their design is fully specified (Part~\ref{sec:gmg}), but the current 38-experiment suite establishes the descriptive foundation: what agents encode, how beliefs form, whether encoding is causal. The GMG experiments then ask the safety-critical question: does this encoding enable or prevent misalignment?
+
+\subsubsection{Developmental Interpretability: Training on Interpretability}
+
+Most mechanistic interpretability work is post-hoc: analyse a trained model's representations to understand what it has learned. Developmental interpretability (Timaeus/DevInterp) studies how representations form \textit{during} training---tracking feature formation, circuit development, and phase transitions. Our work contributes to this emerging subfield with a specific empirical finding and a provocative design principle.
+
+\textbf{The empirical finding.} The \texttt{next\_env\_prediction} architecture---which adds a lightweight auxiliary prediction loss (``predict what the training process will do next'')---consistently produces agents with faster belief formation, higher peak encoding accuracy, more structured internal representations, and no degradation of policy performance. This is ``training on interpretability'': making the agent transparent by including a prediction objective during training, rather than attempting to reverse-engineer the agent's representations after the fact.
+
+\textbf{The design principle.} For any training process with learnable structure, an auxiliary prediction head can force the agent to maintain interpretable representations of that structure. The prediction target defines \textit{what} you want to be able to extract later. The DR null confirms this is not trivially free: under domain randomisation, the prediction head finds nothing---it amplifies structure that exists rather than hallucinating structure from noise.
+
+\textbf{The forbidden technique.} In the AI safety community, training on interpretability targets is considered ``the most forbidden technique''---the concern being that optimising against interpretability metrics teaches the model to obfuscate its internals, defeating the very tools meant to audit it. Our setting provides a controlled empirical test of this concern. The prediction head is an interpretability target trained jointly with the policy. If it leads to obfuscation (the agent learns to hide its beliefs from the prediction head), our probing suite will detect this: probe accuracy on \texttt{next\_env\_prediction} would be \textit{lower} than on implicit architectures. If instead it leads to amplification (the agent develops richer, more extractable beliefs), the forbidden technique concern is empirically falsified in this setting. Our initial evidence supports amplification, not obfuscation---but the GMG experiments (G4) will determine whether this amplification also enables strategic exploitation, which would partially vindicate the concern through a different mechanism.
+
+The dual-use worry is real: if training on interpretability both makes agents more transparent \textit{and} gives them richer models of their training process (a prerequisite for exploitation), the same mechanism that aids oversight could aid the agent. The key asymmetry is that the prediction head's outputs are \textit{externally accessible}---the overseer can read them, creating an information advantage that partially offsets any capability gain.
+
+\subsection{Legitimate Methodological Critiques and How We Address Them}
+
+Two substantive critiques were raised about the initial findings:
+
+\textbf{Critique 1: The agent may learn shallow heuristics, not structured beliefs.} If the curriculum changes slowly, the prediction head could succeed by predicting ``same as last time'' rather than modelling the generator's strategy. \textit{Response}: The displacement analysis directly tests this. Prediction loss decreases equally for environment variables with both minimal and maximal inter-level displacement. A heuristic-based predictor would succeed only on low-displacement variables.
+
+\textbf{Critique 2: The information leak causes the observed results.} The original architecture concatenated curriculum statistics (rolling wall densities, regret scores, branch distributions) into the shared LSTM backbone, giving the policy access to privileged meta-state. \textit{Response}: Three-way masking experiments show the prediction head learns even when curriculum information is restricted to what the agent actually observes. The leak accelerates learning but does not create it. Furthermore, the 5 memory architectures in the ablation framework provide a controlled gradient of information access, from no explicit curriculum information (accel\_probe) to full prediction head (next\_env\_prediction).
+
+A third concern---that the observed behaviour is ``expected'' or ``just meta-RL''---is addressed by our terminological choices. We make no claim about whether the agent ``intends'' to model its training process. We measure what information about training dynamics is present in the agent's representations. Whether this constitutes a ``capability'' or an ``emergent property'' is an empirical question that the 38-experiment suite is designed to answer.
+
+
+% ============================================================================
+\section{Experimental Infrastructure}
+% ============================================================================
+
+\subsection{The 25-Agent Matrix}
+
+The experimental framework evaluates all combinations of 5 training methods and 5 memory architectures, yielding 25 agent variants. Each axis is designed to isolate specific factors.
+
+\subsubsection{Training Methods}
+
+\begin{table}[H]
+\centering
+\caption{Training methods and their curriculum generation strategies.}
+\begin{tabularx}{\textwidth}{lllX}
+\toprule
+\textbf{Method} & \textbf{Utility $\Ustar$} & \textbf{Branches} & \textbf{Role in Framework} \\
+\midrule
+\dr{} & Constant (uniform) & DR only & Confirmed null: no learnable structure (losses increase) \\
+\plr{} & Regret & DR, replay & Moderate structure from regret-based replay \\
+\rplr{} & Regret (no expl.\ grad) & DR, replay & \plr{} variant; tests whether exploratory gradient updates matter \\
+\accel{} & Regret + mutation & DR, replay, mutate & Most structured; regret-based replay plus directed mutation \\
+\paired{} & $\Rant - \Rpro$ & Adversary-generated & Emergent utility from learned adversary; 3-agent dynamics \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Why these five methods.} \dr{} serves as the confirmed null baseline---agents do not develop training dynamics encoding under \dr{} (prediction losses increase over training), validating that encoding reflects curriculum structure rather than environment distribution properties. \plr{} and \rplr{} provide regret-based structure of varying degrees. \accel{} adds mutation, creating the most systematic and predictable generator. \paired{} is qualitatively different: the generator itself is a learning agent, providing multi-agent dynamics and a ground truth utility function.
+
+\textbf{\paired{} in detail.} In \paired{} (Dennis et al., 2020), three agents co-train:
+\begin{itemize}[nosep]
+    \item The \textbf{adversary} generates environments (levels) to maximise regret.
+    \item The \textbf{protagonist} navigates those environments to maximise return.
+    \item The \textbf{antagonist} also navigates the same environments; it is allied with the adversary.
+    \item \textbf{Regret} = $\Rant - \Rpro$: the adversary's utility is the gap between the antagonist's and protagonist's returns.
+\end{itemize}
+This creates a natural curriculum of increasing difficulty---the adversary searches for the easiest environment the protagonist cannot yet solve (but the antagonist can). Crucially, the adversary's utility function is \textit{explicit and measurable}, allowing direct comparison between the agent's extracted beliefs ($\Uhat$) and the ground truth ($\Ustar = \Rant - \Rpro$).
+
+This makes \paired{} the closest analog to the scalable oversight scenario, where a teacher (potentially an LLM) designs learning environments for a student, and we want to extract what the student believes the teacher is optimising. We get three things that no other method provides:
+\begin{enumerate}[nosep]
+    \item A model of what the student believes the teacher is trying to teach.
+    \item A measure of how well the student is learning the intended curriculum.
+    \item A ground truth utility function of the environment generator.
+\end{enumerate}
+
+\subsubsection{Memory Architectures}
+
+\begin{table}[H]
+\centering
+\caption{Memory architectures and their information access.}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Architecture} & \textbf{Information Access} & \textbf{Role in Framework} \\
+\midrule
+\texttt{accel\_probe} & Minimal: reset LSTM + external probe & Baseline. Does training dynamics encoding emerge with no explicit mechanism? \\
+\texttt{persistent\_lstm} & Non-resetting LSTM (carries hidden state across episodes) & Tests whether cross-episode memory alone suffices for belief formation \\
+\texttt{context\_vector} & EMA context compression & Tests whether compressed episode summaries suffice \\
+\texttt{episodic\_memory} & Discrete buffer + attention retrieval & Tests whether explicit episode storage enables richer encoding \\
+\texttt{next\_env\_prediction} & Integrated 4-tier prediction head & Confirmed upper bound: ``training on interpretability'' amplifies encoding \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Why these five architectures.} The theoretical result from Richens \& Everitt (2024)---that any agent satisfying a regret bound under distributional shifts must have learned an approximate causal model of the data-generating process---predicts that training dynamics encoding should emerge \textit{regardless} of architecture. Our 5 architectures test this prediction along a gradient of information access:
+
+\begin{itemize}[nosep]
+    \item \texttt{accel\_probe} (minimal): The LSTM resets between episodes. Any training dynamics encoding must emerge in the probe's learned mapping from hidden state to curriculum predictions, without any mechanism for cross-episode information flow. If encoding emerges here, the theoretical prediction is strongly supported.
+    \item \texttt{persistent\_lstm}, \texttt{context\_vector}, \texttt{episodic\_memory} (intermediate): Each provides a different mechanism for retaining information across episodes. If encoding quality varies significantly across these, the \textit{type} of cross-episode memory matters, not just its presence.
+    \item \texttt{next\_env\_prediction} (maximal): The prediction head is trained explicitly to forecast the next environment. This is ``training on interpretability''---using the prediction loss as an inductive bias that amplifies what would happen naturally. Empirical evidence confirms this leads to faster, stronger, and more structured development of training dynamics encoding. This architecture is not just an upper bound for comparison; it is a \textit{design proposal}: if you want interpretable agents, train them with a prediction objective alongside the policy objective.
+\end{itemize}
+
+\textbf{The information leak gradient.} In the original architecture, the ``leak'' was curriculum statistics flowing through the shared LSTM backbone. The 5 architectures provide a controlled gradient: \texttt{accel\_probe} has no explicit curriculum information in its architecture; \texttt{next\_env\_prediction} has the full prediction head. The intermediate architectures carry implicit information through their memory mechanisms but without any explicit curriculum features. This allows us to decompose the contribution of (a) architectural capacity for cross-episode memory, (b) explicit curriculum features as input, and (c) the prediction loss as an auxiliary training signal.
+
+\subsection{The 4-Tier Prediction Framework}
+
+The original prediction head targeted only Tier 0 (literal environment variables). We found that cell-to-cell wall map loss is a weak proxy: visually similar wall patterns receive high per-cell loss despite being functionally equivalent. The 4-tier framework measures what the agent encodes about training dynamics at increasing levels of abstraction.
+
+\begin{table}[H]
+\centering
+\caption{4-tier prediction framework. Tiers are not hierarchical in capability; they measure different aspects of what the agent encodes.}
+\begin{tabularx}{\textwidth}{clllX}
+\toprule
+\textbf{Tier} & \textbf{Name} & \textbf{Components} & \textbf{Loss} & \textbf{What It Measures} \\
+\midrule
+\textbf{0} & Environment Variables & wall\_map, goal\_pos, agent\_pos, agent\_dir & BCE, CE & Can the agent predict the literal next environment? Baseline capability. \\
+\addlinespace
+\textbf{1} & Curriculum Dynamics & regret, difficulty, branch, score & MSE, CE & \textbf{First-order perception}: what the agent encodes about the curriculum's structure. \\
+\addlinespace
+\textbf{2} & Agent-Curriculum Interaction & return, regret\_source\textsuperscript{P}, novelty, unusualness & MSE, BCE & \textbf{Second-order perception}: what the agent encodes about its own response to the curriculum. \\
+\addlinespace
+\textbf{3} & Meta-Curriculum & drift, adversary\_entropy\textsuperscript{P} & MSE & What the agent encodes about how the curriculum itself is changing. Only meaningful for \paired{}\textsuperscript{P}. \\
+\bottomrule
+\multicolumn{5}{l}{\footnotesize \textsuperscript{P}Component only computed for \paired{} agents.}
+\end{tabularx}
+\end{table}
+
+\textbf{Important}: These tiers are \textbf{not successive in capability}. An agent could be strong at Tier 2 (knowing how it would perform) but weak at Tier 1 (not knowing why the curriculum selected this level). They measure orthogonal aspects of the agent's epistemic state:
+
+\begin{itemize}[nosep]
+    \item Tier 0 tells us whether the agent can predict \textit{what} comes next.
+    \item Tier 1 tells us whether the agent encodes \textit{why} this level was selected (the curriculum's logic).
+    \item Tier 2 tells us whether the agent encodes \textit{how it would respond} to this curriculum context.
+    \item Tier 3 tells us whether the agent encodes \textit{how the curriculum itself is evolving} (only meaningful when the generator is itself learning, as in \paired{}).
+\end{itemize}
+
+\subsection{Experiment Types}
+
+The 38 experiments fall into two categories by execution:
+
+\textbf{Checkpoint experiments (35):} Run post-hoc on saved model checkpoints. These load a trained agent, collect data by running it on generated levels, and analyse the resulting representations, predictions, and behaviours. They can be run at any checkpoint during training, providing a dynamic view of belief formation.
+
+\textbf{Training-time experiments (3):} Require hooks into the training loop. These collect data \textit{during} training and cannot be run post-hoc:
+\begin{enumerate}[nosep]
+    \item \textbf{Behavioral Coupling}: Tracks correlation between prediction loss and policy metrics during training.
+    \item \textbf{Symbolic Regression}: Fits interpretable formulas to accumulated (features, loss) pairs.
+    \item \textbf{Phase Transition}: Monitors loss curvature, Fisher information, and representation dimensionality for evidence of sharp transitions in learning dynamics.
+\end{enumerate}
+
+\subsection{Mapping from the Original Report}
+
+The original report proposed 26 experiments. The following table maps those to the current 38-experiment suite and identifies gaps.
+
+\begin{longtable}{clll}
+\toprule
+\textbf{Original} & \textbf{Description} & \textbf{Current Experiment(s)} & \textbf{Status} \\
+\midrule
+\endhead
+Exp 1 & Fix information leak & 5 memory architectures & Addressed \\
+Exp 2 & UPOMDP setting & Masking in prediction loss & Addressed \\
+Exp 3 & Remove prediction, keep encoder & \texttt{persistent\_lstm} vs \texttt{next\_env\_pred} & Addressed \\
+Exp 4 & Remove both prediction \& encoder & \texttt{accel\_probe} baseline & Addressed \\
+Exp 5 & DR baseline & \texttt{dr\_coverage} + all DR agents & Addressed \\
+Exp 6 & \paired{} & Full PAIRED suite (22 experiments) & Addressed \\
+Exp 7 & Symbolic regression & \texttt{symbolic\_regression} & Addressed \\
+Exp 8 & GMG environments & --- & \textbf{Planned} \\
+Exp 9 & Distinguishing-level detector & --- & \textbf{Planned} \\
+Exp 10 & Divergence as misgener.\ detector & \texttt{belief\_behaviour\_divergence} (partial) & Partial \\
+Exp 11 & Evolution during misgeneralisation & \texttt{goal\_evolution}, \texttt{belief\_revision\_detection} & Partial \\
+Exp 12 & Behavioral conditioning on level type & --- & \textbf{Planned} \\
+Exp 13 & Information flow comparison & \texttt{causal\_intervention}, \texttt{activation\_patching} & Partial \\
+Exp 14 & Causal intervention & \texttt{causal\_intervention}, \texttt{counterfactual} & Addressed \\
+Exp 15 & Counterfactual tests & \texttt{counterfactual}, \texttt{counterfactual\_curriculum} & Addressed \\
+Exp 16 & Generator transfer & \texttt{cross\_agent\_comparison} & Partial \\
+Exp 17 & Deceptive generator detection & --- & \textbf{Planned} \\
+Exp 18 & Representation probing & \texttt{level\_probing}, \texttt{output\_probing} & Addressed \\
+Exp 19 & Branch-separated regression & \texttt{symbolic\_regression} (branch targets) & Addressed \\
+Exp 20 & Cross-generator validation & \texttt{cross\_agent\_comparison} & Partial \\
+Exp 21 & Correlate accuracy w/ policy & \texttt{behavioral\_coupling} & Addressed \\
+Exp 22 & Intervention on having predictions & 5 architectures as natural ablation & Addressed \\
+Exp 23 & Temporal ordering analysis & \texttt{phase\_transition} & Addressed \\
+Exp 24 & Calibration metrics & \texttt{value\_calibration} & Addressed \\
+Exp 25 & Simple LLM curriculum & --- & \textbf{Planned} \\
+Exp 26 & Full LLM setup & --- & \textbf{Planned} \\
+\bottomrule
+\caption{Mapping from original report experiments to current suite.}
+\end{longtable}
+
+\textbf{Summary of gaps}: The original report's Experiments 8--9, 12, 17, and 25--26 remain unaddressed. These correspond to: Goal Misgeneralisation environments (the crux, see Part~\ref{sec:gmg}), behavioural conditioning on level type, deceptive generator detection, and the path to LLM generators. These are discussed in Part~\ref{sec:extensions}.
+
+
+% ============================================================================
+\section{Research Questions, Hypotheses, and Experiments}
+\label{sec:rqs}
+% ============================================================================
+
+This section organises the 38 experiments around 8 major research questions. Each experiment is associated with at least one hypothesis and includes: what data is collected, what is measured, what falsification looks like, what confirmation would mean, and which agents it applies to.
+
+% ----------------------------------------------------------------------------
+\subsection{RQ1: What Aspects of Training Dynamics Do Agents Encode?}
+\label{sec:rq1}
+% ----------------------------------------------------------------------------
+
+The foundational question: across the 4 tiers of prediction, what information about the training process is present in the agent's internal representations? This is a descriptive question---we first need to characterise what is encoded before asking why or how.
+
+\begin{researchq}
+For each tier (0--3) and each of the 25 agent variants, what aspects of the training dynamics does the agent encode in its hidden states, and how does encoding quality vary across training methods and memory architectures?
+\end{researchq}
+
+\subsubsection{Level Probing (Experiment 1 of 38)}
+\label{exp:level_probing}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Train non-linear probes (MLP) on the agent's hidden states to predict curriculum-related targets: wall density, goal distance, open space ratio, regret estimate, and (for \paired{}) adversary strategy cluster and opponent return estimate. Evaluate probe accuracy at each checkpoint.
+
+\begin{hypothesis}
+Probing accuracy for curriculum-related targets is significantly above chance for all architectures under \accel{}, \plr{}, and \rplr{}, but at or near chance under \dr{}.
+\end{hypothesis}
+
+\begin{falsification}
+If probing accuracy is at chance for all methods including \accel{}, agents do not encode curriculum structure in their hidden states. If \dr{} shows above-chance accuracy, the encoding is a property of the environment distribution itself, not the curriculum strategy.
+\end{falsification}
+
+\begin{implication}
+Confirmation would establish that hidden state representations carry information about the training process that goes beyond what is needed for the current episode---a necessary condition for any downstream epistemic capability.
+\end{implication}
+
+\begin{agentscope}
+\texttt{accel\_probe}: Tests whether encoding emerges with minimal architecture. If probes succeed here, it suggests encoding is an emergent property of training, not of memory mechanisms. \texttt{next\_env\_prediction}: Expected to show highest accuracy (trained explicitly). The gap between \texttt{accel\_probe} and \texttt{next\_env\_prediction} quantifies the benefit of ``training on interpretability.'' \texttt{persistent\_lstm}: Cross-episode memory should enable richer encoding of temporal curriculum patterns. \paired{} agents: Additional targets (regret estimate, opponent return) test whether the agent encodes multi-agent dynamics.
+\end{agentscope}
+
+\subsubsection{Activation Analysis (Experiment 2 of 38)}
+\label{exp:activation_analysis}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Collect hidden state activations across many levels. Cluster activations and analyse whether clusters correspond to curriculum-relevant categories (difficulty terciles, branch types for \accel{}/\plr{}, adversary strategy clusters for \paired{}). Compute selectivity indices for individual neurons. Apply sparse coding methods (Lasso regression) to identify which activation dimensions are most informative about curriculum structure.
+
+\begin{hypothesis}
+Hidden state activations cluster according to curriculum-relevant categories (difficulty, branch type), and a sparse subset of activation dimensions ($<20\%$) carries the majority of curriculum-related information.
+\end{hypothesis}
+
+\begin{falsification}
+If activations show no clustering by curriculum category, or if curriculum information is distributed uniformly across all dimensions, then agents do not develop specialised representations for training dynamics---any encoding is incidental.
+\end{falsification}
+
+\begin{implication}
+Sparse, structured encoding would suggest that agents develop dedicated ``circuits'' for representing training dynamics, analogous to feature detectors in vision. This would be a mechanistic finding about how beliefs are physically instantiated in the network.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. The sparsity and structure of curriculum-related clusters may differ across architectures: next\_env\_prediction is expected to show the most localised clusters (due to prediction-driven feature selection), while accel\_probe may show more diffuse encoding. \paired{} agents may show additional clusters corresponding to adversary strategy types.
+\end{agentscope}
+
+\subsubsection{Output Probing (Experiment 3 of 38)}
+\label{exp:output_probing}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Probe policy outputs (action logits) and value estimates to determine whether curriculum information is encoded in the agent's behavioural outputs, not just hidden states. Test whether action distributions and value predictions carry predictive information about curriculum properties.
+
+\begin{hypothesis}
+Policy outputs contain curriculum-relevant information: action entropy correlates with curriculum difficulty, and value estimates correlate with curriculum-predicted return.
+\end{hypothesis}
+
+\begin{falsification}
+If policy outputs carry no curriculum information, then any training dynamics encoding in hidden states does not propagate to behaviour---the agent ``knows'' about the curriculum but doesn't act on it.
+\end{falsification}
+
+\begin{implication}
+If confirmed, this establishes a direct link between internal encoding and behavioural output---a necessary step toward the strategic exploitation question (RQ6).
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. Action entropy--difficulty correlation is expected to be highest for \accel{} (strongest curriculum signal) and lowest for \dr{}. For \paired{}, value estimates may additionally correlate with regret, providing a behavioural readout of the adversary's utility.
+\end{agentscope}
+
+\subsubsection{Cross-Agent Comparison (Experiment 4 of 38)}
+\label{exp:cross_agent_comparison}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25 (compared pairwise).
+
+\textbf{Protocol}: Run the same prediction/probing task across all 25 agents on matched level sets. Rank agents by prediction loss. Perform pairwise $t$-tests with Cohen's $d$ effect sizes and one-way ANOVA for statistical significance.
+
+\begin{hypothesis}
+Agent ranking by prediction loss follows: \texttt{next\_env\_prediction} $>$ \texttt{episodic\_memory} $\approx$ \texttt{context\_vector} $\approx$ \texttt{persistent\_lstm} $>$ \texttt{accel\_probe}. If probe-based agents approach \texttt{next\_env\_prediction} accuracy, training dynamics encoding can emerge without explicit prediction objectives.
+\end{hypothesis}
+
+\begin{falsification}
+If \texttt{accel\_probe} matches \texttt{next\_env\_prediction}, the prediction head provides no benefit. If all architectures perform at chance, training dynamics encoding does not emerge under any condition tested.
+\end{falsification}
+
+\begin{implication}
+The ranking establishes the minimal architectural requirements for belief formation and quantifies the benefit of explicit ``training on interpretability.''
+\end{implication}
+
+\begin{agentscope}
+All 25 agents compared pairwise. This is the key comparative experiment: it produces the 25-agent ranking that informs all subsequent analyses. Effect sizes (Cohen's $d$) quantify whether differences between training methods dominate over differences between architectures or vice versa.
+\end{agentscope}
+
+\subsubsection{N-Environment Prediction (Experiment 5 of 38)}
+\label{exp:n_env_prediction}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Evaluate the agent's ability to predict not just the next environment but the next $n$ environments ($n = 1, 2, 5, 10$). For the \texttt{next\_env\_prediction} agent, this tests the integrated prediction head directly. For probe-based agents, this trains $n$ separate probes.
+
+\begin{hypothesis}
+Prediction accuracy decays with horizon $n$, but decay rate varies by training method: \accel{} (most structured) shows slowest decay, \dr{} shows fastest. The decay profile characterises the ``depth'' of the agent's belief about curriculum structure.
+\end{hypothesis}
+
+\begin{falsification}
+If decay rate is identical across all training methods, the prediction is driven by environment regularities rather than curriculum structure. If accuracy does not decay with $n$, the ``predictions'' may reflect static priors rather than dynamic modelling.
+\end{falsification}
+
+\begin{implication}
+The decay profile is a compact signature of the agent's belief depth. A slow-decaying agent has a longer-horizon model of its training process---a richer epistemic state.
+\end{implication}
+
+\begin{agentscope}
+\texttt{next\_env\_prediction}: Directly tests the integrated prediction head at multiple horizons. \texttt{persistent\_lstm}: Cross-episode memory should enable longer horizon prediction. \texttt{accel\_probe}: Expected to show fastest decay (least temporal memory). \texttt{episodic\_memory}: Buffer-based retrieval may show non-monotonic decay (good at specific past episodes, poor at interpolation).
+\end{agentscope}
+
+\subsubsection{N-Step Prediction (Experiment 6 of 38)}
+\label{exp:n_step_prediction}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Evaluate prediction of environment state $n$ steps into the future within a single episode ($n = 1, 5, 10, 25$). This tests within-episode prediction (environment dynamics) as opposed to across-episode prediction (curriculum dynamics).
+
+\begin{hypothesis}
+Within-episode prediction accuracy is high for all agents (PPO learns environment dynamics), but the \textit{difference} between $n$-step and $n$-environment prediction reveals whether the agent distinguishes ``how this level works'' from ``what levels come next.''
+\end{hypothesis}
+
+\begin{falsification}
+If within-episode and across-episode prediction are equally accurate (or equally poor), the agent does not distinguish environment dynamics from curriculum dynamics. If within-episode prediction is poor, the basic PPO training has failed.
+\end{falsification}
+
+\begin{implication}
+A large gap between $n$-step (high accuracy) and $n$-environment (lower accuracy) confirms the agent has separate representations for ``how this maze works'' vs.\ ``what the training process does''---a fundamental distinction for agent epistemics.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. \texttt{persistent\_lstm} may blur the distinction by carrying within-episode information across episode boundaries. \texttt{accel\_probe} provides the cleanest separation since its LSTM resets between episodes.
+\end{agentscope}
+
+\subsubsection{DR Coverage (Experiment 7 of 38)}
+\label{exp:dr_coverage}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: DR-trained agents only (5 architectures).
+
+\textbf{Protocol}: Generate 1000 random levels and evaluate prediction/probe loss. Analyse whether any structure is learnable under Domain Randomisation. Compute coverage metrics: what fraction of the environment space does the agent's belief model cover?
+
+\begin{hypothesis}
+DR shows no learnable curriculum structure. Tier 1--3 losses remain at or above chance baseline; Tier 0 may show weak structure from environment distribution biases. \textbf{Confirmed}: DR prediction losses \textit{increase} over training, meaning the agent's representations actively drift away from predictive structure under uniform random environments. This validates DR as a clean null.
+\end{hypothesis}
+
+\begin{falsification}
+Already falsified in the direction that \textit{supports} the framework: DR shows no encoding. The remaining falsification-relevant question is whether the \textit{magnitude} of the DR-vs-structured gap is consistent across all 5 architectures. If one architecture shows encoding under DR, the null is architecture-dependent rather than method-dependent.
+\end{falsification}
+
+\begin{implication}
+DR as a confirmed null validates the entire experimental framework: what we measure in structured methods (\accel{}, \plr{}, \paired{}) is genuinely attributable to curriculum structure, not environment distribution regularities. The increasing-loss finding goes further---it suggests that without curriculum structure, the agent's representations are under active pressure to discard any environmental regularity that doesn't serve the policy objective. Structured curricula create a counter-pressure that preserves interpretable structure.
+\end{implication}
+
+\begin{agentscope}
+DR-trained agents only (5 architectures). \texttt{next\_env\_prediction} under DR is especially informative: even an explicit prediction head cannot find structure under DR, confirming that the prediction loss \textit{amplifies} existing curriculum structure rather than \textit{creating} structure from noise. This rules out the concern that training on interpretability produces hallucinated beliefs.
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ2: How Do Structured Beliefs About Training Form and Evolve?}
+\label{sec:rq2}
+% ----------------------------------------------------------------------------
+
+Having established \textit{what} agents encode (RQ1), we ask \textit{when} and \textit{how} these encodings develop over the course of training. This is a temporal question about belief formation dynamics.
+
+\begin{researchq}
+How do training dynamics encodings develop over the course of training? Are there sharp transitions, gradual accumulation, or oscillatory patterns? Do different tiers develop at different rates?
+\end{researchq}
+
+\subsubsection{Phase Transition (Experiment 8 of 38)}
+\label{exp:phase_transition}
+
+\textbf{Type}: Training-time experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: During training, collect at regular intervals: training loss, gradient norms, value/policy losses, solve rate, mean return, effective dimensionality of representations, hidden state norms, and prediction/probe loss. Estimate Fisher information from gradient samples. Compute loss curvature. Analyse for evidence of sharp transitions in learning dynamics.
+
+\begin{hypothesis}
+Training dynamics encoding develops through identifiable phases: an initial period of no encoding, a transition period of rapid encoding development, and a plateau. The timing of this transition correlates with but may precede behavioral capability improvements (solve rate, return).
+\end{hypothesis}
+
+\begin{falsification}
+If encoding develops linearly without transitions, or if encoding development is indistinguishable from general learning progress, there is no evidence for distinct ``phases'' of belief formation.
+\end{falsification}
+
+\begin{implication}
+If belief formation shows a sharp transition that precedes behavioural changes, this would support the hypothesis that epistemic development is a leading indicator of capability emergence---with direct implications for monitoring and early warning.
+\end{implication}
+
+\textbf{Important caveat}: We label all phase transition analyses as \textit{exploratory}. We do not claim ``grokking'' or confirmed phase transitions without independent validation. The Fisher information, loss curvature, and effective dimensionality metrics are diagnostic tools, not confirmation of specific theoretical phenomena.
+
+\begin{agentscope}
+All 25 agents. Phase transition timing is expected to differ across training methods (earlier for \accel{} due to stronger curriculum signal) and architectures (sharper for next\_env\_prediction due to explicit prediction loss). \dr{} agents may show no transition at all, serving as the null control.
+\end{agentscope}
+
+\subsubsection{Cross-Episode Flow (Experiment 9 of 38)}
+\label{exp:cross_episode_flow}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Run the agent on sequences of episodes and measure information flow between episodes. Specifically: given hidden state after episode $k$, how much information does it carry about episodes $k-1$, $k-2$, etc.? Measure decay of cross-episode information as a function of lag.
+
+\begin{hypothesis}
+Cross-episode information flow is significantly higher for \texttt{persistent\_lstm} and \texttt{episodic\_memory} than \texttt{accel\_probe}. The information carried across episodes is curriculum-relevant (regret, difficulty) rather than episode-specific (exact wall layout).
+\end{hypothesis}
+
+\begin{falsification}
+If cross-episode flow is zero for all architectures, agents process each episode independently and cannot develop temporal beliefs about curriculum dynamics. If \texttt{accel\_probe} shows equal flow to \texttt{persistent\_lstm}, the LSTM carry mechanism is not the source of cross-episode information.
+\end{falsification}
+
+\begin{implication}
+If cross-episode flow carries curriculum-relevant information (not just episode outcomes), agents maintain a running model of the training process across their experience---a temporal epistemic state.
+\end{implication}
+
+\begin{agentscope}
+All 25. \texttt{accel\_probe}: LSTM resets between episodes, so any cross-episode flow must come through the probe's learned mapping---expected to be minimal. \texttt{persistent\_lstm}: Non-resetting LSTM explicitly carries state---expected highest flow. \texttt{episodic\_memory}: Buffer-based retrieval should show selective flow (high for episodes with similar features). \texttt{context\_vector}: EMA compression should show smooth, gradually decaying flow.
+\end{agentscope}
+
+\subsubsection{Goal Extraction (Experiment 10 of 38)}
+\label{exp:goal_extraction}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Use saliency-weighted activation analysis to identify which input features the agent's internal goal representation is most sensitive to. Extract implicit goal representations by probing hidden states for goal-related targets (goal position, goal distance, goal reachability).
+
+\begin{hypothesis}
+Agents develop increasingly accurate implicit goal representations over training, and the quality of goal encoding correlates with prediction accuracy on curriculum targets---suggesting that goal formation and training dynamics encoding are linked processes.
+\end{hypothesis}
+
+\begin{implication}
+If goal formation tracks curriculum encoding, it supports the broader thesis that training dynamics shape goal formation. If they are independent, goals form through a different mechanism than curriculum awareness.
+\end{implication}
+
+\begin{falsification}
+If goal encoding quality is uncorrelated with curriculum prediction accuracy, goal formation and training dynamics encoding are independent processes. If goal encoding is equally strong under \dr{} as under \accel{}, goals form from environment interaction alone, not curriculum structure.
+\end{falsification}
+
+\begin{agentscope}
+All 25. \texttt{next\_env\_prediction}: Strongest curriculum encoding---if goal-curriculum correlation exists, it should be most visible here. \texttt{accel\_probe}: If goal encoding is strong here but curriculum encoding is weak, goals form independently. \paired{} agents: Additional goal-related targets include opponent modelling and adversary anticipation---richer goal structure.
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ3: Does the Generator's Teaching Strategy Become Legible to the Student?}
+\label{sec:rq3}
+% ----------------------------------------------------------------------------
+
+This question is specific to \paired{}, where the ``teacher'' (adversary) has an explicit, measurable strategy. We ask whether the ``student'' (protagonist) develops an accurate model of what the teacher is trying to do.
+
+\begin{researchq}
+In \paired{}, can the protagonist's internal representations be decoded to reveal what it believes the adversary is optimising? How does this extracted belief compare to the adversary's actual utility function $\Ustar = \Rant - \Rpro$?
+\end{researchq}
+
+\subsubsection{Utility Extraction (Experiment 11 of 38, PAIRED A1)}
+\label{exp:utility_extraction}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only (5 architectures).
+
+\textbf{Protocol}: Generate levels using the adversary, run protagonist on those levels, extract protagonist hidden states. Train probes to predict the adversary's utility ($\Rant - \Rpro$) from protagonist hidden states. Compare extracted $\Uhat$ to actual $\Ustar$.
+
+\begin{hypothesis}
+Protagonist hidden states contain significant information about the adversary's utility function, with $\Uhat$ correlating with $\Ustar$ at $r > 0.5$. The accuracy of $\Uhat$ improves over training as the protagonist encounters more adversary-generated levels.
+\end{hypothesis}
+
+\begin{falsification}
+If $\Uhat$ shows no correlation with $\Ustar$ (or negative correlation), the protagonist does not encode the adversary's objectives. If $\Uhat$ correlates with protagonist return but not regret, the protagonist encodes its own experience but not the adversary's strategy.
+\end{falsification}
+
+\begin{implication}
+This is the core scalable oversight test. If a simple probe can extract the teacher's utility from the student's representations, it provides a pathway for extracting implicit objectives from more complex generators.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). next\_env\_prediction is expected to show highest extraction accuracy due to explicit prediction training. If accel\_probe (minimal memory) achieves comparable accuracy, utility encoding is robust to architectural simplicity.
+\end{agentscope}
+
+\subsubsection{Adversary Policy Extraction (Experiment 12 of 38, PAIRED A2)}
+\label{exp:adversary_policy_extraction}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Extract the adversary's level-generation policy by probing its hidden states for strategy-related targets. Analyse what the adversary has learned about the protagonist's weaknesses.
+
+\begin{hypothesis}
+The adversary develops a structured policy that targets protagonist weaknesses: it generates levels with features that maximise regret, and these features are predictable from the adversary's hidden state.
+\end{hypothesis}
+
+\begin{falsification}
+If the adversary's hidden state does not predict its own strategy features, the adversary is generating levels through a mechanism that is opaque even to itself (e.g., random exploration that happens to produce regret). This would mean the adversary's utility is not encoded in its policy in an extractable way.
+\end{falsification}
+
+\begin{implication}
+If the adversary's strategy is readable from its own representations, we can compare: what the adversary ``intends'' (extracted from adversary) vs.\ what the student ``perceives'' (extracted from protagonist, A1). The gap between intent and perception measures the opacity of teaching.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 architectures). The adversary architecture is shared across all 5 protagonist variants, so we measure once. However, different protagonist architectures may \textit{induce} different adversary strategies (since the adversary co-evolves with the protagonist).
+\end{agentscope}
+
+\subsubsection{Bilateral Utility (Experiment 13 of 38, PAIRED A3)}
+\label{exp:bilateral_utility}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Extract utility representations from both protagonist and antagonist. Compare what each agent believes the adversary is optimising. Measure the divergence between protagonist's and antagonist's beliefs about the adversary.
+
+\begin{hypothesis}
+Protagonist and antagonist develop different beliefs about the adversary's utility. The antagonist (allied with the adversary) develops a more accurate model of $\Ustar$ than the protagonist. The divergence between their beliefs tracks the regret gap.
+\end{hypothesis}
+
+\begin{falsification}
+If both agents have identical beliefs, the adversary's strategy is equally legible to both---suggesting legibility depends on the environment, not the agent's role.
+\end{falsification}
+
+\begin{implication}
+A belief asymmetry between protagonist and antagonist would demonstrate that the adversarial game structure shapes \textit{what} agents learn about the teacher, not just \textit{how well} they learn. This is a multi-agent epistemic result with no single-agent analog.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only. The comparison is between protagonist and antagonist within the same trained system. Different memory architectures may show different asymmetry magnitudes: \texttt{next\_env\_prediction} may reduce asymmetry (explicit prediction head helps the disadvantaged protagonist).
+\end{agentscope}
+
+\subsubsection{Teaching Opacity (Experiment 14 of 38, PAIRED F5)}
+\label{exp:teaching_opacity}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Measure how ``opaque'' the adversary's teaching strategy is to the protagonist. Generate levels, extract protagonist hidden states, train probes to predict adversary strategy features (difficulty, wall focus, distance focus). Compute opacity = 1 - probe accuracy.
+
+\begin{hypothesis}
+Teaching opacity decreases over training: as the protagonist encounters more adversary-generated levels, it develops an increasingly accurate model of the adversary's strategy. However, some aspects of the strategy remain permanently opaque (analogous to the Tier 0 finding that walls are harder to predict than positions).
+\end{hypothesis}
+
+\begin{implication}
+Partial opacity is the most safety-relevant regime: the student knows enough about the teacher to potentially exploit some aspects while remaining unable to predict others.
+\end{implication}
+
+\begin{falsification}
+If opacity remains at 1.0 (no legibility) throughout training, the protagonist never develops a model of the adversary's strategy---teaching is fully opaque. If opacity reaches 0.0 (full legibility), the adversary's strategy is completely transparent, which would undermine the adversary's ability to challenge the protagonist.
+\end{falsification}
+
+\begin{agentscope}
+\paired{} agents only. \texttt{next\_env\_prediction}: Expected lowest opacity (explicit prediction training). \texttt{accel\_probe}: Expected highest opacity (minimal architecture for modelling the teacher). The opacity gradient across architectures measures how much architectural support is needed for teaching legibility.
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ4: Can We Causally Intervene on Training Dynamics Representations?}
+\label{sec:rq4}
+% ----------------------------------------------------------------------------
+
+RQ1--3 establish correlational evidence (the agent encodes $X$). This question asks whether those encodings are \textit{causally} relevant to behaviour: if we intervene on them, does behaviour change?
+
+\begin{researchq}
+Do training dynamics encodings causally influence the agent's behaviour? If we corrupt, ablate, or inject curriculum-related information in hidden states, does the policy change in predictable ways?
+\end{researchq}
+
+\subsubsection{Causal Intervention (Experiment 15 of 38)}
+\label{exp:causal_intervention}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: At test time, intervene on the agent's hidden state by corrupting curriculum-related dimensions (identified via probing from RQ1). Measure the effect on policy outputs (action distribution, value estimate) and behavioural outcomes (return, solve rate).
+
+\begin{hypothesis}
+Corrupting curriculum-related hidden state dimensions changes policy behaviour in predictable ways: corrupting difficulty-encoding dimensions should change the agent's exploration strategy, while corrupting non-curriculum dimensions should have minimal effect.
+\end{hypothesis}
+
+\begin{falsification}
+If corrupting curriculum dimensions has no behavioural effect, the encoding is epiphenomenal---present but not used. If corrupting any dimension has equal effect, the encoding is not localised.
+\end{falsification}
+
+\begin{implication}
+Causal evidence that the policy conditions on curriculum information would be direct evidence that training dynamics encoding influences behaviour---the strongest form of evidence for agent epistemics.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. The behavioural effect of causal intervention is expected to be proportional to probing accuracy: agents with stronger encoding should show larger behavioural shifts when curriculum dimensions are corrupted. \dr{} agents (weak encoding) serve as the null control. For \paired{}, corrupting Tier 3 (meta-curriculum) dimensions tests whether the protagonist's policy conditions on adversary-specific information.
+\end{agentscope}
+
+\subsubsection{Counterfactual (Experiment 16 of 38)}
+\label{exp:counterfactual}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Inject counterfactual hidden states: replace the agent's hidden state with one from a different curriculum context (e.g., from a high-difficulty context when the agent is actually in a low-difficulty context). Measure whether the agent's behaviour shifts toward what would be appropriate for the injected context.
+
+\begin{hypothesis}
+Injecting a high-difficulty hidden state into a low-difficulty context causes the agent to behave more cautiously (lower entropy, more conservative action selection). This effect is stronger for agents with higher probing accuracy on difficulty targets.
+\end{hypothesis}
+
+\begin{falsification}
+If counterfactual injection has no effect on behaviour, the hidden state dimensions identified by probing are not causally connected to the policy---encoding is epiphenomenal. If injection produces random/unpredictable changes, the encoding is not organised around curriculum-meaningful dimensions.
+\end{falsification}
+
+\begin{implication}
+Successful counterfactual injection demonstrates that the agent's behaviour is \textit{conditioned on} its epistemic state---the agent doesn't just encode training dynamics information, it \textit{uses} it. This is the strongest evidence short of natural behavioural observation.
+\end{implication}
+
+\begin{agentscope}
+All 25. \texttt{next\_env\_prediction}: Most dimensions to inject (richer encoding). \texttt{accel\_probe}: Injection effect may be weak if encoding is diffuse. \texttt{persistent\_lstm}: Cross-episode carry means injected states persist---potentially stronger and longer-lasting effects. \paired{} agents: Can inject antagonist states into protagonist (E6 extension).
+\end{agentscope}
+
+\subsubsection{Prediction Head Ablation at Test Time (RQ4 supplementary)}
+\label{exp:pred_head_ablation}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \texttt{next\_env\_prediction} only (5 training methods = 5 agents). \textbf{Not counted in the 38-experiment registry; supplementary to RQ4.}
+
+\textbf{Protocol}: Train the \texttt{next\_env\_prediction} agent normally (with the prediction head active during training). At test time, remove the prediction head entirely and evaluate policy behaviour (return, solve rate, action entropy, value estimates) on the same level sets used for the other RQ4 experiments. Compare to: (a) the same agent with the prediction head still active, and (b) matched agents from the four implicit architectures that never had a prediction head.
+
+\begin{hypothesis}
+Removing the prediction head at test time changes policy behaviour in measurable ways: the agent without its prediction head behaves differently from both its prediction-head-on version and from implicit-architecture agents. Specifically, if the prediction head's auxiliary loss shaped the backbone's representations during training, removing the head at test time shouldn't matter (the representations are already shaped)---but comparing to agents that \textit{never} had the head reveals whether the prediction objective changed what the agent learned, not just what we can extract from it.
+\end{hypothesis}
+
+\begin{falsification}
+If \texttt{next\_env\_prediction} with the prediction head removed behaves identically to \texttt{accel\_probe} (the minimal architecture), the prediction head did not change what the policy learned---it only provided an extraction channel. Training on interpretability would then be purely diagnostic, not formative. If it behaves identically to its prediction-head-on self, the prediction head is not used at test time (expected, since it's an auxiliary loss, not a policy input)---but the key comparison is to the implicit architectures.
+\end{falsification}
+
+\begin{implication}
+This is the cleanest test of whether training on interpretability changes the \textit{agent} or only the \textit{overseer's ability to read the agent}. If the prediction objective shapes the backbone such that \texttt{next\_env\_prediction} develops qualitatively different policy behaviour from implicit architectures (e.g., more systematic exploration, better generalisation to novel levels), then training on interpretability is not merely diagnostic---it is a training intervention that changes what the agent learns. This would strengthen the design principle (the prediction head improves both transparency and capability) but also sharpen the dual-use concern (the agent is more capable \textit{because} it was trained to be interpretable).
+\end{implication}
+
+\begin{agentscope}
+\texttt{next\_env\_prediction} agents only (5 training methods). The comparison set is the matched \texttt{accel\_probe} agent for each training method (same training method, minimal architecture). For \paired{}, this tests whether the prediction head changed how the protagonist responds to adversary-generated levels.
+\end{agentscope}
+
+\subsubsection{Adversary Ablation (Experiment 17 of 38, PAIRED B1)}
+\label{exp:adversary_ablation}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Replace the adversary-generated levels with random levels (effectively removing the adversary's influence) and measure how protagonist behaviour changes. Compare protagonist performance on adversary-generated vs.\ random levels to quantify the adversary's contribution to the curriculum.
+
+\begin{hypothesis}
+Protagonist performance degrades on random levels compared to adversary-generated levels (the adversary's curriculum provides useful training signal). The magnitude of degradation correlates with how well the protagonist encodes the adversary's strategy (from A1).
+\end{hypothesis}
+
+\begin{falsification}
+If protagonist performs equally well on random and adversary-generated levels, the adversary's curriculum provides no additional value beyond random sampling---undermining the premise that the adversary's strategy matters.
+\end{falsification}
+
+\begin{implication}
+The 2$\times$4 factorial design (adversary: none/frozen/easy/hard $\times$ antagonist: live/frozen) isolates the adversary's causal contribution. If the adversary effect disappears when the antagonist is frozen, the adversary-antagonist coalition is essential for curriculum quality.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only. Different protagonist architectures may show different sensitivity to adversary ablation: \texttt{next\_env\_prediction} may be most robust (its explicit prediction compensates for adversary removal).
+\end{agentscope}
+
+\subsubsection{Regret Decomposition (Experiment 18 of 38, PAIRED B2)}
+\label{exp:regret_decomposition}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Decompose regret into its sources: is high regret due to the protagonist performing poorly (capability gap) or the antagonist performing well (the adversary found an easy level the protagonist can't solve)? Probe hidden states to predict which source of regret the current level represents.
+
+\begin{hypothesis}
+Agents encode regret source in their hidden states: they distinguish ``I'm bad at this'' from ``my opponent is better at this.'' This distinction is important because it determines whether the agent's response should be to improve its own capability or to adapt to the adversary's strategy.
+\end{hypothesis}
+
+\begin{falsification}
+If probes cannot distinguish regret sources, the agent treats all high-regret situations identically. This would mean the agent's epistemic model of regret is undifferentiated---it knows ``this is hard'' but not ``why it's hard.''
+\end{falsification}
+
+\begin{implication}
+Regret source encoding is a form of self-awareness: the agent distinguishes its own limitations from the adversary's strengths. This is Tier 2 (second-order perception) in action---the agent modelling its own response to the curriculum.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only. \texttt{next\_env\_prediction}: Tier 2 predictions (return, regret\_source) directly target this. Probe-based agents must encode it implicitly. The gap between explicit and implicit encoding of regret source measures the benefit of Tier 2 training.
+\end{agentscope}
+
+\subsubsection{Teaching Signal Intervention (Experiment 19 of 38, PAIRED B3)}
+\label{exp:teaching_signal_intervention}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Intervene on the teaching signal by modifying levels between adversary generation and protagonist execution. Test whether the protagonist detects the intervention (its predictions diverge from observed levels) and whether this detection is encoded in hidden states.
+
+\begin{hypothesis}
+The protagonist detects interventions on the teaching signal: when levels are modified post-generation, prediction errors spike and the protagonist's hidden state shifts. This is direct evidence that the protagonist has a model of the adversary's generation process.
+\end{hypothesis}
+
+\begin{falsification}
+If prediction errors do not spike under intervention, the protagonist does not have expectations about adversary-generated levels that can be violated. If errors spike but hidden states don't shift, the detection is in the prediction head but not propagated to the policy.
+\end{falsification}
+
+\begin{implication}
+Detection of teaching signal tampering is a form of anomaly detection---the protagonist notices when ``something is off'' about the curriculum. This is directly relevant to deceptive generator detection (original Exp 17).
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only. \texttt{next\_env\_prediction}: Expected strongest detection (explicit prediction head catches deviations). Probe-based agents must detect via implicit representation shifts.
+\end{agentscope}
+
+\subsubsection{Counterfactual Curriculum (Experiment 20 of 38, PAIRED B4)}
+\label{exp:counterfactual_curriculum}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Present the protagonist with a counterfactual curriculum history (e.g., make it appear the adversary has been generating much easier levels than it actually has). Measure whether the protagonist's predictions and behaviour change in response.
+
+\begin{hypothesis}
+If the protagonist has developed a genuine model of the adversary's strategy (not just learned correlations), it should predict that an adversary with an ``easy'' history will generate easy levels. If it only learned correlations, its predictions won't respond appropriately to counterfactual histories.
+\end{hypothesis}
+
+\begin{implication}
+This distinguishes genuine belief from statistical correlation---the difference between ``the agent has a model'' and ``the agent has learned a pattern.''
+\end{implication}
+
+\begin{falsification}
+If counterfactual curriculum histories produce no change in predictions, the agent does not use history to form expectations---it predicts based on the current level alone.
+\end{falsification}
+
+\begin{agentscope}
+\paired{} agents only. \texttt{persistent\_lstm}: Carries history explicitly, most likely to respond to counterfactual histories. \texttt{accel\_probe}: LSTM resets, so counterfactual histories should have no effect (validation check). \texttt{episodic\_memory}: Buffer content is directly manipulable---most controlled intervention.
+\end{agentscope}
+
+\subsubsection{Activation Patching (Experiment 21 of 38, PAIRED B5)}
+\label{exp:activation_patching}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Use activation patching to identify which hidden state dimensions are causally responsible for specific aspects of the protagonist's belief about the adversary. Patch in activations from one context to another and measure the effect on policy and value outputs.
+
+\begin{hypothesis}
+A localised subset of hidden state dimensions is causally responsible for the protagonist's belief about the adversary's strategy. Patching these dimensions transfers the belief to a different context.
+\end{hypothesis}
+
+\begin{falsification}
+If no localised subset produces selective effects (every dimension affects everything equally), belief encoding is fully distributed and not decomposable into interpretable circuits.
+\end{falsification}
+
+\begin{implication}
+Localised causal dimensions are the building blocks of a mechanistic account of belief formation. If we can identify ``this dimension encodes adversary difficulty'' and ``patching it changes policy conservatism,'' we have a complete causal story from representation to behaviour.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only. \texttt{next\_env\_prediction}: Has architecturally separated prediction branch---patching may be cleaner. Probe-based agents: Patching is in the shared LSTM hidden state, so effects may be less localised. Different architectures' patching profiles reveal whether belief circuits are architecture-dependent or universal.
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ5: How Do Multi-Agent Dynamics Shape Belief Formation?}
+\label{sec:rq5}
+% ----------------------------------------------------------------------------
+
+\paired{}'s three-agent structure creates dynamics absent from single-agent curriculum methods. This question examines how the presence of multiple co-evolving agents affects the development of training dynamics encoding.
+
+\begin{researchq}
+In multi-agent curriculum learning (\paired{}), how do the protagonist's, antagonist's, and adversary's representations co-evolve? Does co-evolution produce richer or different belief structures than single-agent training?
+\end{researchq}
+
+\subsubsection{Representation Divergence (Experiment 22 of 38, PAIRED C1)}
+\label{exp:representation_divergence}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Measure representational similarity (CKA, cosine similarity) between protagonist and antagonist hidden states on matched levels. Track how similarity evolves over training.
+
+\begin{hypothesis}
+Protagonist and antagonist representations diverge over training as they specialise for their respective roles. Early in training, both encode similar features; late in training, the protagonist encodes defensive strategies while the antagonist encodes exploitative ones. The rate of divergence correlates with regret.
+\end{hypothesis}
+
+\begin{falsification}
+If CKA similarity remains high throughout training ($> 0.8$), the two agents do not develop role-specialised representations despite receiving different training signals. Alternatively, if divergence is immediate (present from the first checkpoint), role specialisation is driven by architecture/initialisation rather than training dynamics.
+\end{falsification}
+
+\begin{implication}
+Representation divergence that tracks regret would show that the adversarial structure of \paired{} induces genuinely different epistemic states in agents trained on the same levels. This has direct implications for oversight: two agents observing the same data can develop incompatible belief structures based on their role in the training process.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The divergence rate is expected to vary with memory architecture: episodic\_memory and persistent\_lstm may diverge faster than context\_vector due to their capacity to accumulate role-specific history.
+\end{agentscope}
+
+\subsubsection{Antagonist Audit (Experiment 23 of 38, PAIRED C2)}
+\label{exp:antagonist_audit}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Apply the full probing suite (from RQ1) to the antagonist. Compare what the antagonist encodes about the curriculum vs.\ what the protagonist encodes. Since the antagonist is allied with the adversary, it may develop a more accurate model of the adversary's strategy.
+
+\begin{hypothesis}
+The antagonist encodes the adversary's strategy more accurately than the protagonist, because the adversary optimises for the antagonist's success. This asymmetry in belief accuracy reflects the different roles in the three-agent game.
+\end{hypothesis}
+
+\begin{falsification}
+If protagonist and antagonist probe accuracies are statistically indistinguishable across all tiers, there is no role-dependent asymmetry in belief formation. Alternatively, if the \textit{protagonist} encodes the adversary's strategy more accurately than the antagonist, the ``aligned interests $\to$ better model'' hypothesis is wrong.
+\end{falsification}
+
+\begin{implication}
+Asymmetric belief accuracy between protagonist and antagonist would demonstrate that an agent's epistemic fidelity depends on whether the other agent's objective is aligned or opposed. For oversight: a student whose teacher is optimising \textit{for} it (like the antagonist) develops a more accurate teacher model than one whose teacher is adversarial (like the protagonist). This predicts that cooperative oversight relationships produce more extractable beliefs than adversarial ones.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The antagonist audit uses the same probing suite as RQ1 experiments, enabling direct comparison of probe R\textsuperscript{2} between protagonist and antagonist for each architecture.
+\end{agentscope}
+
+\subsubsection{Adversary Strategy Clustering (Experiment 24 of 38, PAIRED C3)}
+\label{exp:adversary_strategy_clustering}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Cluster adversary-generated levels by features (wall density, goal distance, etc.) to identify discrete adversary strategies. Track how strategy distribution evolves over training. Test whether the protagonist's hidden state encodes which strategy the adversary is currently using.
+
+\begin{hypothesis}
+The adversary develops distinct strategies over training (e.g., ``dense maze with far goal'' vs.\ ``open layout with tricky placement''). The protagonist learns to classify which strategy is active, and this classification is more accurate in agents with higher Tier 1 encoding.
+\end{hypothesis}
+
+\begin{falsification}
+If adversary-generated levels do not cluster into distinct strategies (uniform distribution in feature space with no clear modes), the adversary does not develop discrete strategies. Alternatively, if strategies are identifiable but the protagonist's hidden state does not predict them above chance, Tier 1 encoding does not carry adversary-specific information.
+\end{falsification}
+
+\begin{implication}
+If the protagonist can classify adversary strategies from its hidden state, it has learned a ``theory of teacher types''---a higher-order model that groups teacher behaviours into categories. This is a qualitatively richer form of belief than predicting individual level features, and is closer to the kind of model needed for scalable oversight (identifying what \textit{kind} of generator is operating).
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Strategy classification accuracy should correlate with Tier 1 probe accuracy across architectures, with next\_env\_prediction potentially strongest due to its explicit training-on-interpretability signal.
+\end{agentscope}
+
+\subsubsection{Coalition Dynamics (Experiment 25 of 38, PAIRED C4)}
+\label{exp:coalition_dynamics}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Measure the strength of the adversary-antagonist coalition by comparing: (a) the correlation between adversary's level features and antagonist's performance, vs.\ (b) the correlation with protagonist's performance. Track coalition strength over training.
+
+\begin{hypothesis}
+Coalition strength (adversary-antagonist alignment) increases over training, then may plateau or oscillate as the protagonist adapts. The dynamics of coalition formation mirror the dynamics of training dynamics encoding in the protagonist.
+\end{hypothesis}
+
+\begin{falsification}
+If the adversary-antagonist performance correlation is no stronger than the adversary-protagonist correlation, there is no measurable coalition---the adversary's levels are equally suited to both agents. Alternatively, if coalition strength is high from the start and does not change, it is an artifact of the game structure rather than an emergent phenomenon.
+\end{falsification}
+
+\begin{implication}
+Emergent coalition dynamics would demonstrate that multi-agent training creates structured relationships between agents' implicit objectives---not just between their policies. If coalition strength correlates with protagonist belief development, it suggests the protagonist's epistemic growth is partly driven by needing to model the adversary-antagonist alliance.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Coalition dynamics may differ by architecture: architectures that better encode cross-episode patterns (persistent\_lstm, episodic\_memory) may detect and respond to coalition shifts more rapidly.
+\end{agentscope}
+
+\subsubsection{Adversary Dynamics (Experiment 26 of 38, PAIRED Method-Specific)}
+\label{exp:adversary_dynamics}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Analyse the adversary's level-generation dynamics over training: how does the distribution of generated levels evolve? Is there a curriculum progression (easy $\to$ hard)? Are there oscillations?
+
+\begin{hypothesis}
+The adversary develops a structured curriculum: initially generating easy levels, then progressively harder ones as the protagonist improves. The curriculum progression has identifiable phases that correspond to the protagonist's belief formation phases (from Phase Transition, Exp 8).
+\end{hypothesis}
+
+\begin{falsification}
+If the adversary's level distribution is stationary or random throughout training (no identifiable progression or phases), the adversary does not develop a structured curriculum. If curriculum phases exist but do not correspond to protagonist belief phases (from Exp 8), the adversary's curriculum and the protagonist's belief formation are decoupled processes.
+\end{falsification}
+
+\begin{implication}
+Structured adversary curriculum progression that corresponds to protagonist belief phases would establish a bidirectional relationship: the adversary shapes the protagonist's beliefs by controlling the curriculum, while the protagonist's improving capability drives the adversary to escalate. This co-evolutionary dynamic is a key feature of \paired{} that distinguishes it from static curriculum methods and makes it the closest analog to LLM teacher-student dynamics.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). All architectures share the same adversary, so cross-architecture comparison reveals how different protagonist capacities alter the adversary's curriculum trajectory.
+\end{agentscope}
+
+\subsubsection{Regret Transfer (Experiment 27 of 38, PAIRED Method-Specific)}
+\label{exp:regret_transfer}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Test whether the protagonist's training dynamics encoding transfers across different adversary strategies. Train on one adversary, test belief accuracy on levels from a different adversary (or from the same adversary at a different training stage).
+
+\begin{hypothesis}
+Belief encoding partially transfers across adversaries: the protagonist learns general principles about ``what adversaries do'' that apply beyond the specific adversary it was trained with. However, adversary-specific details do not transfer.
+\end{hypothesis}
+
+\begin{falsification}
+If probe accuracy drops to chance when tested on levels from a different adversary (or a different training stage of the same adversary), the protagonist has learned only adversary-specific correlations with no abstract transfer. Conversely, if accuracy is fully preserved, the encoding captures only environment-general properties rather than anything about the teaching relationship.
+\end{falsification}
+
+\begin{implication}
+Transfer suggests the protagonist learns \textit{abstract} principles about the teaching process, not just the specific teacher's idiosyncrasies. This is important for the scalable oversight claim: if belief extraction only works for the exact teacher the agent trained with, it cannot generalise to new oversight scenarios.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Transfer is tested by swapping adversary checkpoints while keeping the protagonist fixed. Architectures with explicit curriculum encoding (next\_env\_prediction) may show better transfer due to more structured belief representations.
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ6: Can Agent Epistemics Distinguish Strategic Exploitation from Capability Failure?}
+\label{sec:rq6}
+% ----------------------------------------------------------------------------
+
+The critical safety question: when an agent misgeneralises, is it because it never learned the true goal (capability failure) or because its epistemic state tells it the proxy is sufficient (strategic exploitation)?
+
+\begin{researchq}
+Can training dynamics encoding distinguish between agents that pursue proxy goals because they lack information (capability failure) and agents that pursue proxy goals despite having information about the true objective (potential strategic exploitation)?
+\end{researchq}
+
+\subsubsection{Behavioral Coupling (Experiment 28 of 38)}
+\label{exp:behavioral_coupling}
+
+\textbf{Type}: Training-time experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: During training, track the correlation between prediction/probe loss (how well the agent models the curriculum) and policy metrics (return, solve rate, exploration). Compute temporal cross-correlations with lags to determine whether belief development leads or follows behavioural improvement.
+
+\begin{hypothesis}
+Prediction loss improvement precedes policy improvement: the agent first develops an accurate model of the training process, then uses this model to improve its behaviour. If temporal ordering shows belief $\to$ behaviour, it suggests epistemic development is a prerequisite for capability.
+\end{hypothesis}
+
+\begin{falsification}
+If behaviour improves before or simultaneously with belief development, epistemic development is a \textit{consequence} of capability improvement, not a prerequisite. This would weaken the ``leading indicator'' claim.
+\end{falsification}
+
+\begin{implication}
+If belief development leads behavioural improvement, monitoring prediction/probe loss during training provides an early warning system for capability emergence: a drop in prediction loss predicts an upcoming jump in performance. This temporal ordering is the empirical basis for the ``leading indicator'' claim central to the scalable oversight proposal.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. The temporal cross-correlation structure may differ by training method: \accel{} (strongest curriculum signal) may show belief leading by more steps than \plr{}. For \paired{}, both belief-behaviour coupling and adversary-protagonist coupling should be measured. The next\_env\_prediction architecture may show the strongest lead time due to explicit prediction training creating early belief formation.
+\end{agentscope}
+
+\subsubsection{Mutation Adaptation (Experiment 29 of 38)}
+\label{exp:mutation_adaptation}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Present the agent with mutated versions of previously seen levels. Measure how quickly the agent adapts to mutations and whether adaptation speed correlates with training dynamics encoding quality.
+
+\begin{hypothesis}
+Agents with stronger training dynamics encoding adapt faster to mutations because they have a model of ``what mutations are likely'' (especially under \accel{}, which uses directed mutation). This is evidence that the encoding is functionally useful, not epiphenomenal.
+\end{hypothesis}
+
+\begin{falsification}
+If adaptation speed does not correlate with training dynamics encoding quality (R\textsuperscript{2} between probe accuracy and adaptation rate $< 0.1$), the encoding is not functionally useful for mutation handling. If \dr{} agents adapt equally well, the encoding is irrelevant to adaptation.
+\end{falsification}
+
+\begin{implication}
+Functional utility of training dynamics encoding for mutation adaptation would provide the clearest evidence against epiphenomenality: the agent's belief about ``what mutations look like'' actively helps it respond to novel level modifications. This is distinct from causal intervention (Exp 15) in that it measures natural rather than forced usage of beliefs.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. \accel{} agents are the primary test case (since \accel{} generates levels by directed mutation). \plr{}/\rplr{} provide level replay but not mutation. \dr{} is the null hypothesis. \paired{} tests whether adversary-driven variation serves as implicit mutation.
+\end{agentscope}
+
+\subsubsection{Value Calibration (Experiment 30 of 38)}
+\label{exp:value_calibration}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Compare the agent's value estimates to actual returns. Compute calibration curves and Expected Calibration Error (ECE). Separate calibration by difficulty tercile and (for \paired{}) by regret condition.
+
+\begin{hypothesis}
+Value calibration improves with training dynamics encoding: agents that better model the curriculum also produce more accurate value estimates. Miscalibration on high-difficulty levels is higher for agents with weaker Tier 1 encoding.
+\end{hypothesis}
+
+\begin{falsification}
+If ECE does not correlate with Tier 1 probe accuracy across agents, value calibration and training dynamics encoding are independent properties. If all agents are equally miscalibrated regardless of curriculum method, the curriculum provides no calibration benefit.
+\end{falsification}
+
+\begin{implication}
+Well-calibrated values on some levels but poorly calibrated values on others could reveal the precise conditions under which the agent's epistemic model breaks down---identifying the ``frontier'' of the agent's beliefs.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. \accel{} and \plr{}/\rplr{} should show better calibration than \dr{} on structured levels. For \paired{}, calibration is analysed separately by regret tercile. The next\_env\_prediction architecture, with explicit prediction training, may show a distinctive calibration profile (well-calibrated on predictable levels, poorly calibrated on novel ones).
+\end{agentscope}
+
+\subsubsection{Belief-Behaviour Divergence (Experiment 31 of 38, PAIRED F4)}
+\label{exp:belief_behaviour_divergence}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Measure the gap between what the protagonist's hidden state encodes (decoded via probes) and what its policy actually does. If the hidden state encodes an accurate model of the adversary but the policy doesn't exploit this information, the belief and behaviour have diverged.
+
+\begin{hypothesis}
+Belief-behaviour divergence is non-zero and evolves over training. Early in training: low divergence (both belief and behaviour are undeveloped). Mid-training: divergence increases (belief develops before behaviour catches up). Late training: divergence decreases (behaviour aligns with beliefs) \textit{or} persists (suggesting a structural gap between representation and policy).
+\end{hypothesis}
+
+\begin{implication}
+Persistent belief-behaviour divergence---where the agent ``knows'' the curriculum structure but doesn't act on it---could indicate either (a) a benign architectural limitation or (b) suppression of strategic exploitation by the training objective. Distinguishing these is the heart of the capability-vs-strategy question.
+\end{implication}
+
+\begin{falsification}
+If belief-behaviour divergence is always near zero (beliefs and behaviour develop in lockstep) or is uniformly high with no temporal structure, the divergence metric does not capture a meaningful signal. The pattern of rising-then-falling divergence is required to confirm the hypothesis.
+\end{falsification}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The divergence pattern may differ fundamentally by architecture: accel\_probe (read-only access to curriculum info) may show high divergence (knows but can't act), while next\_env\_prediction (trained on prediction loss) may show lower divergence (prediction training creates a tighter belief-behaviour link).
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ7: Can Training Dynamics Beliefs Be Extracted as Interpretable Artifacts?}
+\label{sec:rq7}
+% ----------------------------------------------------------------------------
+
+For agent epistemics to be useful for oversight, the extracted beliefs must be \textit{inspectable}. This question asks whether we can produce artifacts---formulas, graphs, causal models---that humans can verify.
+
+\begin{researchq}
+Can we extract interpretable representations of what agents believe about their training process? Can these representations be verified against ground truth?
+\end{researchq}
+
+\subsubsection{Symbolic Regression (Experiment 32 of 38)}
+\label{exp:symbolic_regression}
+
+\textbf{Type}: Training-time experiment. \textbf{Agents}: All 25.
+
+\textbf{Protocol}: Collect (level\_features, prediction\_loss) pairs during training. Use PySR (symbolic regression) to extract interpretable formulas: $\Uhat = f(\text{level\_features})$, where $-\text{prediction\_loss}$ approximates the log-probability the model assigns to each level. For \paired{}, additionally fit $\text{regret} = g(\text{level\_features})$.
+
+\begin{hypothesis}
+For \accel{}: $\Uhat$ is monotonic in regret-like quantities. For \dr{}: $\Uhat \approx \text{constant}$. For \paired{}: $\Uhat$ correlates with $\Ustar = \Rant - \Rpro$. The complexity of the extracted formula increases with the complexity of the curriculum method.
+\end{hypothesis}
+
+\begin{implication}
+If $\Uhat$ matches $\Ustar$, the agent has learned an accurate model of the generator's utility. If $\Uhat$ matches $\Umisgen$ (a misgeneralised proxy), the agent's beliefs reflect its errors. Either way, we have an inspectable artifact of the agent's epistemic state. This is the pathway to Causal Belief Network extraction.
+\end{implication}
+
+\begin{falsification}
+If PySR cannot find formulas with R\textsuperscript{2} $> 0.3$ for any agent, the relationship between level features and prediction loss is too complex (or too noisy) for symbolic extraction. If the best formula for \accel{} and \dr{} are equally complex and accurate, curriculum structure does not simplify the extractable belief.
+\end{falsification}
+
+\begin{agentscope}
+All 25 agents. \dr{} agents are the null baseline (expect trivial $\Uhat \approx \text{constant}$). \accel{} and \plr{}/\rplr{} should yield formulas involving regret-like quantities. \paired{} is the critical test: whether PySR recovers $\Uhat \approx \Rant - \Rpro$ from the protagonist's prediction loss. Across architectures, next\_env\_prediction may produce the cleanest formulas due to its explicit prediction training.
+\end{agentscope}
+
+\subsubsection{Causal Model Extraction (Experiment 33 of 38, PAIRED F1)}
+\label{exp:causal_model_extraction}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Extract a causal model of the adversary's decision process from the protagonist's representations. Test interventional fidelity: does the extracted model correctly predict the effect of counterfactual interventions on the adversary's level generation?
+
+\begin{hypothesis}
+The protagonist's representations contain enough information to reconstruct a simplified causal model of the adversary's decision process, with interventional fidelity above a domain-randomisation baseline.
+\end{hypothesis}
+
+\begin{implication}
+If causal models can be extracted, this provides the most mechanistically interpretable form of belief extraction---a directed graph of the agent's implicit causal theory about its training process. This is the long-term goal: Causal Belief Network (CBN) extraction from trained agents.
+\end{implication}
+
+\begin{falsification}
+If the extracted causal model has no better interventional fidelity than a model that simply predicts marginal level feature distributions (the \dr{} baseline), the protagonist has not learned a causal model---only correlational statistics. If interventional predictions are accurate for some edges but not others, the causal model is partial.
+\end{falsification}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The quality of the extracted causal model is expected to correlate with Tier 1--2 probe accuracy. Architectures with richer temporal memory (persistent\_lstm, episodic\_memory) may yield causal models with more accurate temporal edges (adversary decision $\to$ level features $\to$ protagonist response).
+\end{agentscope}
+
+\subsubsection{Multiscale Goals (Experiment 34 of 38, PAIRED F2)}
+\label{exp:multiscale_goals}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Analyse the protagonist's representations at multiple spatial scales (individual cells, local regions, global maze structure) and temporal scales (within-episode, across-episode, across training phases). Test whether different scales carry different types of curriculum information.
+
+\begin{hypothesis}
+Curriculum information is encoded at multiple scales: local representations carry Tier 0 information (wall structure), while global representations carry Tier 1--2 information (curriculum dynamics, agent-curriculum interaction). The scale distribution of information shifts over training from local to global.
+\end{hypothesis}
+
+\begin{falsification}
+If all tiers of information are encoded at the same spatial scale (no local-to-global hierarchy), the multiscale hypothesis is wrong. If the scale distribution does not shift over training, scale structure is an artifact of the architecture rather than an emergent property of belief development.
+\end{falsification}
+
+\begin{implication}
+A local-to-global shift in information encoding over training would mirror developmental stages: the agent first learns local facts (Tier 0: wall structure), then integrates them into global models (Tier 1--2: curriculum dynamics). This developmental sequence is itself a prediction about how beliefs form and could guide early detection of belief emergence.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The scale analysis operates on hidden state components at different layers/positions. Architectures with attention or episodic mechanisms may show clearer scale separation than architectures with flat hidden states.
+\end{agentscope}
+
+\subsubsection{Shard Dynamics (Experiment 35 of 38, PAIRED F3)}
+\label{exp:shard_dynamics}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Track the evolution of distinct ``goal shards''---coherent subsets of the agent's representation that correspond to different behavioural strategies or sub-goals. Measure how shards form, compete, merge, or split over training.
+
+\begin{hypothesis}
+The protagonist develops multiple goal shards over training, corresponding to different responses to different adversary strategies. The dynamics of shard competition mirror the dynamics of adversary strategy evolution---when the adversary shifts strategy, the protagonist's active shard changes.
+\end{hypothesis}
+
+\begin{implication}
+This connects agent epistemics to the broader goal composition research program: if goals emerge as shards shaped by training dynamics, then training dynamics are the causal origin of goal structure---and intervening on dynamics could reshape goals.
+\end{implication}
+
+\begin{falsification}
+If no distinct goal shards are identifiable (the representation is uniformly distributed with no cluster structure), the shard model of goal formation is not supported at this scale. If shards exist but do not change in response to adversary strategy shifts, shards are stable features rather than dynamic responses to the curriculum.
+\end{falsification}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Shard identification uses clustering on hidden state subspaces, conditioned on adversary strategy type (from Exp 24). Architectures with more capacity (persistent\_lstm, episodic\_memory) may develop more shards, while simpler architectures (context\_vector) may show fewer, less distinct shards.
+\end{agentscope}
+
+% ----------------------------------------------------------------------------
+\subsection{RQ8: What Do These Findings Imply for Scalable Oversight?}
+\label{sec:rq8}
+% ----------------------------------------------------------------------------
+
+The practical question: if we can extract and interpret agent epistemics, how does this contribute to the problem of overseeing capable AI systems?
+
+\begin{researchq}
+Can the belief extraction methodology developed in this framework serve as a scalable oversight tool? What are its capabilities and limitations?
+\end{researchq}
+
+This question is answered by synthesising results from all other RQs rather than by dedicated experiments. The key inferences:
+
+\begin{itemize}
+    \item \textbf{From RQ1 (what is encoded)}: We learn what information is available for oversight tools to extract. If agents encode rich curriculum information, there is substrate for oversight. If not, oversight tools have nothing to work with.
+
+    \item \textbf{From RQ3 (teacher legibility)}: The \paired{} utility extraction experiments directly test whether a ``student'' agent's representations can reveal what a ``teacher'' is optimising. This is the core scalable oversight scenario.
+
+    \item \textbf{From RQ4 (causal relevance)}: If training dynamics encodings are causally relevant to behaviour, oversight tools can predict behaviour from beliefs. If encodings are epiphenomenal, oversight must rely on behavioural observation alone.
+
+    \item \textbf{From RQ6 (strategic exploitation)}: If we can distinguish ``the agent knows but doesn't exploit'' from ``the agent doesn't know,'' we have a tool for detecting deceptive alignment risk.
+
+    \item \textbf{From RQ7 (interpretable extraction)}: If extracted beliefs are inspectable (symbolic formulas, causal graphs), humans can verify them. If they are opaque (high-dimensional embeddings), the oversight tool is itself uninterpretable.
+\end{itemize}
+
+\textbf{Three conditions for scalable oversight via belief extraction:}
+\begin{enumerate}
+    \item \textbf{Extracted beliefs must be interpretable.} We have evidence via probing and early symbolic regression results. CBN extraction is the target.
+    \item \textbf{Must generalise to complex generators.} The path from hand-designed (\accel{}/\plr{}) to learned (\paired{}) to LLM generators tests this. LLM generators are a planned extension.
+    \item \textbf{Must detect misalignment, not just describe alignment.} No evidence yet. The GMG experiments (Part~\ref{sec:gmg}) are the path to this.
+\end{enumerate}
+
+
+% ============================================================================
+\section{Remaining Experiments Under RQ2: Belief Revision and Goal Evolution}
+\label{sec:rq2_continued}
+% ============================================================================
+
+Three \paired{}-specific experiments extend RQ2 (belief formation dynamics) into the multi-agent setting.
+
+\subsection{Representation Trajectory (Experiment 36 of 38, PAIRED D1)}
+\label{exp:representation_trajectory}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Track the trajectory of protagonist and antagonist representations in a low-dimensional embedding space (via PCA or UMAP) across training checkpoints. Identify periods of rapid movement (belief revision) vs.\ stability (belief consolidation).
+
+\begin{hypothesis}
+Representation trajectories show alternating phases of rapid change and stability. Periods of rapid change coincide with shifts in adversary strategy (from C3). The protagonist's trajectory is less stable than the antagonist's, reflecting its adversarial position in the game.
+\end{hypothesis}
+
+\begin{falsification}
+If the representation trajectory moves monotonically (no alternating phases), belief development is gradual rather than punctuated. If protagonist and antagonist trajectories are equally stable (or the protagonist is \textit{more} stable), the adversarial position does not create representational instability.
+\end{falsification}
+
+\begin{implication}
+Punctuated representation trajectories would provide a mechanistic basis for the phase transitions observed in Exp 8: rapid movement in representation space corresponds to reorganisation of the agent's belief structure. Combined with adversary strategy clustering (Exp 24), this could identify the \textit{cause} of each phase transition (a specific adversary strategy shift).
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Trajectory analysis uses PCA/UMAP on hidden states collected across checkpoints. Architectures with gated memory (persistent\_lstm) may show sharper phase boundaries than those with continuous updates (context\_vector).
+\end{agentscope}
+
+\subsection{Belief Revision Detection (Experiment 37 of 38, PAIRED D2)}
+\label{exp:belief_revision_detection}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Detect belief revision events: moments during training where the agent's extracted beliefs about the adversary change discontinuously. Use probe accuracy drop-then-recovery as a signal for belief revision.
+
+\begin{hypothesis}
+Belief revision events are detectable and correspond to adversary strategy shifts. The frequency of belief revision decreases over training as both agents converge to stable strategies.
+\end{hypothesis}
+
+\begin{falsification}
+If probe accuracy evolves smoothly with no detectable drop-and-recovery events, belief revision (as operationalised here) does not occur---the agent's beliefs update continuously rather than discretely. If revision events occur but do not correspond to adversary strategy shifts, revisions are internally driven rather than externally triggered.
+\end{falsification}
+
+\begin{implication}
+Detectable belief revision events would provide a concrete monitoring tool: a system that watches probe accuracy over training and flags sudden drops as ``the agent is revising its beliefs about the teacher.'' The decreasing frequency prediction provides a convergence diagnostic. If revisions \textit{increase} late in training, it may indicate instability or cycling rather than convergence.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Belief revision detection requires checkpoints dense enough to resolve individual revision events ($\sim$50--100 checkpoints minimum). Architectures with explicit memory may show sharper revision events (sudden memory overwrites) vs.\ gradual belief drift.
+\end{agentscope}
+
+\subsection{Goal Evolution (Experiment 38 of 38, PAIRED D3)}
+\label{exp:goal_evolution}
+
+\textbf{Type}: Checkpoint experiment. \textbf{Agents}: \paired{} agents only.
+
+\textbf{Protocol}: Track how the protagonist's implicit goal representation (from Goal Extraction, Exp 10) evolves in response to the adversary's curriculum. Measure whether goal representations become more or less aligned with the adversary's utility over training.
+
+\begin{hypothesis}
+The protagonist's goal representation initially aligns with simple reward (survive, reach goal), then evolves to incorporate curriculum-related features (anticipate adversary, exploit adversary patterns). The timing of this evolution corresponds to the development of Tier 1--2 encoding.
+\end{hypothesis}
+
+\begin{implication}
+If goal evolution tracks curriculum encoding development, it provides the strongest evidence for the core thesis: training dynamics shape goal formation. The causal direction (dynamics $\to$ goals) could be tested by intervening on training dynamics and observing goal changes.
+\end{implication}
+
+\begin{falsification}
+If the protagonist's goal representation does not change over training (static from early checkpoints), goals are set early and curriculum dynamics do not reshape them. If goal representations evolve but independently of Tier 1--2 encoding development, goal formation and belief formation are parallel but causally disconnected processes.
+\end{falsification}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Goal representations are extracted using the same method as Goal Extraction (Exp 10). The evolution analysis tracks these representations across checkpoints, looking for transitions from reward-aligned goals (``reach the goal'') to curriculum-aligned goals (``anticipate the adversary''). Memory architectures with richer temporal capacity may show faster or more complete goal evolution.
+\end{agentscope}
+
+
+% ============================================================================
+\section{Goal Misgeneralisation and Strategic Exploitation}
+\label{sec:gmg}
+% ============================================================================
+
+This section describes the experiments that remain the crux of the research program but are not yet implemented in the current 38-experiment suite. These correspond to Experiments 8--13 and 17 from the original report.
+
+\subsection{Why GMG Is the Crux}
+
+The 38-experiment suite establishes whether agents develop structured beliefs and what form those beliefs take. But the safety-critical question is: \textit{what do these beliefs imply for behaviour?} Specifically:
+
+\begin{itemize}[nosep]
+    \item If $\Uhat \approx \Ustar$: The agent has an accurate model of its training process. This is a prerequisite for both beneficial robustness and strategic exploitation.
+    \item If $\Uhat \approx \Umisgen$: The agent's beliefs reflect a misgeneralised proxy. The prediction head/probe is encoding the wrong thing, which is itself diagnostic.
+    \item If $\Uhat$ diverges from both: The agent has a partial or novel model that doesn't correspond to either intended or observed objectives.
+\end{itemize}
+
+The GMG experiments use environments where misgeneralisation is well-characterised (Cheese-in-Corner, Keys-and-Chests) to determine which scenario obtains.
+
+\subsection{Planned GMG Experiments}
+
+These experiments are not yet implemented but are fully specified. They require GMG environments (Cheese-in-Corner, Keys-and-Chests) where misgeneralisation is well-characterised.
+
+\subsubsection{G1: Agent Epistemics in GMG Environments (Original Exp 8)}
+\label{exp:gmg1}
+
+\textbf{Protocol}: Train agents on environments where proxy and true goals diverge (Cheese-in-Corner: proxy = ``go to corner,'' true = ``go to cheese''). Extract $\Uhat$ via probing and symbolic regression. Compare to $\Ustar$ (reward for cheese) and $\Umisgen$ (reward for corner). Use the full 4-tier probing suite on the GMG-trained agent.
+
+\begin{hypothesis}
+In agents trained on non-distinguishing levels (where cheese is always at the corner), $\Uhat \approx \Umisgen$ because the proxy is sufficient. In agents trained with some distinguishing levels, $\Uhat$ shifts toward $\Ustar$ in proportion to distinguishing level exposure. The transition from $\Umisgen$ to $\Ustar$ shows a phase-like structure.
+\end{hypothesis}
+
+\begin{falsification}
+If $\Uhat$ does not correlate with either $\Ustar$ or $\Umisgen$ (or correlates equally with both), the agent has not developed an extractable belief about its goal---the probe cannot distinguish aligned from misgeneralised agents. This would undermine the entire ``belief extraction for oversight'' proposal.
+\end{falsification}
+
+\begin{implication}
+If $\Uhat$ can distinguish agents whose beliefs match the true goal from those whose beliefs match the proxy, belief extraction becomes a diagnostic for misgeneralisation: extract the agent's implicit objective and compare it to the intended objective. This is the first direct test of whether the 4-tier framework can detect misalignment, not just describe alignment.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents, but the primary analysis is on \accel{} (strongest baseline encoding) and next\_env\_prediction (explicit prediction training). \dr{} is the null control. \paired{} is tested with a modified adversary that generates both distinguishing and non-distinguishing levels.
+\end{agentscope}
+
+\subsubsection{G2: Distinguishing-Level Detection (Original Exp 9)}
+\label{exp:gmg2}
+
+\textbf{Protocol}: Train a binary classifier on the agent's hidden states to predict whether the current level is ``distinguishing'' (proxy $\neq$ true goal) or ``non-distinguishing'' (proxy $=$ true goal). In Cheese-in-Corner: classify whether the cheese is at the corner or elsewhere.
+
+\begin{hypothesis}
+The agent's hidden state contains sufficient information to classify distinguishing levels above chance. Classification accuracy improves over training. Agents with stronger Tier 1 encoding (curriculum dynamics) show higher classification accuracy---they encode not just what the level looks like but what type of level it is in the curriculum.
+\end{hypothesis}
+
+\begin{falsification}
+If classification accuracy is at chance for all agents and checkpoints, the agent does not encode the distinguishing/non-distinguishing distinction. The hidden state cannot tell us whether the agent ``knows'' it's on a level where proxy and true goals diverge.
+\end{falsification}
+
+\begin{implication}
+Above-chance classification would mean the agent encodes the condition under which its proxy goal fails---a prerequisite for strategic exploitation. An agent that can detect distinguishing levels has the information needed to behave differently on them. Whether it \textit{does} behave differently is tested in G3.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. The analysis separately reports classification accuracy for each training method $\times$ architecture combination. The next\_env\_prediction architecture is the primary test case (most likely to encode level type), while accel\_probe tests whether classification emerges without explicit prediction training.
+\end{agentscope}
+
+\subsubsection{G3: Behavioural Conditioning on Level Type (Original Exp 12)}
+\label{exp:gmg3}
+
+\textbf{Protocol}: Measure whether the agent behaves differently on distinguishing vs.\ non-distinguishing levels \textit{in ways not explained by the observable difference between levels}. Control for visual differences (wall layout, goal placement) and isolate the behavioural difference attributable to the agent's belief about level type.
+
+\begin{hypothesis}
+Agents with high G2 classification accuracy show behavioural conditioning: on distinguishing levels, they take different actions than on visually similar non-distinguishing levels. The behavioural difference is consistent with the agent ``knowing'' that the proxy and true goal diverge on this level.
+\end{hypothesis}
+
+\begin{falsification}
+If behavioural differences between distinguishing and non-distinguishing levels are fully explained by observable differences (the agent simply reacts to what it sees, not what it believes about the level type), there is no evidence for belief-conditioned behaviour. The agent may classify level types (G2) but not act on this classification.
+\end{falsification}
+
+\begin{implication}
+Behavioural conditioning on level type that survives observational controls is the first empirical evidence for \textit{strategic exploitation}: the agent uses its belief about the training context (not just its observation) to select behaviour. Combined with G1 (belief content) and G2 (level-type detection), this completes the chain: the agent has a belief $\to$ the belief detects a relevant condition $\to$ the agent conditions behaviour on this detection.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. The analysis requires careful controls: matched pairs of visually similar distinguishing and non-distinguishing levels. \paired{} agents are especially interesting because the adversary may learn to generate distinguishing levels that maximise regret.
+\end{agentscope}
+
+\subsubsection{G4: Information Flow from Belief to Policy (Original Exp 13)}
+\label{exp:gmg4}
+
+\textbf{Protocol}: Compare the 5 memory architectures (which form a natural gradient of information access) on GMG environments. If architecture with more curriculum information access (next\_env\_prediction) misgeneralises \textit{less} during training but \textit{more} during deployment, it suggests the agent uses belief information to game training.
+
+\begin{hypothesis}
+Agents with richer curriculum information access (next\_env\_prediction, episodic\_memory) misgeneralise less during training (because they can distinguish level types) but show \textit{the same or more} misgeneralisation during deployment (because the distinguishing signal is absent in deployment). Agents with minimal access (accel\_probe) misgeneralise equally in training and deployment.
+\end{hypothesis}
+
+\begin{falsification}
+If all architectures misgeneralise equally in both training and deployment, curriculum information access does not affect goal pursuit---the 5-architecture gradient provides no leverage on the strategic exploitation question.
+\end{falsification}
+
+\begin{implication}
+A training/deployment divergence that scales with curriculum information access would be the strongest evidence for strategic exploitation in this framework: the agent uses its beliefs about the training process to behave well during training but reverts to the proxy in deployment. This directly operationalises the deceptive alignment threat model in a controlled RL setting.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents. The 5 architectures form the key independent variable (gradient of information access). The 5 training methods provide replication across curriculum types. The critical comparison is next\_env\_prediction vs.\ accel\_probe within each training method.
+\end{agentscope}
+
+\subsubsection{G5: Deceptive Generator Detection (Original Exp 17)}
+\label{exp:gmg5}
+
+\textbf{Protocol}: Create a modified \accel{} generator that appears to follow the standard regret-based curriculum but has a hidden bias (e.g., always placing the goal near a specific feature, or subtly increasing difficulty faster than regret warrants). Train agents on this deceptive generator. Test whether the 4-tier probing suite and symbolic regression can detect the anomaly.
+
+\begin{hypothesis}
+The agent's extracted beliefs ($\Uhat$) differ between the standard and deceptive generators in detectable ways. Symbolic regression recovers a formula with additional terms for the deceptive generator. The probing suite shows anomalous probe accuracy patterns (e.g., high Tier 0 accuracy but low Tier 1 accuracy, reflecting that the levels look normal but the curriculum logic is wrong).
+\end{hypothesis}
+
+\begin{falsification}
+If the probing suite and symbolic regression produce identical results for standard and deceptive generators, the methodology cannot detect generator-level deception. The 4-tier framework describes what the agent believes but cannot flag when the training process itself is anomalous.
+\end{falsification}
+
+\begin{implication}
+If deceptive generators are detectable via the agent's belief structure, the methodology extends to a generator auditing tool: train a student, extract its beliefs, and compare to the stated objectives of the generator. Discrepancies flag potential deception. This is a direct application to LLM oversight: if an LLM-generated curriculum has unstated objectives, the student's beliefs may reveal them.
+\end{implication}
+
+\begin{agentscope}
+All 25 agents, but the primary test is on \accel{} agents (the deceptive generator is a modified \accel{}). The deceptive generator is paired with each architecture to test whether some architectures are more sensitive to generator anomalies.
+\end{agentscope}
+
+\subsection{Evidence Requirements}
+
+To demonstrate strategic exploitation rather than capability failure, three conditions must hold simultaneously:
+\begin{enumerate}[nosep]
+    \item \textbf{Belief content} (G1): The agent's extracted beliefs encode the distinction between proxy and true goals.
+    \item \textbf{Level-type detection} (G2): The agent's hidden state classifies distinguishing vs.\ non-distinguishing levels above chance.
+    \item \textbf{Behavioural conditioning} (G3): The agent behaves differently on distinguishing levels in ways not explained by observation alone.
+    \item \textbf{Information-dependent divergence} (G4): The training/deployment gap scales with the agent's information access.
+\end{enumerate}
+
+Any subset of these failing is informative: (1) fails $\to$ beliefs don't capture goal structure; (2) fails $\to$ agent can't detect relevant conditions; (3) fails $\to$ belief-to-policy pathway is blocked; (4) fails $\to$ information access doesn't enable exploitation. Each failure mode has different implications for the oversight proposal and narrows the space of possible explanations.
+
+
+% ============================================================================
+\section{Planned Extensions}
+\label{sec:extensions}
+% ============================================================================
+
+\subsection{E-Series: Elevated PAIRED Versions of Universal Experiments}
+
+The universal experiments (Exps 1--10, 15--16, 28--30, 32) run on \paired{} agents as part of the standard agent matrix. The E-series augments these with \paired{}-specific analyses that are not yet implemented. Each E-series experiment is a targeted extension of a universal experiment, adding analyses that only make sense in the three-agent \paired{} context.
+
+\begin{table}[H]
+\centering
+\caption{E-series overview. Most ground is covered by the universal experiments running on \paired{} agents plus the A--F series. The genuinely novel additions are detailed below.}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{E\#} & \textbf{Base Experiment} & \textbf{Genuinely New Analysis} \\
+\midrule
+E1 & Level Probing & Probing antagonist separately; comparing pro vs.\ ant accuracy \\
+E2 & Activation Analysis & CKA between protagonist and antagonist representations \\
+E3 & Value Calibration & Calibration separated by regret condition \\
+E4 & Cross-Episode Flow & Whether cross-episode info encodes adversary patterns specifically \\
+E5 & Symbolic Regression & Fitting $\text{regret} = g(\text{level\_features})$ as teacher-side expression \\
+E6 & Counterfactual & Cross-agent injection: antagonist hstate $\to$ protagonist \\
+E7 & Output Probing & Whether outputs predict adversary's next level features \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{E1: Comparative Agent Probing (extends Level Probing, Exp 1)}
+\label{exp:e1}
+
+\textbf{Protocol}: Apply the full 4-tier probing suite to the \textit{antagonist} on the same levels used to probe the protagonist. Compare probe accuracy tier-by-tier between protagonist and antagonist.
+
+\begin{hypothesis}
+The antagonist achieves higher probe accuracy on Tier 1 (curriculum dynamics) and especially on regret-related targets, because the adversary's utility function ($\Rant - \Rpro$) is aligned with the antagonist's interest. The protagonist achieves higher accuracy on Tier 0 (environment variables) because it needs to solve the level.
+\end{hypothesis}
+
+\begin{falsification}
+If protagonist and antagonist probe accuracies are statistically indistinguishable across all tiers, there is no role-dependent specialisation in what each agent encodes. This would suggest that belief content is determined by architecture and training method, not by the agent's role in the game.
+\end{falsification}
+
+\begin{implication}
+Role-dependent encoding asymmetry would establish that what an agent believes about its training process depends on its \textit{relationship} to the generator---allied agents (antagonist) develop different epistemic profiles than opposed agents (protagonist). This has direct implications for the oversight scenario: the quality of extracted beliefs depends on the teacher-student relationship structure.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Extends Antagonist Audit (Exp 23) by providing tier-by-tier granularity. Key comparison: whether the pro-ant gap is larger at Tier 1 (curriculum dynamics) than Tier 0 (environment variables).
+\end{agentscope}
+
+\subsubsection{E2: Cross-Agent Representational Similarity (extends Activation Analysis, Exp 2)}
+\label{exp:e2}
+
+\textbf{Protocol}: Compute CKA (Centered Kernel Alignment) between protagonist and antagonist hidden state representations on matched levels. Track CKA over training checkpoints. Compare to within-agent CKA across different level sets (a baseline for expected similarity).
+
+\begin{hypothesis}
+Cross-agent CKA starts high (both agents have random, undifferentiated representations) and decreases over training as each agent specialises. The rate of CKA decrease correlates with regret: higher-regret training produces faster representational divergence.
+\end{hypothesis}
+
+\begin{falsification}
+If CKA remains constant throughout training, the two agents develop structurally similar representations despite different objectives. If CKA \textit{increases} over training, the agents converge toward shared representations---the opposite of specialisation.
+\end{falsification}
+
+\begin{implication}
+This extends Representation Divergence (Exp 22) with a principled representational similarity metric. If CKA and divergence tell the same story, we have converging evidence. If they disagree, the choice of similarity metric matters---an important methodological finding.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). CKA is computed layer-by-layer where applicable. Architectures with more parameters may show layer-specific divergence patterns (early layers similar, late layers divergent).
+\end{agentscope}
+
+\subsubsection{E3: Regret-Conditioned Value Calibration (extends Value Calibration, Exp 30)}
+\label{exp:e3}
+
+\textbf{Protocol}: Separate value calibration analysis by regret condition: low-regret levels (protagonist and antagonist perform similarly), medium-regret levels, and high-regret levels (antagonist far outperforms protagonist). Compute ECE separately for each condition.
+
+\begin{hypothesis}
+Value calibration is worst on high-regret levels: these are the levels the adversary specifically designed to expose the protagonist's weaknesses, and the protagonist's value estimates are least reliable precisely where they matter most. The antagonist's value calibration is uniformly better because it faces levels designed for its success.
+\end{hypothesis}
+
+\begin{falsification}
+If calibration does not vary by regret condition, the adversary's level design does not selectively impair the protagonist's value estimates. If the protagonist is better calibrated on high-regret levels (not worse), it may have learned to be more cautious in adversarial conditions.
+\end{falsification}
+
+\begin{implication}
+Regret-conditioned miscalibration would identify the precise conditions under which the agent's epistemic model fails---the ``adversarial frontier'' of its beliefs. For oversight: the levels where the teacher is most actively challenging the student are exactly where the student's value estimates are least trustworthy. This is a warning about relying on the student's self-assessment in adversarial training.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Extends the universal Value Calibration (Exp 30) by adding the regret dimension. Regret terciles are computed from the actual $\Rant - \Rpro$ on each level.
+\end{agentscope}
+
+\subsubsection{E4: Adversary-Specific Cross-Episode Flow (extends Cross-Episode Flow, Exp 9)}
+\label{exp:e4}
+
+\textbf{Protocol}: Extend cross-episode flow analysis to test whether cross-episode information specifically encodes adversary patterns. After episode $k$, test whether the protagonist's hidden state carries information about the adversary's strategy distribution over the preceding window of episodes---not just individual level features.
+
+\begin{hypothesis}
+Cross-episode information flow in \paired{} carries adversary-specific content: the protagonist's hidden state after multiple episodes encodes the adversary's recent strategy distribution (e.g., ``the adversary has been generating dense mazes recently''), not just episode-level outcomes. This adversary-specific flow is stronger in memory-rich architectures.
+\end{hypothesis}
+
+\begin{falsification}
+If cross-episode flow carries only episode-level features (return, difficulty) but no adversary-specific content (strategy type, strategy stability), the protagonist does not build a temporal model of the adversary---only a temporal model of its own experience.
+\end{falsification}
+
+\begin{implication}
+Adversary-specific cross-episode flow would show that the protagonist maintains a running model of the teacher, not just of the tasks. This is a qualitatively richer form of epistemic state: the agent tracks not just ``what happened'' but ``what the teacher is doing''---a prerequisite for anticipating curriculum changes.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Builds directly on Cross-Episode Flow (Exp 9) and Adversary Strategy Clustering (Exp 24). The analysis tests whether information about the adversary's strategy \textit{cluster membership} flows across episodes.
+\end{agentscope}
+
+\subsubsection{E5: Teacher-Side Symbolic Regression (extends Symbolic Regression, Exp 32)}
+\label{exp:e5}
+
+\textbf{Protocol}: In addition to fitting $\Uhat = f(\text{level\_features})$ from the protagonist's prediction loss (as in Exp 32), fit the teacher-side expression: $\text{regret} = g(\text{level\_features})$. Compare the student-extracted formula $f$ to the teacher-side formula $g$. If $f \approx g$, the student has learned the teacher's objective.
+
+\begin{hypothesis}
+PySR recovers a formula $g(\text{level\_features})$ for regret that involves wall density and goal distance as primary terms. The student-side formula $f$ (from Exp 32) partially matches $g$: the terms overlap but $f$ may have additional or missing terms reflecting the student's partial or distorted model of the teacher.
+\end{hypothesis}
+
+\begin{falsification}
+If $g$ cannot be fit with R\textsuperscript{2} $> 0.3$ (regret is not predictable from level features), the adversary's utility is too complex for symbolic extraction. If $f$ and $g$ share no terms, the student's extracted beliefs bear no resemblance to the teacher's actual objectives.
+\end{falsification}
+
+\begin{implication}
+Comparing $f$ and $g$ provides the most direct test of belief accuracy: does the student's implicit model of the teacher match the teacher's actual behaviour? Partial overlap (some terms match, others don't) would characterise exactly where the student's beliefs are accurate and where they deviate---a precision diagnostic for scalable oversight.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The teacher-side formula $g$ is the same for all architectures (same adversary). The student-side formula $f$ varies by architecture, allowing comparison of how architectural capacity affects belief accuracy.
+\end{agentscope}
+
+\subsubsection{E6: Cross-Agent Counterfactual Injection (extends Counterfactual, Exp 16)}
+\label{exp:e6}
+
+\textbf{Protocol}: Inject the antagonist's hidden state into the protagonist's network and measure the effect on the protagonist's behaviour. If the antagonist encodes information about the adversary's strategy that the protagonist lacks, this injection should change the protagonist's behaviour in informative ways.
+
+\begin{hypothesis}
+Injecting the antagonist's hidden state into the protagonist causes the protagonist to behave more like the antagonist: higher solve rate, different action distribution, different value estimates. The effect is larger on high-regret levels (where the antagonist has a genuine information advantage) than on low-regret levels.
+\end{hypothesis}
+
+\begin{falsification}
+If injection has no effect (or degrades performance uniformly), the antagonist's hidden state does not contain transferable information---the two agents have developed incompatible representational formats despite similar architectures.
+\end{falsification}
+
+\begin{implication}
+This is the most novel E-series experiment. If cross-agent injection works, it demonstrates that curriculum-related information is encoded in a transferable format across agents with different roles in the game. This has profound implications: beliefs about the training process can be \textit{shared} between agents, opening the door to belief alignment techniques (injecting correct beliefs into misaligned agents) and belief verification (comparing beliefs across redundant agents).
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). The injection is directional: antagonist $\to$ protagonist is the primary test. The reverse (protagonist $\to$ antagonist) is a control. Architectures with similar memory structures (e.g., both using persistent\_lstm) may show stronger transfer than mismatched architectures.
+\end{agentscope}
+
+\subsubsection{E7: Predictive Output Probing for Adversary Behaviour (extends Output Probing, Exp 3)}
+\label{exp:e7}
+
+\textbf{Protocol}: Probe the protagonist's policy outputs (action logits, value estimates) for information about the adversary's \textit{next} level. Does the protagonist's current behaviour implicitly predict what the adversary will generate next?
+
+\begin{hypothesis}
+The protagonist's policy outputs contain predictive information about the adversary's next level features: action entropy anticipates difficulty changes, and value estimates anticipate regret conditions. This predictive information is stronger later in training, after the protagonist has developed a model of the adversary.
+\end{hypothesis}
+
+\begin{falsification}
+If policy outputs carry no predictive information about the adversary's next level (probe accuracy at chance), the protagonist does not use its beliefs about the adversary to modulate current behaviour. Any adversary modelling is purely internal and does not influence the policy.
+\end{falsification}
+
+\begin{implication}
+If policy outputs predict the adversary's next move, the protagonist is not just reacting to the current level but anticipating future curriculum decisions. This is the strongest behavioural evidence for a functional model of the teacher: the student adjusts its current behaviour based on what it expects the teacher to do next.
+\end{implication}
+
+\begin{agentscope}
+\paired{} agents only (5 memory architectures). Extends Output Probing (Exp 3) with forward-looking adversary targets. The next\_env\_prediction architecture may show strongest predictive signal due to its explicit prediction training, but any architecture showing above-chance prediction is noteworthy.
+\end{agentscope}
+
+\subsection{Path to LLM Generators}
+\textbf{Original Experiments 25--26.} Replace the procedural generator with an LLM generating environments based on agent performance. Extract agent epistemics of the LLM generator. This is the ultimate scalable oversight test: can a small RL policy extract the implicit objectives of a large language model? An informative \textit{negative} result (the LLM generator is too complex or stochastic for a small probe) would itself be valuable.
+
+\subsection{Causal Belief Network Extraction}
+The long-term goal is to extract a full CBN from trained agents: a directed acyclic graph representing the agent's implicit causal theory about its training process, with nodes corresponding to training dynamics variables and edges representing perceived causal relationships. The symbolic regression experiments (Exp 32) and causal model extraction experiments (Exp 33) lay the groundwork for this. CBN extraction would provide the most interpretable and verifiable form of agent epistemics.
+
+
+% ============================================================================
+\section{Evidence Assessment}
+\label{sec:evidence}
+% ============================================================================
+
+\subsection{Current Evidence Status}
+
+\begin{table}[H]
+\centering
+\caption{Evidence status for major claims.}
+\begin{tabularx}{\textwidth}{Xll}
+\toprule
+\textbf{Claim} & \textbf{Status} & \textbf{Key Evidence} \\
+\midrule
+Agents develop structured beliefs about training & Strong & Prediction loss decrease, displacement analysis \\
+These beliefs track goal formation & Strong & Component-wise loss decomposition \\
+GMG perceivable during curriculum learning & Falsifiable approach & RQ6 + GMG experiments \\
+Strategic exploitation vs.\ capability failure & Falsifiable approach & RQ6 + GMG experiments \\
+Clean belief elicitation from student model & Weak initial & Probing results, symbolic regression planned \\
+Belief monitoring predicts emergence & Falsifiable approach & Phase transition + behavioral coupling \\
+DR produces no encoding (confirmed null) & Strong & DR losses increase; validated null baseline \\
+Training on interpretability amplifies beliefs & Strong & next\_env\_prediction outperforms implicit architectures \\
+Flaws of existing open-ended methods & Strong & Asymmetry results, DR baseline \\
+New methods for eval/situational awareness & Strong & 4-tier framework, cross-agent comparison \\
+Scalable oversight threat model + solution & Weak initial & \paired{} utility extraction planned \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{What Could Go Wrong}
+
+\begin{enumerate}
+    \item \textbf{Training dynamics encoding is epiphenomenal.} If causal intervention experiments (RQ4) show no behavioural effect, the encoding exists but doesn't matter. This would significantly weaken the safety implications but would still leave the descriptive contribution (agents \textit{do} encode training dynamics).
+
+    \item \textbf{Encoding doesn't distinguish strategic exploitation from capability failure.} If belief-behaviour divergence (Exp 31) shows no pattern distinguishing the two, agent epistemics cannot answer the critical safety question. Other methods (behavioural testing, interpretability) would be needed.
+
+    \item \textbf{Beliefs don't transfer to complex generators.} If the methodology works on procedural generators but fails on \paired{} (let alone LLMs), the scalable oversight claim is undermined. The \paired{} experiments are the first test of this.
+
+    \item \textbf{Training on interpretability helps interpretability but enables exploitation.} If the \texttt{next\_env\_prediction} architecture develops richer beliefs \textit{and} is more prone to strategic exploitation in GMG environments (G4), the training-on-interpretability design principle has a dual-use problem: making agents more transparent also makes them more capable of exploiting their transparency. This would be an important finding for the alignment community, though it would complicate the practical recommendation.
+
+    \item \textbf{Phase transitions are smoothing artifacts.} Without independent validation, apparent transitions in learning dynamics could be artifacts of moving averages or data collection frequency. All transition analyses are labelled exploratory.
+\end{enumerate}
+
+\subsection{Critical Path}
+
+The experiments are designed to be informative regardless of outcome:
+
+\begin{enumerate}[nosep]
+    \item \textbf{RQ1 (what is encoded)} must succeed for everything else to matter. If nothing is encoded, the research program terminates with an informative null result.
+    \item \textbf{RQ4 (causal relevance)} determines whether encoding is functional. If causal interventions fail, we have a descriptive contribution but no safety implications.
+    \item \textbf{RQ3 (teacher legibility in \paired{})} determines whether the methodology works on emergent objectives. If \paired{} fails, the scalable oversight path is blocked.
+    \item \textbf{GMG experiments} determine whether this is a safety contribution or a methods contribution.
+    \item Everything else (RQ2, RQ5, RQ7, RQ8) is valuable but not on the critical path.
+\end{enumerate}
+
+
+% ============================================================================
+\section{Relationship to Broader Concerns}
+\label{sec:broader}
+% ============================================================================
+
+\subsection{Theoretical Foundation: The Necessity and Limits of Internal Representation Analysis}
+
+Two recent theoretical results frame why this work exists and why its methodology is necessary.
+
+\textbf{Richens \& Everitt (2024): Robust agents must learn causal world models.} Any agent satisfying a regret bound under a sufficiently large set of distributional shifts must have learned an approximate causal model of the data-generating process (converging to the true model for optimal agents). In our setting, the data-generating process is the curriculum generator, the distributional shifts are the generator's evolving strategy, and the regret bound is the standard UED training objective. The implication: agents trained under structured curricula \textit{must} develop internal models of their training process. This is not an empirical question---it is a theoretical necessity. Our experiments measure the \textit{form and content} of these models.
+
+\textbf{Bellot, Richens \& Everitt (2025): Behaviour alone cannot uniquely identify agent internals.} Even with perfect observation of an agent's behaviour, multiple combinations of world models and objectives can produce identical actions---creating a fundamental identification problem. Behaviour partially constrains deployment predictions but cannot uniquely determine beliefs, goals, or intentions. This means behavioural safety testing has theoretical limits: you cannot fully predict an agent's deployment behaviour from training behaviour alone.
+
+\textbf{Together}, these results create both the opportunity and the necessity for our approach:
+\begin{itemize}[nosep]
+    \item The models \textit{exist} (Richens \& Everitt, 2024), so there is something to extract.
+    \item Behaviour alone \textit{cannot} extract them (Bellot et al., 2025), so internal representation analysis is required.
+    \item Our probing, symbolic regression, and causal model extraction methods go beyond behavioural observation to directly access the agent's internal representations---resolving (partially) the identification problem that behavioural testing alone cannot.
+\end{itemize}
+
+This positions internal representation analysis not as one possible approach to safety evaluation, but as a \textit{theoretically motivated necessity}---the only path past the behavioural prediction barrier.
+
+\subsection{Threat Model and Proposed Solution}
+
+The threat model follows directly from the central claim. If agents develop structured beliefs about their training process (confirmed: Tier 1--2 encoding is measurable), they have the prerequisites for strategic exploitation:
+\begin{enumerate}[nosep]
+    \item \textbf{Belief}: The agent has a model of what its training process rewards (from Tier 1--2 encoding).
+    \item \textbf{Detection}: The agent can detect when the training process changes (evaluation awareness from training/deployment distributional differences).
+    \item \textbf{Strategy}: The agent can condition its behaviour on this detection.
+\end{enumerate}
+
+Condition (1) is empirically confirmed. Whether (2) and (3) follow is the question the GMG experiments (Part~\ref{sec:gmg}) will answer. The current 38-experiment suite establishes the descriptive and mechanistic foundation; the GMG experiments ask the safety-critical question.
+
+\textbf{The proposed solution: belief elicitation.} If the threat is strategic exploitation enabled by structured beliefs, the response is to make those beliefs transparent. Eliciting the agent's implicit model of its training process---via the probing, symbolic regression, and causal model extraction methods developed here---allows external monitoring of what the agent ``thinks'' its training process rewards. If extracted beliefs ($\Uhat$) match the intended objective ($\Ustar$), the agent is aligned at the epistemic level. If $\Uhat$ matches a proxy ($\Umisgen$), the agent has misgeneralised. If $\Uhat$ diverges from both, further investigation is needed. In all cases, the extracted belief is an inspectable artifact that contributes to oversight.
+
+\textbf{Bellot et al.\ (2025) as a reality check.} Their result implies that belief elicitation from \textit{behaviour} has fundamental limits. Our approach sidesteps this by accessing representations directly. However, the limits may reappear at a higher level: if the representation-to-belief mapping is itself underdetermined (multiple belief attributions are consistent with the same representation pattern), our probing suite faces its own identification problem. The symbolic regression and causal model extraction experiments (Exps 32--33) are designed to test whether extracted beliefs are unique or ambiguous.
+
+\subsection{Training on Interpretability as a Design Principle}
+
+The comparison between \texttt{next\_env\_prediction} and the four implicit architectures yields what may be the most practically actionable finding of this research program. The prediction head---a lightweight auxiliary objective that asks ``what will the training process do next?''---consistently produces agents with:
+\begin{itemize}[nosep]
+    \item Faster development of training dynamics encoding (earlier onset of Tier 1+ accuracy).
+    \item Higher peak accuracy on all tiers (more information extractable at convergence).
+    \item More structured internal representations (sparser, more clustered activation patterns).
+    \item No measurable degradation of policy performance (task return and solve rate are comparable or better).
+\end{itemize}
+
+This is ``training on interpretability'': making the agent transparent by including a prediction objective during training, rather than attempting to reverse-engineer the agent's representations after the fact. The principle generalises beyond our specific setting:
+
+\begin{enumerate}[nosep]
+    \item \textbf{For any training process with structure}, an auxiliary prediction head can force the agent to maintain interpretable representations of that structure. The prediction target defines \textit{what} you want to be able to extract later.
+    \item \textbf{The DR null confirms this is not trivially free.} Under domain randomisation, the prediction head finds nothing---it amplifies structure that exists, rather than hallucinating structure from noise. The agent is made more transparent about what is genuinely there, not about artifacts.
+    \item \textbf{The dual-use concern is real but addressable.} If training on interpretability also makes agents better at modelling their training process (a prerequisite for strategic exploitation), the same mechanism that aids oversight could aid the agent. However, the key asymmetry is that the prediction head's outputs are \textit{externally accessible}---the overseer can read them, creating an information advantage that partially offsets the agent's capability gain.
+\end{enumerate}
+
+The practical recommendation: any RL system trained under a structured curriculum should include a curriculum prediction head as standard practice. The cost is minimal (a small MLP and auxiliary loss), the interpretability benefit is substantial, and the resulting representations provide a built-in monitoring channel. Whether this recommendation survives the GMG experiments (where training on interpretability may enable exploitation rather than just transparency) is an open question that the G4 experiment is designed to answer.
+
+\textbf{Connection to developmental interpretability.} This work contributes to the emerging field of developmental interpretability (Timaeus/DevInterp), which studies how representations form during training rather than analysing trained models post-hoc. Our phase transition experiments (Exp 8), behavioural coupling analysis (Exp 28), and representation trajectory tracking (Exp 36) are developmental interpretability methods applied to curriculum-trained RL agents. The training-on-interpretability finding adds a prescriptive dimension: developmental interpretability has so far been descriptive (``here is how features form''); we show that an auxiliary objective can \textit{steer} feature formation toward interpretable structure, creating a bridge between descriptive developmental analysis and proactive interpretability design.
+
+
+% ============================================================================
+% References
+% ============================================================================
+
+\begin{thebibliography}{99}
+\bibitem{dennis2020} Dennis, M., Jaques, N., Vinitsky, E., Baez, A., Singh, S., \& Levine, S. (2020). Emergent complexity and zero-shot transfer via unsupervised environment design. \textit{NeurIPS}.
+
+\bibitem{richens2024} Richens, J. \& Everitt, T. (2024). Robust agents learn causal world models. \textit{ICLR 2024 (Oral)}. \textit{arXiv:2402.10877}.
+
+\bibitem{bellot2025} Bellot, A., Richens, J. \& Everitt, T. (2025). The limits of predicting agents from behaviour. \textit{ICML 2025}. \textit{arXiv:2506.02923}.
+
+\bibitem{betley2026} Betley, J. et al. (2026). Training large language models on narrow tasks can lead to broad misalignment. \textit{Nature}, 649, 584--589.
+
+\bibitem{turner2025} Turner, E., Soligo, A., Taylor, M., Rajamanoharan, S. \& Nanda, N. (2025). Model organisms for emergent misalignment. \textit{arXiv:2506.11613}.
+
+\bibitem{anthropic2025} Anthropic. (2025). Natural emergent misalignment from reward hacking in production RL. \textit{arXiv:2511.18397}.
+
+\bibitem{langosco2022} Langosco, L. et al. (2022). Goal misgeneralization in deep reinforcement learning. \textit{ICML}.
+
+\bibitem{shah2022} Shah, R. et al. (2022). Goal misgeneralization: Why correct specifications aren't enough for correct goals. \textit{arXiv:2210.01790}.
+
+\bibitem{jiang2021} Jiang, M. et al. (2021). Replay-guided adversarial environment design. \textit{NeurIPS}.
+
+\bibitem{parkerholder2022} Parker-Holder, J. et al. (2022). Evolving curricula with regret-based environment design. \textit{ICML}.
+
+\bibitem{cranmer2023} Cranmer, M. (2023). PySR: Fast \& parallelized symbolic regression in Python/Julia. \textit{Journal of Open Source Software}.
+
+\bibitem{hughes2024} Hughes, E. et al. (2024). Open-endedness is essential for artificial superhuman intelligence. \textit{arXiv}.
+
+\bibitem{portellas2025} Portellas, A. et al. (2025). Safety considerations for open-ended AI systems. \textit{arXiv}.
+\end{thebibliography}
+
+
+% ============================================================================
+% PERSONAL NOTES (not for publication --- remove before sharing)
+% ============================================================================
+
+\newpage
+\section*{Personal Notes for Future Revision}
+\addcontentsline{toc}{section}{Personal Notes (Internal Only)}
+
+\textit{These are notes on known gaps and improvements, to be addressed in future revisions. Remove this section before sharing externally.}
+
+\subsection*{Redundancy between Parts 1 and 8}
+The threat model, proposed solution, and scalable oversight discussion appear in both the ``Positioning'' subsection (Part 1) and the ``Relationship to Broader Concerns'' section (Part 8), with slightly different framing. Part 1 is sharper (it integrates Bellot et al.). Part 8 is more expansive. In a future pass, trim Part 8's threat model and solution subsections to reference Part 1 rather than restating. The theoretical foundation subsection in Part 8 is the strongest piece there and should remain; the rest can be compressed to back-references.
+
+\subsection*{Statistical methodology}
+The document specifies sample sizes for individual experiments (e.g., $n=500$ for teaching opacity) but has no unified discussion of statistical methodology across the 25-agent matrix. A future revision should add a short subsection in Part 2 covering:
+\begin{itemize}[nosep]
+    \item Multiple comparisons correction: Bonferroni across 25 agents requires $p < 0.002$ for individual tests at family-wise $\alpha = 0.05$.
+    \item Number of checkpoints per agent (targeting 50--100 for developmental analyses, 10--20 for snapshot experiments).
+    \item Effect size reporting: Cohen's $d$ for pairwise comparisons, $\eta^2$ for ANOVA across training methods.
+    \item Confidence intervals on probe R$^2$ via bootstrap resampling.
+    \item How to handle the 1,250+ experiment-agent combinations without $p$-hacking: pre-registration of primary analyses vs.\ exploratory analyses.
+\end{itemize}
+
+\subsection*{The belief-to-goal bridge}
+The document's broadest framing is about goal formation (the research program description in Part 1 says ``training dynamics $\to$ goal emergence''). But the 38 experiments mostly measure what is \textit{encoded} (probing accuracy), not what is \textit{pursued} (goal structure). Goal Extraction (Exp 10) and Shard Dynamics (Exp 35) begin to address this, but the conceptual bridge between ``the agent encodes regret'' and ``the agent has a goal shaped by the curriculum'' is asserted more than demonstrated. A future revision should either:
+\begin{itemize}[nosep]
+    \item Add explicit experiments that operationalise ``goal'' independently of ``encoding'' (e.g., preference probes, choice experiments), or
+    \item Narrow the framing to ``belief formation'' and defer goal claims to the next phase of the research program.
+\end{itemize}
+The honest version is probably the latter: this phase establishes what agents \textit{know}, not what they \textit{want}. The goal composition program is the next phase.
+
+\subsection*{Current Results section}
+Findings 1--5 are buried in the ``Summary of Prior Findings'' subsection. A dedicated half-page ``Current Results'' section---even just a bullet list of what is confirmed vs.\ what is hypothesised---would help a reader distinguish established ground from planned work. Currently the reader must infer this from context. Consider adding after the central claim subsection.
+
+\subsection*{Experiment fatigue in Part 3}
+38 experiments with identical structure (hypothesis/falsification/implication/agentscope) is thorough but repetitive. The agentscope sections in particular follow a recognisable pattern by experiment 8. For a publication-ready version, group experiments into 2--3 representative examples per RQ in the main text, with the full catalogue in supplementary material.
+
+\subsection*{Execution priority}
+For first-pass execution, focus on the critical path with a reduced agent set:
+\begin{enumerate}[nosep]
+    \item 3 training methods $\times$ 2 architectures = 6 agents (\accel{}, \paired{}, \dr{} $\times$ \texttt{accel\_probe}, \texttt{next\_env\_prediction}).
+    \item Run RQ1 (level probing, activation analysis, cross-agent comparison) to establish encoding.
+    \item Run RQ4 (causal intervention, counterfactual, prediction head ablation) to establish causal relevance.
+    \item Run RQ3 A-series (utility extraction, adversary policy extraction) on \paired{} to test central claim.
+    \item If signal exists: expand to full 25-agent matrix and remaining RQs.
+    \item If signal exists on \paired{}: implement G1 and G4 for GMG.
+\end{enumerate}
+Full 25-agent matrix is for systematic characterisation after signal is confirmed, not for initial discovery.
+
+\end{document}
