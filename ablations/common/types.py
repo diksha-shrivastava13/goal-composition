@@ -266,7 +266,7 @@ def create_probe_tracking_state(
         last_levels_wall_map=jnp.zeros((batch_size, env_height, env_width), dtype=jnp.bool_),
         last_levels_goal_pos=jnp.zeros((batch_size, 2), dtype=jnp.uint32),
         last_levels_agent_pos=jnp.zeros((batch_size, 2), dtype=jnp.uint32),
-        last_levels_agent_dir=jnp.zeros(batch_size, dtype=jnp.uint32),
+        last_levels_agent_dir=jnp.zeros(batch_size, dtype=jnp.uint8),
         last_branch=0,
         # Tier 1/2/3 loss tracking
         tier1_loss_history=jnp.zeros(buffer_size),

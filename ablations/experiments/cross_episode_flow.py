@@ -26,6 +26,7 @@ from .utils.memory_probing import (
     analyze_selective_memory,
     compute_memory_decay_curve,
 )
+from .utils.batched_rollout import batched_rollout
 
 
 @dataclass
@@ -94,7 +95,35 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
         """
         Collect cross-episode flow data.
         """
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
+        timings = {}
+
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
         self._data = CrossEpisodeData()
+        n_seqs = self.n_episode_sequences
+        max_steps = 50  # Short episodes for cross-episode flow
 
         # Initialize probe accuracy tracking
         for lag in range(1, self.max_lag_to_test + 1):
@@ -102,18 +131,101 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
             if self.has_regret:
                 self._data.adversary_pattern_retention_by_lag[lag] = []
 
-        for seq_idx in range(self.n_episode_sequences):
-            rng, seq_rng = jax.random.split(rng)
+        # --- Run all sequences in parallel, episodes within each sequence are sequential ---
+        _log("episode_sequences", msg=f"Running {n_seqs} sequences x {self.sequence_length} episodes...")
+        t0_total = time.time()
 
-            # Run episode sequence
-            sequence_data = self._run_episode_sequence(seq_rng)
+        # Initialize hstate for all sequences in parallel
+        hstate = self.agent.initialize_hidden_state(n_seqs)
 
-            # Test memory at various lags
+        # Store per-sequence per-episode data
+        all_sequence_data = [[] for _ in range(n_seqs)]
+
+        for ep_idx in tqdm(range(self.sequence_length), desc="Sequential episodes"):
+            rng, rng_levels, rng_rollout = jax.random.split(rng, 3)
+
+            # Generate levels for all sequences at this episode index
+            _log(f"ep_{ep_idx}/generate", msg=f"Generating levels for episode {ep_idx}...")
+            t0 = time.time()
+            level_rngs = jax.random.split(rng_levels, n_seqs)
+            levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+            jax.block_until_ready(levels)
+            _log(f"ep_{ep_idx}/generate", time.time() - t0)
+
+            # Run batched rollout for this episode, carrying hstate from previous episode
+            _log(f"ep_{ep_idx}/rollout", msg=f"Running batched rollout for episode {ep_idx}...")
+            t0 = time.time()
+            result = batched_rollout(
+                rng_rollout, levels, max_steps,
+                self.train_state.apply_fn, self.train_state.params,
+                self.agent.env, self.agent.env_params,
+                hstate,  # Carry hstate from previous episode
+                collection_steps=[-1],
+                return_final_hstate=True,
+            )
+            jax.block_until_ready(result.episode_returns)
+            _log(f"ep_{ep_idx}/rollout", time.time() - t0)
+
+            # Update hstate for next episode (cross-episode persistence)
+            hstate = result.final_hstate
+
+            # Extract terminal hstates and episode data for all sequences
+            terminal_hstates = result.hstates_by_step["-1"]  # (n_seqs, hidden_dim)
+            wall_maps = np.array(levels.wall_map)
+
+            for seq_idx in range(n_seqs):
+                wall_density = float(wall_maps[seq_idx].mean())
+
+                features = {
+                    'return': float(result.episode_returns[seq_idx]),
+                    'solved': 1.0 if result.episode_solved[seq_idx] else 0.0,
+                    'length': int(result.episode_lengths[seq_idx]),
+                    'episode_idx': ep_idx,
+                    'wall_density': wall_density,
+                    'novelty_score': float(np.random.random()),
+                }
+
+                ep_data = {
+                    'level': {'wall_density': wall_density},
+                    'result': {
+                        'total_return': float(result.episode_returns[seq_idx]),
+                        'solved': bool(result.episode_solved[seq_idx]),
+                        'n_steps': int(result.episode_lengths[seq_idx]),
+                    },
+                    'features': features,
+                    'hidden_state': terminal_hstates[seq_idx].copy(),
+                    'pattern_signature': ep_idx,  # Use episode index as signature
+                }
+
+                # PAIRED-specific: compute adversary pattern and regret
+                if self.has_regret:
+                    rng, adv_rng = jax.random.split(rng)
+                    adversary_pattern = self._compute_adversary_pattern(
+                        {'wall_density': wall_density}, ep_idx, adv_rng
+                    )
+                    ep_data['adversary_pattern'] = adversary_pattern
+
+                    if result.episode_solved[seq_idx]:
+                        regret = 0.1 + float(jax.random.uniform(adv_rng)) * 0.2
+                    else:
+                        regret = 0.5 + wall_density * 0.5
+                    ep_data['regret'] = regret
+                    features['regret'] = regret
+
+                all_sequence_data[seq_idx].append(ep_data)
+
+        _log("episode_sequences", time.time() - t0_total)
+
+        # --- Post-process: test memory at various lags ---
+        _log("memory_probing", msg="Testing memory capacity at various lags...")
+        t0 = time.time()
+        for seq_idx in tqdm(range(n_seqs), desc="Memory probing", leave=False):
+            sequence_data = all_sequence_data[seq_idx]
+
             for lag in range(1, self.max_lag_to_test + 1):
                 accuracies = self._test_lag_accuracy(sequence_data, lag)
                 self._data.probe_accuracies_by_lag[lag].extend(accuracies)
 
-                # PAIRED-specific: test adversary pattern retention
                 if self.has_regret:
                     adv_retention = self._test_adversary_pattern_retention(sequence_data, lag)
                     self._data.adversary_pattern_retention_by_lag[lag].extend(adv_retention)
@@ -121,165 +233,19 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
             # Collect episode features for selective memory analysis
             for ep_data in sequence_data:
                 self._data.episode_features.append(ep_data['features'])
-                # Check if this episode is "retained" by testing probe accuracy
                 retained = ep_data.get('probe_accuracy', 0) > 0.5
                 self._data.retained_in_memory.append(retained)
 
-                # PAIRED-specific: collect adversary patterns and regret
                 if self.has_regret:
                     self._data.adversary_patterns.append(ep_data.get('adversary_pattern', {}))
                     self._data.regrets.append(ep_data.get('regret', 0.0))
 
-            # Store final hidden states
+            # Store final hidden state of sequence
             self._data.hidden_states_over_episodes.append(sequence_data[-1]['hidden_state'])
+        _log("memory_probing", time.time() - t0)
 
+        _log("collect_data_done", msg=f"Data collection complete ({n_seqs} sequences x {self.sequence_length} episodes)")
         return self._data
-
-    def _run_episode_sequence(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
-        """Run a sequence of episodes, maintaining hidden state."""
-        sequence_data = []
-
-        # Initialize hidden state (will persist across episodes for persistent agents)
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        for ep_idx in range(self.sequence_length):
-            rng, level_rng, ep_rng = jax.random.split(rng, 3)
-
-            # Create distinctive level pattern
-            pattern = create_distinctive_level_pattern(
-                pattern_type="unique_walls",
-                pattern_id=ep_idx,
-            )
-
-            level = {
-                'wall_map': pattern['wall_map'],
-                'wall_density': pattern['wall_map'].sum() / (13 * 13),
-                'goal_pos': (6, 6),
-                'agent_pos': (1, 1),
-                'pattern_id': pattern['pattern_id'],
-                'signature': pattern['signature'],
-            }
-
-            # Run episode
-            ep_result, hstate = self._run_episode(ep_rng, level, hstate)
-
-            # Compute episode features
-            features = {
-                'return': ep_result['total_return'],
-                'solved': 1.0 if ep_result['solved'] else 0.0,
-                'length': ep_result['n_steps'],
-                'episode_idx': ep_idx,
-                'wall_density': level['wall_density'],
-                'novelty_score': float(np.random.random()),  # Placeholder
-            }
-
-            # Store hidden state both flattened and as tuple for probe usage
-            h_c, h_h = hstate
-            hidden_flat = np.concatenate([
-                np.array(h_c).flatten(),
-                np.array(h_h).flatten()
-            ])
-
-            ep_data = {
-                'level': level,
-                'result': ep_result,
-                'features': features,
-                'hidden_state': hidden_flat.copy(),
-                'hidden_state_tuple': hstate,  # Keep tuple for probe decoding
-                'pattern_signature': pattern['signature'],
-            }
-
-            # PAIRED-specific: compute adversary pattern and regret
-            if self.has_regret:
-                rng, adv_rng = jax.random.split(rng)
-                adversary_pattern = self._compute_adversary_pattern(level, ep_idx, adv_rng)
-                ep_data['adversary_pattern'] = adversary_pattern
-
-                # Compute regret (estimate based on solve status)
-                if ep_result['solved']:
-                    regret = 0.1 + float(jax.random.uniform(adv_rng)) * 0.2
-                else:
-                    regret = 0.5 + level['wall_density'] * 0.5
-                ep_data['regret'] = regret
-                features['regret'] = regret
-
-            sequence_data.append(ep_data)
-
-        return sequence_data
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        initial_hstate: Any,
-        max_steps: int = 50,
-    ) -> Tuple[Dict[str, Any], Any]:
-        """Run a single episode, returning final hidden state."""
-        hstate = initial_hstate
-        total_return = 0.0
-        solved = False
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            new_hstate, pi, value = self._forward_step(obs, hstate)
-
-            action = pi.sample(seed=step_rng)
-            hstate = new_hstate
-
-            # Simulate step
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 5:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        return {
-            'total_return': total_return,
-            'solved': solved,
-            'n_steps': step + 1,
-        }, hstate
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 5) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 5) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def _test_lag_accuracy(
         self,

@@ -94,7 +94,7 @@ class BranchClassifier:
     def __init__(self, cv_folds: int = 5):
         self.cv_folds = cv_folds
         self.scaler = StandardScaler()
-        self.model = LogisticRegression(max_iter=1000, multi_class="multinomial")
+        self.model = LogisticRegression(max_iter=1000)
         self.fitted = False
 
     def fit(

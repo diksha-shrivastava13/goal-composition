@@ -113,119 +113,176 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> ActivationData:
         """
-        Collect activations from episodes across curriculum conditions.
+        Collect activations from episodes across curriculum conditions (GPU-batched).
 
         Collects hidden states at episode end, along with method-appropriate
         metadata for clustering analysis.
         """
-        all_hidden_states = []
-        all_hidden_c = []
-        all_hidden_h = []
-        all_wall_densities = []
-        all_outcomes = []
-        all_training_phases = []
-        all_returns = []
+        import time
+        import logging
+        from tqdm import tqdm
+        from .utils.batched_rollout import batched_rollout
 
-        # Method-specific collections
-        all_branch_types = [] if self.has_branches else None
-        all_regrets = [] if self.has_regret else None
-        all_adversary_difficulties = [] if self.has_regret else None
+        logger = logging.getLogger(__name__)
+        timings = {}
 
-        # PAIRED bilateral collections
-        all_antagonist_hidden_states = [] if self.has_regret else None
-        all_antagonist_returns = [] if self.has_regret else None
-        all_regret_sources = [] if self.has_regret else None
-        all_adversary_strategy_clusters = [] if self.has_regret else None
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
 
-        # Get current training step for phase estimation
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
+        n_episodes = self.n_episodes
+        max_steps = 256
+
+        # --- 1. Generate all levels in batch ---
+        _log("generate_levels", msg="Generating levels...")
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n_episodes)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log("generate_levels", time.time() - t0, "Level generation complete")
+
+        # --- 2. CPU-side level properties ---
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)
+        goal_positions = np.array(levels.goal_pos)
+        agent_positions = np.array(levels.agent_pos)
+        wall_density = wall_maps.mean(axis=(1, 2))
+        _log("cpu_level_properties", time.time() - t0)
+
+        # --- 3. Batched protagonist rollout with terminal hstate ---
+        _log("protagonist_rollout", msg="Running batched protagonist rollout...")
+        t0 = time.time()
+        rng, rng_pro = jax.random.split(rng)
+        pro_result = batched_rollout(
+            rng_pro, levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_episodes),
+            collection_steps=[-1],
+        )
+        _log("protagonist_rollout", time.time() - t0, "Protagonist rollout complete")
+
+        # Extract flattened hidden states from terminal hstates
+        hidden_states = pro_result.hstates_by_step["-1"]  # (n_episodes, hidden_dim)
+        hidden_dim = hidden_states.shape[1] // 2
+        hidden_c = hidden_states[:, :hidden_dim]
+        hidden_h = hidden_states[:, hidden_dim:]
+
+        # Training phase
         current_step = self.train_state.step if hasattr(self.train_state, 'step') else 0
-        max_steps = 30000  # From plan: 30K updates
-        training_phase = current_step / max_steps
+        max_training_steps = 30000
+        training_phase = current_step / max_training_steps
 
-        for ep_idx in range(self.n_episodes):
-            rng, ep_rng, level_rng, branch_rng = jax.random.split(rng, 4)
+        # Branch types
+        if self.has_branches:
+            branch_types = np.arange(n_episodes) % self.branch_count
+        else:
+            branch_types = None
 
-            # Generate level (method-appropriate)
-            if self.has_branches:
-                branch = int(jax.random.randint(branch_rng, (), 0, self.branch_count))
-                level = self._generate_level(level_rng, branch)
-            else:
-                branch = None
-                level = self._generate_level(level_rng, 0)  # No branch for PAIRED/DR
+        # --- 4. PAIRED bilateral ---
+        antagonist_hidden_states = None
+        antagonist_returns = None
+        regrets = None
+        adversary_difficulties = None
+        regret_sources = None
+        adversary_strategy_clusters = None
 
-            # Run episode and collect final hidden state
-            episode_data = self._run_episode(ep_rng, level)
+        if self.has_regret:
+            _log("paired_cpu_estimates", msg="Computing PAIRED CPU estimates...")
+            t0 = time.time()
+            adversary_difficulties = np.array([
+                self._estimate_adversary_difficulty({
+                    'wall_density': float(wall_density[i]),
+                    'goal_pos': tuple(goal_positions[i]),
+                    'agent_pos': tuple(agent_positions[i]),
+                })
+                for i in tqdm(range(n_episodes), desc="Adversary difficulty", leave=False)
+            ])
+            _log("paired_cpu_estimates", time.time() - t0)
 
-            # Extract LSTM components
-            h_c, h_h = episode_data['final_hstate']
-            h_c_flat = np.array(h_c).flatten()
-            h_h_flat = np.array(h_h).flatten()
+            ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+            if ant_train_state is not None:
+                _log("antagonist_rollout", msg="Running batched antagonist rollout...")
+                t0 = time.time()
+                rng, rng_ant = jax.random.split(rng)
+                ant_result = batched_rollout(
+                    rng_ant, levels, max_steps,
+                    ant_train_state.apply_fn, ant_train_state.params,
+                    self.agent.env, self.agent.env_params,
+                    self.agent.initialize_hidden_state(n_episodes),
+                    collection_steps=[-1],
+                )
+                _log("antagonist_rollout", time.time() - t0, "Antagonist rollout complete")
 
-            # Combined hidden state
-            hidden_combined = np.concatenate([h_c_flat, h_h_flat])
+                antagonist_hidden_states = ant_result.hstates_by_step["-1"]
+                antagonist_returns = ant_result.episode_returns
 
-            # Universal data
-            all_hidden_states.append(hidden_combined)
-            all_hidden_c.append(h_c_flat)
-            all_hidden_h.append(h_h_flat)
-            all_wall_densities.append(level.get('wall_density', 0.0))
-            all_outcomes.append(1 if episode_data.get('solved', False) else 0)
-            all_training_phases.append(training_phase)
-            all_returns.append(episode_data.get('total_return', 0.0))
-
-            # Method-specific data
-            if all_branch_types is not None:
-                all_branch_types.append(branch)
-
-            if all_regrets is not None:
-                # Estimate regret for PAIRED
-                regret = episode_data.get('regret', 0.0)
-                all_regrets.append(regret)
-
-                # Estimate adversary difficulty
-                adv_difficulty = self._estimate_adversary_difficulty(level)
-                all_adversary_difficulties.append(adv_difficulty)
-
-                # PAIRED bilateral: collect antagonist data on same level
-                rng, ant_rng = jax.random.split(rng)
-                ant_episode_data = self._run_antagonist_episode(ant_rng, level)
-
-                # Antagonist hidden state
-                ant_h_c, ant_h_h = ant_episode_data['final_hstate']
-                ant_hidden = np.concatenate([
-                    np.array(ant_h_c).flatten(),
-                    np.array(ant_h_h).flatten()
+                # Compute regret and regret sources
+                regrets = antagonist_returns - pro_result.episode_returns
+                regret_sources = np.array([
+                    self._classify_regret_source(
+                        float(pro_result.episode_returns[i]),
+                        float(antagonist_returns[i]),
+                        float(regrets[i]),
+                    )
+                    for i in range(n_episodes)
                 ])
-                all_antagonist_hidden_states.append(ant_hidden)
-                all_antagonist_returns.append(ant_episode_data.get('total_return', 0.0))
 
-                # Compute regret source decomposition
-                pro_return = episode_data.get('total_return', 0.0)
-                ant_return = ant_episode_data.get('total_return', 0.0)
-                regret_source = self._classify_regret_source(pro_return, ant_return, regret)
-                all_regret_sources.append(regret_source)
+                adversary_strategy_clusters = np.array([
+                    self._estimate_adversary_strategy_cluster(
+                        {'wall_density': float(wall_density[i])},
+                        float(adversary_difficulties[i]),
+                    )
+                    for i in range(n_episodes)
+                ])
+            else:
+                regrets = np.zeros(n_episodes)
 
-                # Adversary strategy cluster (placeholder)
-                strategy_cluster = self._estimate_adversary_strategy_cluster(level, adv_difficulty)
-                all_adversary_strategy_clusters.append(strategy_cluster)
-
+        # --- 5. Assemble data ---
         self._data = ActivationData(
-            hidden_states=np.stack(all_hidden_states),
-            hidden_c=np.stack(all_hidden_c),
-            hidden_h=np.stack(all_hidden_h),
-            wall_densities=np.array(all_wall_densities),
-            episode_outcomes=np.array(all_outcomes),
-            training_phases=np.array(all_training_phases),
-            episode_returns=np.array(all_returns),
-            branch_types=np.array(all_branch_types) if all_branch_types else None,
-            regrets=np.array(all_regrets) if all_regrets else None,
-            adversary_difficulties=np.array(all_adversary_difficulties) if all_adversary_difficulties else None,
-            antagonist_hidden_states=np.stack(all_antagonist_hidden_states) if all_antagonist_hidden_states else None,
-            antagonist_returns=np.array(all_antagonist_returns) if all_antagonist_returns else None,
-            regret_sources=np.array(all_regret_sources) if all_regret_sources else None,
-            adversary_strategy_clusters=np.array(all_adversary_strategy_clusters) if all_adversary_strategy_clusters else None,
+            hidden_states=hidden_states,
+            hidden_c=hidden_c,
+            hidden_h=hidden_h,
+            wall_densities=wall_density,
+            episode_outcomes=(pro_result.episode_solved).astype(int),
+            training_phases=np.full(n_episodes, training_phase),
+            episode_returns=pro_result.episode_returns,
+            branch_types=branch_types,
+            regrets=regrets,
+            adversary_difficulties=adversary_difficulties,
+            antagonist_hidden_states=antagonist_hidden_states,
+            antagonist_returns=antagonist_returns,
+            regret_sources=regret_sources,
+            adversary_strategy_clusters=adversary_strategy_clusters,
             training_method=self.training_method,
         )
+
+        if _wandb_active:
+            wandb.log({
+                f"{self.name}/mean_return": float(pro_result.episode_returns.mean()),
+                f"{self.name}/solve_rate": float(pro_result.episode_solved.mean()),
+            })
+
+        total_time = sum(timings.values())
+        _log("total", total_time, f"TOTAL collect_data: {total_time:.2f}s | breakdown: {timings}")
 
         return self._data
 
@@ -243,75 +300,6 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
         normalized_distance = goal_distance / 18.0  # Max ~18 for 13x13 grid
 
         return float(0.5 * wall_density + 0.5 * normalized_distance)
-
-    def _run_antagonist_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Run antagonist episode on same level (PAIRED bilateral)."""
-        # Get antagonist train state
-        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
-
-        if ant_train_state is None:
-            # No antagonist available - return empty data
-            empty_hstate = (
-                np.zeros((1, 256)),  # c
-                np.zeros((1, 256)),  # h
-            )
-            return {
-                'final_hstate': empty_hstate,
-                'total_return': 0.0,
-                'solved': False,
-                'regret': 0.0,
-                'steps': 0,
-            }
-
-        # Initialize antagonist hidden state
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        total_return = 0.0
-        solved = False
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-
-            # Antagonist forward pass
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-            done_batch = jnp.zeros((1, 1), dtype=bool)
-
-            hstate, pi, value = ant_train_state.apply_fn(
-                ant_train_state.params, (obs_batch, done_batch), hstate
-            )
-
-            action = pi.sample(seed=step_rng)
-
-            # Simulate reward (simplified)
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            # Antagonist typically performs better (lower wall avoidance needed)
-            if step > 5:
-                solve_prob = 0.4 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        return {
-            'final_hstate': hstate,
-            'total_return': total_return,
-            'solved': solved,
-            'steps': step + 1,
-        }
 
     def _classify_regret_source(
         self,
@@ -364,27 +352,22 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
         cluster = difficulty_bin * 2 + density_bin
         return int(cluster)
 
-    def _generate_level(self, rng: chex.PRNGKey, branch: int) -> Dict[str, Any]:
-        """Generate a level with appropriate branch characteristics."""
-        rng_walls, rng_goal, rng_agent = jax.random.split(rng, 3)
-
+    def _generate_level(self, rng: chex.PRNGKey, branch: int = 0) -> Dict[str, Any]:
+        """Generate a synthetic test level for prediction loss computation."""
         height, width = 13, 13
 
-        # Wall density varies by branch (DR more random, Replay more structured)
-        if branch == 0:  # DR
-            wall_prob = float(jax.random.uniform(rng_walls)) * 0.3
-        elif branch == 1:  # Replay
-            wall_prob = 0.15 + float(jax.random.uniform(rng_walls)) * 0.1
-        else:  # Mutate
-            wall_prob = 0.1 + float(jax.random.uniform(rng_walls)) * 0.2
+        # Vary wall density by branch to approximate training distribution
+        if branch == 0:  # DR branch: lower density
+            wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.15
+        elif branch == 1:  # Replay branch: medium density
+            wall_prob = 0.15 + float(jax.random.uniform(rng)) * 0.15
+        else:  # Mutation branch: higher density
+            wall_prob = 0.2 + float(jax.random.uniform(rng)) * 0.15
 
-        wall_map = np.array(jax.random.bernoulli(rng_walls, wall_prob, (height, width)))
-        # Clear borders
+        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
         wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
 
-        wall_density = wall_map.sum() / (height * width)
-
-        # Random goal and agent positions
+        rng_goal, rng_agent = jax.random.split(rng)
         goal_pos = (
             int(jax.random.randint(rng_goal, (), 1, height - 1)),
             int(jax.random.randint(rng_goal, (), 1, width - 1)),
@@ -396,104 +379,11 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
 
         return {
             'wall_map': wall_map,
-            'wall_density': wall_density,
+            'wall_density': wall_map.sum() / (height * width),
             'goal_pos': goal_pos,
             'agent_pos': agent_pos,
             'branch': branch,
         }
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Run a single episode and return final state and metrics."""
-        # Initialize hidden state
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        total_return = 0.0
-        solved = False
-
-        # Simulate episode (simplified for activation collection)
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            # Create dummy observation from level
-            obs = self._create_observation(level, step)
-
-            # Forward pass
-            hstate, pi, value = self._forward_step(obs, hstate)
-
-            # Sample action
-            action = pi.sample(seed=step_rng)
-
-            # Simulate reward (simplified)
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            # Check if solved (simplified: random based on wall density)
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        # Estimate regret (simplified: based on solve status and wall density)
-        if solved:
-            regret = 0.0
-        else:
-            regret = 0.5 + 0.5 * level['wall_density']
-
-        return {
-            'final_hstate': hstate,
-            'total_return': total_return,
-            'solved': solved,
-            'regret': regret,
-            'steps': step + 1,
-        }
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        # Create simple observation structure
-        height, width = level['wall_map'].shape
-
-        # Simple 3-channel image: walls, goal, agent
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)  # Walls
-        image[level['goal_pos']] = [0, 1, 0]  # Goal
-
-        # Agent position (moves during episode - simplified)
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        # Create observation namedtuple-like object
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step through agent network."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        # Batch dimensions
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def analyze(self) -> Dict[str, Any]:
         """

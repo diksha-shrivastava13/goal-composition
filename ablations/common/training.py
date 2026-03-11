@@ -589,6 +589,9 @@ def evaluate_n_env_predictions(
     from .networks import ActorCritic
     from .metrics import compute_per_instance_calibration_batch
 
+    # Detect if this is a next_env_prediction agent (integrated head, no probe_params)
+    has_probe_params = hasattr(train_state, 'probe_params') and train_state.probe_params is not None
+
     results = {
         'wall_accuracy': [],
         'goal_accuracy': [],
@@ -615,6 +618,7 @@ def evaluate_n_env_predictions(
         done = jnp.zeros(1, dtype=bool)
 
         # Rollout to get final hidden state
+        predictions = None
         for _ in range(num_steps):
             rng_rollout, rng_action = jax.random.split(rng_rollout)
             x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
@@ -625,16 +629,39 @@ def evaluate_n_env_predictions(
                 env.step, in_axes=(0, 0, 0, None)
             )(jax.random.split(rng_action, 1), env_state, action, env_params)
 
-        # Flatten hidden state and make prediction
-        h_c, h_h = hstate
-        hstate_flat = jnp.concatenate([h_c[0], h_h[0]], axis=-1)
+        # Get predictions
+        if has_probe_params:
+            # Probe-based agents: flatten hidden state and apply probe
+            h_c, h_h = hstate
+            hstate_flat = jnp.concatenate([h_c[0], h_h[0]], axis=-1)
+            probe_input = jax.lax.stop_gradient(hstate_flat[None, ...])
+            predictions = probe_network.apply(train_state.probe_params, probe_input)
+        else:
+            # next_env_prediction: get predictions from forward pass with predict_curriculum
+            try:
+                x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
+                result = train_state.apply_fn(
+                    train_state.params, x, hstate,
+                    predict_curriculum=True,
+                )
+                if len(result) >= 4:
+                    predictions = result[3]
+            except (TypeError, ValueError):
+                pass
 
-        # Get prediction from probe
-        probe_input = jax.lax.stop_gradient(hstate_flat[None, ...])
-        predictions = probe_network.apply(train_state.probe_params, probe_input)
+            if predictions is None:
+                # Fallback: use probe_network with zero params (random baseline)
+                h_c, h_h = hstate
+                hstate_flat = jnp.concatenate([h_c[0], h_h[0]], axis=-1)
+                probe_input = jax.lax.stop_gradient(hstate_flat[None, ...])
+                probe_params = probe_network.init(rng, probe_input)
+                predictions = probe_network.apply(probe_params, probe_input)
 
         # Compute per-instance metrics
-        level_batch = jax.tree_util.tree_map(lambda x: x[None, ...], level)
+        level_batch = jax.tree_util.tree_map(
+            lambda x: jnp.array(x)[None, ...] if not hasattr(x, 'shape') else x[None, ...],
+            level
+        )
         metrics = compute_per_instance_calibration_batch(
             predictions, level_batch, env_height, env_width
         )

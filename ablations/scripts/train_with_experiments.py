@@ -316,6 +316,10 @@ def train_with_experiments(
         metrics["time_delta"] = train_time
         agent.log_metrics(metrics, runner_state[1])
 
+        # Call training-time experiment hooks
+        if hasattr(agent, '_call_training_hooks'):
+            agent._call_training_hooks(runner_state[1], metrics, step_num)
+
         results_summary['training_metrics'].append({
             'step': step_num,
             'metrics': {k: float(v) if hasattr(v, 'item') else v
@@ -367,6 +371,10 @@ def train_with_experiments(
                         f"experiment/{exp_name}/status": 1 if result['status'] == 'success' else 0,
                         "step": step_num,
                     })
+
+    # Finalize training-time experiments
+    if hasattr(agent, '_finalize_training_experiments'):
+        agent._finalize_training_experiments()
 
     # Save summary
     summary_path = os.path.join(experiment_dir, "training_summary.json")

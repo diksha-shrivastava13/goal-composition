@@ -70,19 +70,27 @@ def uses_prediction_head(agent) -> bool:
     return detect_agent_type(agent) == "next_env_prediction"
 
 
-def create_observation_from_level(level: Dict[str, Any]) -> Any:
+def create_observation_from_level(level) -> Any:
     """
-    Create observation object from level dict.
+    Create observation object from level (NamedTuple or dict-like).
 
     Args:
-        level: Dict with wall_map, goal_pos, agent_pos, agent_dir
+        level: Level object with wall_map, goal_pos, agent_pos, agent_dir attributes
+               (or a dict with those keys)
 
     Returns:
         Observation object with image and agent_dir attributes
     """
     height = width = DEFAULT_ENV_HEIGHT
-    if 'wall_map' in level:
-        wall_map = level['wall_map']
+
+    # Support both dict-like and attribute-based access
+    def _get(key, default=None):
+        if isinstance(level, dict):
+            return level.get(key, default)
+        return getattr(level, key, default)
+
+    wall_map = _get('wall_map')
+    if wall_map is not None:
         if hasattr(wall_map, 'shape'):
             height, width = wall_map.shape
         else:
@@ -96,15 +104,15 @@ def create_observation_from_level(level: Dict[str, Any]) -> Any:
     image[:, :, 0] = np.array(wall_map).astype(np.float32)
 
     # Goal position
-    goal_pos = level['goal_pos']
-    if hasattr(goal_pos, '__len__') and len(goal_pos) >= 2:
+    goal_pos = _get('goal_pos')
+    if goal_pos is not None and hasattr(goal_pos, '__len__') and len(goal_pos) >= 2:
         goal_y, goal_x = int(goal_pos[0]), int(goal_pos[1])
         if 0 <= goal_y < height and 0 <= goal_x < width:
             image[goal_y, goal_x] = [0, 1, 0]
 
     # Agent position
-    agent_pos = level['agent_pos']
-    if hasattr(agent_pos, '__len__') and len(agent_pos) >= 2:
+    agent_pos = _get('agent_pos')
+    if agent_pos is not None and hasattr(agent_pos, '__len__') and len(agent_pos) >= 2:
         agent_y, agent_x = int(agent_pos[0]), int(agent_pos[1])
         if 0 <= agent_y < height and 0 <= agent_x < width:
             image[agent_y, agent_x, 2] = 1.0
@@ -115,21 +123,23 @@ def create_observation_from_level(level: Dict[str, Any]) -> Any:
             self.image = img
             self.agent_dir = direction
 
-    agent_dir = level.get('agent_dir', 0)
-    if hasattr(agent_dir, '__len__'):
-        agent_dir = int(agent_dir[0]) if len(agent_dir) > 0 else 0
+    agent_dir = _get('agent_dir', 0)
+    if hasattr(agent_dir, 'shape') and agent_dir.shape == ():
+        agent_dir = int(agent_dir)
+    elif hasattr(agent_dir, 'ndim') and agent_dir.ndim >= 1:
+        agent_dir = int(agent_dir.flat[0]) if agent_dir.size > 0 else 0
     else:
         agent_dir = int(agent_dir)
 
     return Obs(jnp.array(image), jnp.array([agent_dir]))
 
 
-def create_level_object(level: Dict[str, Any]):
+def create_level_object(level):
     """
-    Create Level dataclass from dict for loss computation.
+    Create Level dataclass from level (NamedTuple or dict) for loss computation.
 
     Args:
-        level: Dict with wall_map, goal_pos, agent_pos, agent_dir
+        level: Level object with wall_map, goal_pos, agent_pos, agent_dir
 
     Returns:
         Level-like object with required fields as arrays
@@ -143,30 +153,30 @@ def create_level_object(level: Dict[str, Any]):
         agent_pos: jnp.ndarray
         agent_dir: jnp.ndarray
 
+    def _get(key, default=None):
+        if isinstance(level, dict):
+            return level.get(key, default)
+        return getattr(level, key, default)
+
     # Handle wall_map
-    if 'wall_map' in level:
-        wall_map = jnp.array(level['wall_map'])
+    wall_map = _get('wall_map')
+    if wall_map is not None:
+        wall_map = jnp.array(wall_map)
     else:
         wall_map = jnp.zeros((DEFAULT_ENV_HEIGHT, DEFAULT_ENV_WIDTH))
 
     # Handle goal_pos
-    goal_pos = level['goal_pos']
-    if not hasattr(goal_pos, 'shape'):
-        goal_pos = jnp.array(goal_pos)
-    else:
-        goal_pos = jnp.array(goal_pos)
+    goal_pos = jnp.array(_get('goal_pos'))
 
     # Handle agent_pos
-    agent_pos = level['agent_pos']
-    if not hasattr(agent_pos, 'shape'):
-        agent_pos = jnp.array(agent_pos)
-    else:
-        agent_pos = jnp.array(agent_pos)
+    agent_pos = jnp.array(_get('agent_pos'))
 
     # Handle agent_dir
-    agent_dir = level.get('agent_dir', 0)
-    if hasattr(agent_dir, '__len__'):
-        agent_dir = int(agent_dir[0]) if len(agent_dir) > 0 else 0
+    agent_dir = _get('agent_dir', 0)
+    if hasattr(agent_dir, 'shape') and agent_dir.shape == ():
+        agent_dir = int(agent_dir)
+    elif hasattr(agent_dir, 'ndim') and agent_dir.ndim >= 1:
+        agent_dir = int(agent_dir.flat[0]) if agent_dir.size > 0 else 0
     else:
         agent_dir = int(agent_dir)
     agent_dir = jnp.array(agent_dir)
@@ -179,21 +189,27 @@ def create_level_object(level: Dict[str, Any]):
     )
 
 
-def extract_curriculum_features(level: Dict[str, Any]) -> jnp.ndarray:
+def extract_curriculum_features(level) -> jnp.ndarray:
     """
     Extract curriculum features for next_env_prediction agent.
 
     Args:
-        level: Dict with wall_map, goal_pos, agent_pos, agent_dir
+        level: Level object with wall_map, goal_pos, agent_pos, agent_dir
 
     Returns:
         1D array of curriculum features
     """
     height, width = DEFAULT_ENV_HEIGHT, DEFAULT_ENV_WIDTH
 
+    def _get(key, default=None):
+        if isinstance(level, dict):
+            return level.get(key, default)
+        return getattr(level, key, default)
+
     # Handle wall_map
-    if 'wall_map' in level:
-        wall_map = np.array(level['wall_map'])
+    wall_map = _get('wall_map')
+    if wall_map is not None:
+        wall_map = np.array(wall_map)
         height, width = wall_map.shape
     else:
         wall_map = np.zeros((height, width))
@@ -204,7 +220,7 @@ def extract_curriculum_features(level: Dict[str, Any]) -> jnp.ndarray:
     wall_flat = wall_map.flatten().astype(np.float32)
 
     # Goal position one-hot
-    goal_pos = level['goal_pos']
+    goal_pos = _get('goal_pos')
     goal_y, goal_x = int(goal_pos[0]), int(goal_pos[1])
     goal_onehot = np.zeros(grid_size, dtype=np.float32)
     goal_idx = goal_y * width + goal_x
@@ -212,7 +228,7 @@ def extract_curriculum_features(level: Dict[str, Any]) -> jnp.ndarray:
         goal_onehot[goal_idx] = 1.0
 
     # Agent position one-hot
-    agent_pos = level['agent_pos']
+    agent_pos = _get('agent_pos')
     agent_y, agent_x = int(agent_pos[0]), int(agent_pos[1])
     agent_onehot = np.zeros(grid_size, dtype=np.float32)
     agent_idx = agent_y * width + agent_x
@@ -220,9 +236,11 @@ def extract_curriculum_features(level: Dict[str, Any]) -> jnp.ndarray:
         agent_onehot[agent_idx] = 1.0
 
     # Direction one-hot
-    agent_dir = level.get('agent_dir', 0)
-    if hasattr(agent_dir, '__len__'):
-        agent_dir = int(agent_dir[0]) if len(agent_dir) > 0 else 0
+    agent_dir = _get('agent_dir', 0)
+    if hasattr(agent_dir, 'shape') and agent_dir.shape == ():
+        agent_dir = int(agent_dir)
+    elif hasattr(agent_dir, 'ndim') and agent_dir.ndim >= 1:
+        agent_dir = int(agent_dir.flat[0]) if agent_dir.size > 0 else 0
     else:
         agent_dir = int(agent_dir)
     dir_onehot = np.zeros(4, dtype=np.float32)
@@ -261,8 +279,9 @@ def compute_agent_prediction_loss(
 
     # Create observation from level
     obs = create_observation_from_level(level)
-    hstate = agent.initialize_carry(rng, batch_dims=(1,))
-    obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
+    hstate = agent.initialize_hidden_state(1)
+    # Obs is a plain class, not a pytree — manually add batch dims
+    obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
     done_batch = jnp.zeros((1, 1), dtype=bool)
 
     try:

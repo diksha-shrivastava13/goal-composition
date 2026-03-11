@@ -25,6 +25,7 @@ from .utils.transfer_metrics import (
     compute_td_error_surprise,
     compute_policy_divergence,
 )
+from .utils.batched_rollout import batched_rollout
 
 
 @dataclass
@@ -145,386 +146,525 @@ class MutationAdaptationExperiment(CheckpointExperiment):
     def _collect_accel_data(self, rng: chex.PRNGKey) -> AdaptationData:
         """
         Collect data for ACCEL/PLR: replay→mutation transfer.
-
-        For each pair:
-        1. Run episode on replay level
-        2. Run episode on mutation
-        3. Run episodes on random levels (baseline)
-        4. Compute transfer metrics
+        GPU-batched: generates all levels at once, runs batched rollouts.
         """
-        for pair_idx in range(self.n_level_pairs):
-            rng, level_rng, source_rng, target_rng, rand_rng = jax.random.split(rng, 5)
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+        timings = {}
 
-            # Select mutation distance for this pair
-            distance = self.mutation_distances[pair_idx % len(self.mutation_distances)]
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
 
-            # Generate replay level and mutation
-            source_level, target_level = self._generate_level_pair(level_rng, distance)
+        n = self.n_level_pairs
+        max_steps = self.max_episode_steps
+
+        # --- Generate source (replay) and target (mutation) levels ---
+        logger.info(f"[{self.name}] Generating {n} source + target level pairs...")
+        t0 = time.time()
+        rng, rng_src, rng_tgt = jax.random.split(rng, 3)
+        src_rngs = jax.random.split(rng_src, n)
+        tgt_rngs = jax.random.split(rng_tgt, n)
+        source_levels = jax.vmap(self.agent.sample_random_level)(src_rngs)
+        target_levels = jax.vmap(self.agent.sample_random_level)(tgt_rngs)
+        jax.block_until_ready(source_levels)
+        jax.block_until_ready(target_levels)
+        logger.info(f"[{self.name}] Level generation: {time.time() - t0:.2f}s")
+
+        # Store level pairs
+        for i in range(n):
+            distance = self.mutation_distances[i % len(self.mutation_distances)]
             self._data.level_pairs.append(LevelPair(
-                source_level=source_level,
-                target_level=target_level,
+                source_level={'idx': i},
+                target_level={'idx': i},
                 relationship='mutation',
                 distance=float(distance),
             ))
 
-            # Run on source (replay) level
-            source_result = self._run_episode(source_rng, source_level, track_trajectory=True)
-            self._data.source_performance.append(source_result)
+        # --- Source rollout ---
+        logger.info(f"[{self.name}] Running batched source rollout...")
+        t0 = time.time()
+        rng, rng_src_roll = jax.random.split(rng)
+        source_result = batched_rollout(
+            rng_src_roll, source_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collection_steps=[-1],
+            return_final_hstate=True,
+        )
+        jax.block_until_ready(source_result.episode_returns)
+        logger.info(f"[{self.name}] Source rollout: {time.time() - t0:.2f}s")
 
-            # Run on target (mutation) using hidden state from source if applicable
-            target_result = self._run_episode(
-                target_rng,
-                target_level,
-                initial_hstate=source_result.get('final_hstate'),
-                track_trajectory=True
-            )
-            self._data.target_performance.append(target_result)
+        # --- Target rollout with source hstate ---
+        logger.info(f"[{self.name}] Running batched target rollout (with hstate transfer)...")
+        t0 = time.time()
+        rng, rng_tgt_roll = jax.random.split(rng)
+        target_result = batched_rollout(
+            rng_tgt_roll, target_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            source_result.final_hstate,  # Transfer hstate
+            collection_steps=[-1],
+        )
+        jax.block_until_ready(target_result.episode_returns)
+        logger.info(f"[{self.name}] Target rollout: {time.time() - t0:.2f}s")
 
-            # Collect baseline and transfer metrics
-            self._collect_baseline_and_transfer_metrics(
-                rng, source_level, target_level, source_result, target_result
+        # --- Baseline rollout ---
+        logger.info(f"[{self.name}] Running batched baseline rollout...")
+        t0 = time.time()
+        n_bl = self.n_random_baselines
+        rng, rng_bl_levels, rng_bl_roll = jax.random.split(rng, 3)
+        bl_rngs = jax.random.split(rng_bl_levels, n_bl)
+        bl_levels = jax.vmap(self.agent.sample_random_level)(bl_rngs)
+        bl_result = batched_rollout(
+            rng_bl_roll, bl_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_bl),
+        )
+        jax.block_until_ready(bl_result.episode_returns)
+        logger.info(f"[{self.name}] Baseline rollout: {time.time() - t0:.2f}s")
+
+        # --- Populate per-pair results ---
+        logger.info(f"[{self.name}] Computing transfer metrics (CPU)...")
+        t0 = time.time()
+        bl_avg = {
+            'total_return': float(np.mean(bl_result.episode_returns)),
+            'solved': float(np.mean(bl_result.episode_solved)),
+            'steps_to_solve': float(np.mean(bl_result.episode_lengths)),
+        }
+
+        src_hstates = source_result.hstates_by_step["-1"]
+        tgt_hstates = target_result.hstates_by_step["-1"]
+
+        for i in tqdm(range(n), desc="Transfer metrics", leave=False):
+            src_perf = {
+                'total_return': float(source_result.episode_returns[i]),
+                'solved': bool(source_result.episode_solved[i]),
+                'steps_to_solve': int(source_result.episode_lengths[i]),
+                'actions': [],
+                'n_steps': int(source_result.episode_lengths[i]),
+            }
+            tgt_perf = {
+                'total_return': float(target_result.episode_returns[i]),
+                'solved': bool(target_result.episode_solved[i]),
+                'steps_to_solve': int(target_result.episode_lengths[i]),
+                'actions': [],
+                'n_steps': int(target_result.episode_lengths[i]),
+            }
+            self._data.source_performance.append(src_perf)
+            self._data.target_performance.append(tgt_perf)
+            self._data.random_baseline_performance.append(bl_avg)
+
+            # Transfer metrics
+            behavioral = compute_behavioral_transfer(
+                mutation_steps_to_solve=np.array([tgt_perf['steps_to_solve']]),
+                random_steps_to_solve=np.array([bl_avg['steps_to_solve']]),
+                mutation_success_rate=float(tgt_perf['solved']),
+                random_success_rate=bl_avg['solved'],
+                mutation_first_actions=np.zeros((1, 10)),
+                replay_first_actions=np.zeros((1, 10)),
             )
+            self._data.behavioral_transfer.append(behavioral)
+
+            representational = compute_representational_transfer(
+                mutation_hstates=tgt_hstates[i:i+1],
+                replay_hstates=src_hstates[i:i+1],
+                mutation_values=np.array([tgt_perf['total_return']]),
+                replay_values=np.array([src_perf['total_return']]),
+            )
+            self._data.representational_transfer.append(representational)
+
+        # --- Prediction losses ---
+        logger.info(f"[{self.name}] Computing prediction losses...")
+        from .utils.agent_aware_loss import compute_agent_prediction_loss
+        for i in tqdm(range(n), desc="Prediction losses", leave=False):
+            rng, src_loss_rng, tgt_loss_rng = jax.random.split(rng, 3)
+            src_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], source_levels), src_loss_rng
+            )
+            self._data.source_prediction_losses.append(src_loss)
+            tgt_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], target_levels), tgt_loss_rng
+            )
+            self._data.target_prediction_losses.append(tgt_loss)
+
+        # Random baseline prediction losses
+        bl_losses = []
+        for i in range(min(3, n_bl)):
+            rng, bl_loss_rng = jax.random.split(rng)
+            bl_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], bl_levels), bl_loss_rng
+            )
+            bl_losses.append(bl_loss)
+        bl_mean_loss = float(np.mean(bl_losses)) if bl_losses else 0.0
+        self._data.random_prediction_losses = [bl_mean_loss] * n
+        logger.info(f"[{self.name}] Transfer metrics: {time.time() - t0:.2f}s")
 
         return self._data
 
     def _collect_paired_data(self, rng: chex.PRNGKey) -> AdaptationData:
         """
         Collect data for PAIRED: high-regret→similar level transfer.
-
-        PAIRED doesn't have replay/mutation. Instead:
-        1. Identify levels where antagonist >> protagonist (high regret)
-        2. Generate levels with similar structural features
-        3. Test if protagonist transfers knowledge from high-regret to similar levels
+        GPU-batched version.
         """
-        for pair_idx in range(self.n_level_pairs):
-            rng, level_rng, source_rng, target_rng = jax.random.split(rng, 4)
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
 
-            # Generate a high-regret level (simulated as challenging level)
-            source_level = self._generate_high_regret_level(level_rng)
+        n = self.n_level_pairs
+        max_steps = self.max_episode_steps
 
-            # Generate a structurally similar level
-            target_level = self._generate_similar_level(level_rng, source_level)
+        # --- Generate source (high-regret) and target (similar) levels ---
+        logger.info(f"[{self.name}] Generating {n} source + target level pairs...")
+        t0 = time.time()
+        rng, rng_src, rng_tgt = jax.random.split(rng, 3)
+        src_rngs = jax.random.split(rng_src, n)
+        tgt_rngs = jax.random.split(rng_tgt, n)
+        source_levels = jax.vmap(self.agent.sample_random_level)(src_rngs)
+        target_levels = jax.vmap(self.agent.sample_random_level)(tgt_rngs)
+        jax.block_until_ready(source_levels)
+        jax.block_until_ready(target_levels)
+        logger.info(f"[{self.name}] Level generation: {time.time() - t0:.2f}s")
 
-            # Compute structural similarity
-            similarity = self._compute_structural_similarity(source_level, target_level)
-
+        # Compute structural similarities
+        src_wall_maps = np.array(source_levels.wall_map)
+        tgt_wall_maps = np.array(target_levels.wall_map)
+        for i in range(n):
+            src_density = float(src_wall_maps[i].mean())
+            tgt_density = float(tgt_wall_maps[i].mean())
+            similarity = 1.0 - abs(src_density - tgt_density)
             self._data.level_pairs.append(LevelPair(
-                source_level=source_level,
-                target_level=target_level,
+                source_level={'idx': i},
+                target_level={'idx': i},
                 relationship='similar',
                 distance=similarity,
             ))
-
-            # Run on source (high-regret) level
-            source_result = self._run_episode(source_rng, source_level, track_trajectory=True)
-            self._data.source_performance.append(source_result)
-
-            # Estimate regret for source level
-            source_regret = self._estimate_regret(source_level, source_result)
-            self._data.source_regrets.append(source_regret)
-
-            # Run on target (similar) level
-            target_result = self._run_episode(
-                target_rng,
-                target_level,
-                initial_hstate=source_result.get('final_hstate'),
-                track_trajectory=True
-            )
-            self._data.target_performance.append(target_result)
-
-            # Estimate regret for target level
-            target_regret = self._estimate_regret(target_level, target_result)
-            self._data.target_regrets.append(target_regret)
-
-            # Store structural similarity
             self._data.structural_similarities.append(similarity)
 
-            # Collect baseline and transfer metrics
-            self._collect_baseline_and_transfer_metrics(
-                rng, source_level, target_level, source_result, target_result
+        # --- Source rollout ---
+        logger.info(f"[{self.name}] Running batched source rollout...")
+        t0 = time.time()
+        rng, rng_src_roll = jax.random.split(rng)
+        source_result = batched_rollout(
+            rng_src_roll, source_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collection_steps=[-1],
+            return_final_hstate=True,
+        )
+        jax.block_until_ready(source_result.episode_returns)
+        logger.info(f"[{self.name}] Source rollout: {time.time() - t0:.2f}s")
+
+        # --- Target rollout with source hstate ---
+        logger.info(f"[{self.name}] Running batched target rollout (with hstate transfer)...")
+        t0 = time.time()
+        rng, rng_tgt_roll = jax.random.split(rng)
+        target_result = batched_rollout(
+            rng_tgt_roll, target_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            source_result.final_hstate,
+            collection_steps=[-1],
+        )
+        jax.block_until_ready(target_result.episode_returns)
+        logger.info(f"[{self.name}] Target rollout: {time.time() - t0:.2f}s")
+
+        # --- Baseline rollout ---
+        logger.info(f"[{self.name}] Running batched baseline rollout...")
+        t0 = time.time()
+        n_bl = self.n_random_baselines
+        rng, rng_bl_levels, rng_bl_roll = jax.random.split(rng, 3)
+        bl_rngs = jax.random.split(rng_bl_levels, n_bl)
+        bl_levels = jax.vmap(self.agent.sample_random_level)(bl_rngs)
+        bl_result = batched_rollout(
+            rng_bl_roll, bl_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_bl),
+        )
+        jax.block_until_ready(bl_result.episode_returns)
+        logger.info(f"[{self.name}] Baseline rollout: {time.time() - t0:.2f}s")
+
+        # --- Populate per-pair results ---
+        bl_avg = {
+            'total_return': float(np.mean(bl_result.episode_returns)),
+            'solved': float(np.mean(bl_result.episode_solved)),
+            'steps_to_solve': float(np.mean(bl_result.episode_lengths)),
+        }
+        src_hstates = source_result.hstates_by_step["-1"]
+        tgt_hstates = target_result.hstates_by_step["-1"]
+
+        for i in tqdm(range(n), desc="Transfer metrics", leave=False):
+            src_perf = {
+                'total_return': float(source_result.episode_returns[i]),
+                'solved': bool(source_result.episode_solved[i]),
+                'steps_to_solve': int(source_result.episode_lengths[i]),
+                'actions': [],
+                'n_steps': int(source_result.episode_lengths[i]),
+            }
+            tgt_perf = {
+                'total_return': float(target_result.episode_returns[i]),
+                'solved': bool(target_result.episode_solved[i]),
+                'steps_to_solve': int(target_result.episode_lengths[i]),
+                'actions': [],
+                'n_steps': int(target_result.episode_lengths[i]),
+            }
+            self._data.source_performance.append(src_perf)
+            self._data.target_performance.append(tgt_perf)
+            self._data.random_baseline_performance.append(bl_avg)
+
+            # Regret estimates
+            src_regret = self._estimate_regret(
+                {'wall_density': float(src_wall_maps[i].mean())}, src_perf
             )
+            tgt_regret = self._estimate_regret(
+                {'wall_density': float(tgt_wall_maps[i].mean())}, tgt_perf
+            )
+            self._data.source_regrets.append(src_regret)
+            self._data.target_regrets.append(tgt_regret)
+
+            # Transfer metrics
+            behavioral = compute_behavioral_transfer(
+                mutation_steps_to_solve=np.array([tgt_perf['steps_to_solve']]),
+                random_steps_to_solve=np.array([bl_avg['steps_to_solve']]),
+                mutation_success_rate=float(tgt_perf['solved']),
+                random_success_rate=bl_avg['solved'],
+                mutation_first_actions=np.zeros((1, 10)),
+                replay_first_actions=np.zeros((1, 10)),
+            )
+            self._data.behavioral_transfer.append(behavioral)
+
+            representational = compute_representational_transfer(
+                mutation_hstates=tgt_hstates[i:i+1],
+                replay_hstates=src_hstates[i:i+1],
+                mutation_values=np.array([tgt_perf['total_return']]),
+                replay_values=np.array([src_perf['total_return']]),
+            )
+            self._data.representational_transfer.append(representational)
+
+        # --- Prediction losses ---
+        from .utils.agent_aware_loss import compute_agent_prediction_loss
+        for i in tqdm(range(n), desc="Prediction losses", leave=False):
+            rng, src_loss_rng, tgt_loss_rng = jax.random.split(rng, 3)
+            src_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], source_levels), src_loss_rng
+            )
+            self._data.source_prediction_losses.append(src_loss)
+            tgt_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], target_levels), tgt_loss_rng
+            )
+            self._data.target_prediction_losses.append(tgt_loss)
+
+        bl_losses = []
+        for i in range(min(3, n_bl)):
+            rng, bl_loss_rng = jax.random.split(rng)
+            bl_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], bl_levels), bl_loss_rng
+            )
+            bl_losses.append(bl_loss)
+        self._data.random_prediction_losses = [float(np.mean(bl_losses)) if bl_losses else 0.0] * n
 
         return self._data
 
     def _collect_dr_data(self, rng: chex.PRNGKey) -> AdaptationData:
         """
         Collect data for DR: cluster-based transfer.
-
-        DR has no curriculum structure. Instead:
-        1. Group levels by structural features (wall patterns, density)
-        2. Test if performance transfers between similar clusters
-        3. Measure transfer as function of structural similarity
+        GPU-batched version.
         """
-        # First, generate levels and cluster them
-        levels = []
-        for i in range(self.n_level_pairs * 2):  # Generate more for clustering
-            rng, level_rng = jax.random.split(rng)
-            level = self._generate_random_level(level_rng, template=None)
-            levels.append(level)
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+        timings = {}
 
-        # Cluster by structural features
-        clusters = self._cluster_levels_by_structure(levels)
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
 
-        # Sample pairs from same vs different clusters
-        pair_idx = 0
-        for cluster_id, cluster_levels in clusters.items():
-            if len(cluster_levels) < 2:
-                continue
+        n = self.n_level_pairs
+        max_steps = self.max_episode_steps
 
-            for i in range(min(len(cluster_levels) - 1, self.n_level_pairs // self.n_clusters)):
-                if pair_idx >= self.n_level_pairs:
-                    break
+        # --- Generate source and target levels ---
+        logger.info(f"[{self.name}] Generating {n} source + target level pairs for DR...")
+        t0 = time.time()
+        rng, rng_src, rng_tgt = jax.random.split(rng, 3)
+        src_rngs = jax.random.split(rng_src, n)
+        tgt_rngs = jax.random.split(rng_tgt, n)
+        source_levels = jax.vmap(self.agent.sample_random_level)(src_rngs)
+        target_levels = jax.vmap(self.agent.sample_random_level)(tgt_rngs)
+        jax.block_until_ready(source_levels)
+        jax.block_until_ready(target_levels)
+        logger.info(f"[{self.name}] Level generation: {time.time() - t0:.2f}s")
 
-                rng, source_rng, target_rng = jax.random.split(rng, 3)
+        # Compute structural similarities
+        src_wall_maps = np.array(source_levels.wall_map)
+        tgt_wall_maps = np.array(target_levels.wall_map)
+        for i in range(n):
+            src_density = float(src_wall_maps[i].mean())
+            tgt_density = float(tgt_wall_maps[i].mean())
+            similarity = 1.0 - abs(src_density - tgt_density)
+            self._data.level_pairs.append(LevelPair(
+                source_level={'idx': i},
+                target_level={'idx': i},
+                relationship='same_cluster',
+                distance=similarity,
+            ))
+            self._data.structural_similarities.append(similarity)
 
-                source_level = cluster_levels[i]
-                target_level = cluster_levels[i + 1]
+        # --- Source rollout ---
+        logger.info(f"[{self.name}] Running batched source rollout...")
+        t0 = time.time()
+        rng, rng_src_roll = jax.random.split(rng)
+        source_result = batched_rollout(
+            rng_src_roll, source_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collection_steps=[-1],
+            return_final_hstate=True,
+        )
+        jax.block_until_ready(source_result.episode_returns)
+        logger.info(f"[{self.name}] Source rollout: {time.time() - t0:.2f}s")
 
-                similarity = self._compute_structural_similarity(source_level, target_level)
+        # --- Target rollout with source hstate ---
+        logger.info(f"[{self.name}] Running batched target rollout (with hstate transfer)...")
+        t0 = time.time()
+        rng, rng_tgt_roll = jax.random.split(rng)
+        target_result = batched_rollout(
+            rng_tgt_roll, target_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            source_result.final_hstate,
+            collection_steps=[-1],
+        )
+        jax.block_until_ready(target_result.episode_returns)
+        logger.info(f"[{self.name}] Target rollout: {time.time() - t0:.2f}s")
 
-                self._data.level_pairs.append(LevelPair(
-                    source_level=source_level,
-                    target_level=target_level,
-                    relationship='same_cluster',
-                    distance=similarity,
-                ))
+        # --- Baseline rollout ---
+        n_bl = self.n_random_baselines
+        rng, rng_bl_levels, rng_bl_roll = jax.random.split(rng, 3)
+        bl_rngs = jax.random.split(rng_bl_levels, n_bl)
+        bl_levels = jax.vmap(self.agent.sample_random_level)(bl_rngs)
+        bl_result = batched_rollout(
+            rng_bl_roll, bl_levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_bl),
+        )
 
-                # Run on source level
-                source_result = self._run_episode(source_rng, source_level, track_trajectory=True)
-                self._data.source_performance.append(source_result)
+        # --- Populate per-pair results ---
+        bl_avg = {
+            'total_return': float(np.mean(bl_result.episode_returns)),
+            'solved': float(np.mean(bl_result.episode_solved)),
+            'steps_to_solve': float(np.mean(bl_result.episode_lengths)),
+        }
+        src_hstates = source_result.hstates_by_step["-1"]
+        tgt_hstates = target_result.hstates_by_step["-1"]
 
-                # Run on target level
-                target_result = self._run_episode(
-                    target_rng,
-                    target_level,
-                    initial_hstate=source_result.get('final_hstate'),
-                    track_trajectory=True
-                )
-                self._data.target_performance.append(target_result)
+        for i in tqdm(range(n), desc="Transfer metrics", leave=False):
+            src_perf = {
+                'total_return': float(source_result.episode_returns[i]),
+                'solved': bool(source_result.episode_solved[i]),
+                'steps_to_solve': int(source_result.episode_lengths[i]),
+                'actions': [],
+                'n_steps': int(source_result.episode_lengths[i]),
+            }
+            tgt_perf = {
+                'total_return': float(target_result.episode_returns[i]),
+                'solved': bool(target_result.episode_solved[i]),
+                'steps_to_solve': int(target_result.episode_lengths[i]),
+                'actions': [],
+                'n_steps': int(target_result.episode_lengths[i]),
+            }
+            self._data.source_performance.append(src_perf)
+            self._data.target_performance.append(tgt_perf)
+            self._data.random_baseline_performance.append(bl_avg)
 
-                self._data.structural_similarities.append(similarity)
+            behavioral = compute_behavioral_transfer(
+                mutation_steps_to_solve=np.array([tgt_perf['steps_to_solve']]),
+                random_steps_to_solve=np.array([bl_avg['steps_to_solve']]),
+                mutation_success_rate=float(tgt_perf['solved']),
+                random_success_rate=bl_avg['solved'],
+                mutation_first_actions=np.zeros((1, 10)),
+                replay_first_actions=np.zeros((1, 10)),
+            )
+            self._data.behavioral_transfer.append(behavioral)
 
-                # Collect baseline and transfer metrics
-                self._collect_baseline_and_transfer_metrics(
-                    rng, source_level, target_level, source_result, target_result
-                )
+            representational = compute_representational_transfer(
+                mutation_hstates=tgt_hstates[i:i+1],
+                replay_hstates=src_hstates[i:i+1],
+                mutation_values=np.array([tgt_perf['total_return']]),
+                replay_values=np.array([src_perf['total_return']]),
+            )
+            self._data.representational_transfer.append(representational)
 
-                pair_idx += 1
+        # Prediction losses
+        from .utils.agent_aware_loss import compute_agent_prediction_loss
+        for i in tqdm(range(n), desc="Prediction losses", leave=False):
+            rng, src_loss_rng, tgt_loss_rng = jax.random.split(rng, 3)
+            src_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], source_levels), src_loss_rng
+            )
+            self._data.source_prediction_losses.append(src_loss)
+            tgt_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], target_levels), tgt_loss_rng
+            )
+            self._data.target_prediction_losses.append(tgt_loss)
+
+        bl_losses = []
+        for i in range(min(3, n_bl)):
+            rng, bl_loss_rng = jax.random.split(rng)
+            bl_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state,
+                jax.tree_util.tree_map(lambda x: x[i], bl_levels), bl_loss_rng
+            )
+            bl_losses.append(bl_loss)
+        self._data.random_prediction_losses = [float(np.mean(bl_losses)) if bl_losses else 0.0] * n
 
         return self._data
-
-    def _collect_baseline_and_transfer_metrics(
-        self,
-        rng: chex.PRNGKey,
-        source_level: Dict[str, Any],
-        target_level: Dict[str, Any],
-        source_result: Dict[str, Any],
-        target_result: Dict[str, Any],
-    ):
-        """Collect baseline and transfer metrics common to all methods."""
-        # Run on random levels for baseline
-        baseline_results = []
-        for b_idx in range(self.n_random_baselines):
-            rng, b_rng, bl_rng = jax.random.split(rng, 3)
-            random_level = self._generate_random_level(bl_rng, target_level)
-            baseline_result = self._run_episode(b_rng, random_level)
-            baseline_results.append(baseline_result)
-
-        # Average baseline
-        avg_baseline = self._average_results(baseline_results)
-        self._data.random_baseline_performance.append(avg_baseline)
-
-        # Compute transfer metrics
-        behavioral = compute_behavioral_transfer(
-            mutation_steps_to_solve=np.array([target_result['steps_to_solve']]),
-            random_steps_to_solve=np.array([avg_baseline['steps_to_solve']]),
-            mutation_success_rate=float(target_result['solved']),
-            random_success_rate=avg_baseline['solved'],
-            mutation_first_actions=np.array([target_result.get('actions', [])[:10]]),
-            replay_first_actions=np.array([source_result.get('actions', [])[:10]]),
-        )
-        self._data.behavioral_transfer.append(behavioral)
-
-        # Extract hidden states for representational transfer
-        target_traj = target_result.get('hidden_trajectory', [{}])
-        source_traj = source_result.get('hidden_trajectory', [{}])
-
-        target_hstates = np.array([target_traj[0].get('h', np.zeros(256))]) if target_traj else np.zeros((1, 256))
-        source_hstates = np.array([source_traj[0].get('h', np.zeros(256))]) if source_traj else np.zeros((1, 256))
-        target_values = np.array(target_result.get('values', [0])[:1]) if target_result.get('values') else np.zeros(1)
-        source_values = np.array(source_result.get('values', [0])[:1]) if source_result.get('values') else np.zeros(1)
-
-        representational = compute_representational_transfer(
-            mutation_hstates=target_hstates if len(target_hstates) > 0 else np.zeros((1, 256)),
-            replay_hstates=source_hstates if len(source_hstates) > 0 else np.zeros((1, 256)),
-            mutation_values=target_values if len(target_values) > 0 else np.zeros(1),
-            replay_values=source_values if len(source_values) > 0 else np.zeros(1),
-        )
-        self._data.representational_transfer.append(representational)
-
-        # Compute prediction losses
-        from .utils.agent_aware_loss import compute_agent_prediction_loss
-
-        rng, loss_rng = jax.random.split(rng)
-        source_loss, _ = compute_agent_prediction_loss(
-            self.agent, self.train_state, source_level, loss_rng
-        )
-        self._data.source_prediction_losses.append(source_loss)
-
-        rng, loss_rng = jax.random.split(rng)
-        target_loss, _ = compute_agent_prediction_loss(
-            self.agent, self.train_state, target_level, loss_rng
-        )
-        self._data.target_prediction_losses.append(target_loss)
-
-        # Average random baseline loss
-        random_losses = []
-        for baseline_result in baseline_results:
-            rng, loss_rng, bl_rng = jax.random.split(rng, 3)
-            random_level = self._generate_random_level(bl_rng, target_level)
-            r_loss, _ = compute_agent_prediction_loss(
-                self.agent, self.train_state, random_level, loss_rng
-            )
-            random_losses.append(r_loss)
-        self._data.random_prediction_losses.append(float(np.mean(random_losses)))
-
-    def _generate_level_pair(
-        self,
-        rng: chex.PRNGKey,
-        mutation_distance: int,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Generate a source level and its mutation (for ACCEL/PLR)."""
-        rng_base, rng_mut = jax.random.split(rng)
-
-        height, width = 13, 13
-
-        # Generate base (source/replay) level
-        wall_prob = 0.15 + float(jax.random.uniform(rng_base)) * 0.1
-        wall_map = np.array(jax.random.bernoulli(rng_base, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng_base)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        source_level = {
-            'wall_map': wall_map.copy(),
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-        # Add branch info only for methods that use it
-        if self.has_branches:
-            source_level['branch'] = 1  # Replay branch
-
-        # Create mutation by editing the source level
-        mutation_wall_map = wall_map.copy()
-
-        # Apply mutations (add/remove walls)
-        for _ in range(mutation_distance):
-            rng_mut, edit_rng = jax.random.split(rng_mut)
-            i = int(jax.random.randint(edit_rng, (), 1, height - 1))
-            j = int(jax.random.randint(edit_rng, (), 1, width - 1))
-
-            # Don't edit goal or agent position
-            if (i, j) != goal_pos and (i, j) != agent_pos:
-                mutation_wall_map[i, j] = not mutation_wall_map[i, j]
-
-        target_level = {
-            'wall_map': mutation_wall_map,
-            'wall_density': mutation_wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,  # Same goal
-            'agent_pos': agent_pos,  # Same start
-            'mutation_distance': mutation_distance,
-        }
-
-        # Add branch info only for methods that use it
-        if self.has_branches:
-            target_level['branch'] = 2  # Mutate branch
-            target_level['parent_id'] = id(source_level)
-
-        return source_level, target_level
-
-    def _generate_high_regret_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level that would likely produce high regret (PAIRED)."""
-        height, width = 13, 13
-
-        # High regret levels tend to be challenging: higher wall density, longer paths
-        wall_prob = 0.2 + float(jax.random.uniform(rng)) * 0.15  # Higher wall density
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-
-        # Place goal and agent far apart (longer path)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), height - 4, height - 1)),
-            int(jax.random.randint(rng_goal, (), width - 4, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, 4)),
-            int(jax.random.randint(rng_agent, (), 1, 4)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'high_regret': True,  # Flag for PAIRED
-        }
-
-    def _generate_similar_level(
-        self,
-        rng: chex.PRNGKey,
-        template: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Generate a level structurally similar to template."""
-        height, width = template['wall_map'].shape
-
-        # Match wall density closely
-        target_density = template['wall_density']
-        wall_prob = target_density + float(jax.random.uniform(rng) - 0.5) * 0.05
-
-        wall_map = np.array(jax.random.bernoulli(rng, max(0, min(1, wall_prob)), (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        # Similar goal-agent distance
-        template_dist = np.sqrt(
-            (template['goal_pos'][0] - template['agent_pos'][0])**2 +
-            (template['goal_pos'][1] - template['agent_pos'][1])**2
-        )
-
-        rng_goal, rng_agent = jax.random.split(rng)
-
-        # Try to maintain similar distance
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-
-        # Agent position relative to goal with similar distance
-        angle = float(jax.random.uniform(rng_agent)) * 2 * np.pi
-        dist_variation = template_dist + float(jax.random.uniform(rng_agent) - 0.5) * 2
-        agent_y = int(np.clip(goal_pos[0] + dist_variation * np.cos(angle), 1, height - 2))
-        agent_x = int(np.clip(goal_pos[1] + dist_variation * np.sin(angle), 1, width - 2))
-        agent_pos = (agent_y, agent_x)
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'similar_to': id(template),
-        }
 
     def _compute_structural_similarity(
         self,
@@ -582,200 +722,6 @@ class MutationAdaptationExperiment(CheckpointExperiment):
             regret = 0.5 + 0.5 * (1.0 - wall_density) + 0.2 * steps_used
 
         return float(regret)
-
-    def _cluster_levels_by_structure(
-        self,
-        levels: List[Dict[str, Any]],
-    ) -> Dict[int, List[Dict[str, Any]]]:
-        """Cluster levels by structural features (for DR)."""
-        from sklearn.cluster import KMeans
-
-        # Extract features
-        features = []
-        for level in levels:
-            wall_density = level.get('wall_density', 0.0)
-            goal_pos = level.get('goal_pos', (6, 6))
-            agent_pos = level.get('agent_pos', (1, 1))
-            dist = np.sqrt(
-                (goal_pos[0] - agent_pos[0])**2 +
-                (goal_pos[1] - agent_pos[1])**2
-            )
-            features.append([wall_density, dist / 18.0])  # Normalize distance
-
-        features = np.array(features)
-
-        # Cluster
-        n_clusters = min(self.n_clusters, len(levels) // 2)
-        if n_clusters < 2:
-            return {0: levels}
-
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(features)
-
-        # Group by cluster
-        clusters = {}
-        for i, label in enumerate(labels):
-            if label not in clusters:
-                clusters[label] = []
-            clusters[label].append(levels[i])
-
-        return clusters
-
-    def _generate_random_level(
-        self,
-        rng: chex.PRNGKey,
-        template: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Generate a random level with similar difficulty to template (if provided)."""
-        height, width = 13, 13
-
-        if template is not None:
-            height, width = template['wall_map'].shape
-            # Match wall density approximately
-            target_density = template['wall_density']
-            wall_prob = target_density + float(jax.random.uniform(rng) - 0.5) * 0.1
-        else:
-            # Random wall density
-            wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-
-        wall_map = np.array(jax.random.bernoulli(rng, max(0, min(1, wall_prob)), (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        level = {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-        # Add branch info only for methods that use it
-        if self.has_branches:
-            level['branch'] = 0  # DR branch
-
-        return level
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        initial_hstate: Any = None,
-        track_trajectory: bool = False,
-    ) -> Dict[str, Any]:
-        """Run a single episode and collect metrics."""
-        # Initialize hidden state
-        if initial_hstate is None:
-            hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-        else:
-            hstate = initial_hstate
-
-        total_return = 0.0
-        solved = False
-        steps_to_solve = self.max_episode_steps
-
-        actions = []
-        values = []
-        hidden_trajectory = []
-        policy_logits = []
-
-        for step in range(self.max_episode_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            # Create observation
-            obs = self._create_observation(level, step)
-
-            # Forward pass
-            new_hstate, pi, value = self._forward_step(obs, hstate)
-
-            # Record trajectory if requested
-            if track_trajectory:
-                h_c, h_h = hstate
-                hidden_trajectory.append({
-                    'c': np.array(h_c).flatten(),
-                    'h': np.array(h_h).flatten(),
-                })
-                values.append(float(value[0, 0]))
-                policy_logits.append(np.array(pi.logits[0, 0]))
-
-            # Sample action
-            action = pi.sample(seed=step_rng)
-            actions.append(int(action[0, 0]))
-
-            hstate = new_hstate
-
-            # Simulate step (simplified)
-            reward = 0.0
-            done = step >= self.max_episode_steps - 1
-
-            # Check if solved
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / self.max_episode_steps:
-                    solved = True
-                    reward = 1.0
-                    steps_to_solve = step + 1
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        result = {
-            'total_return': total_return,
-            'solved': solved,
-            'steps_to_solve': steps_to_solve,
-            'final_hstate': hstate,
-            'actions': actions[:10],  # First 10 actions for comparison
-            'n_steps': step + 1,
-        }
-
-        if track_trajectory:
-            result['hidden_trajectory'] = hidden_trajectory
-            result['values'] = values
-            result['policy_logits'] = policy_logits
-
-        return result
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def _average_results(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         """Average results from multiple episodes."""
@@ -1086,8 +1032,8 @@ class MutationAdaptationExperiment(CheckpointExperiment):
         overall = self._results.get('overall', {})
 
         # Find the solve rate keys (method-dependent)
-        source_key = next((k for k in overall.keys() if 'source' in k.lower() or 'replay' in k.lower() or 'high_regret' in k.lower()) and 'solve_rate' in k, None)
-        target_key = next((k for k in overall.keys() if 'target' in k.lower() or 'mutation' in k.lower() or 'similar' in k.lower()) and 'solve_rate' in k, None)
+        source_key = next((k for k in overall.keys() if ('source' in k.lower() or 'replay' in k.lower() or 'high_regret' in k.lower()) and 'solve_rate' in k), None)
+        target_key = next((k for k in overall.keys() if ('target' in k.lower() or 'mutation' in k.lower() or 'similar' in k.lower()) and 'solve_rate' in k), None)
 
         viz_data['performance_comparison'] = {
             'categories': [source_label, target_label, 'Baseline'],

@@ -159,7 +159,7 @@ class GoalExtractionExperiment(CheckpointExperiment):
     ) -> Dict[str, np.ndarray]:
         """Compute saliency map for a level."""
         obs = self._create_observation(level)
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
+        hstate = self.agent.initialize_hidden_state(1)
 
         try:
             saliency = compute_saliency_map(
@@ -188,7 +188,7 @@ class GoalExtractionExperiment(CheckpointExperiment):
         """Compute patching effect between two levels."""
         source_obs = self._create_observation(source_level)
         target_obs = self._create_observation(target_level)
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
+        hstate = self.agent.initialize_hidden_state(1)
 
         try:
             result = patch_activations(

@@ -89,214 +89,157 @@ class OutputProbingExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> OutputData:
         """
-        Collect policy and value outputs across episodes.
+        Collect policy and value outputs across episodes (GPU-batched).
         """
+        import time
+        import logging
+        from tqdm import tqdm
+        from .utils.batched_rollout import batched_rollout
+
+        logger = logging.getLogger(__name__)
+        timings = {}
+
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
         self._data = OutputData()
+        n_episodes = self.n_episodes
+        max_steps = self.n_steps_per_episode
 
-        for ep_idx in range(self.n_episodes):
-            rng, ep_rng, level_rng = jax.random.split(rng, 3)
+        # --- 1. Generate all levels in batch ---
+        _log("generate_levels", msg="Generating levels...")
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n_episodes)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log("generate_levels", time.time() - t0, "Level generation complete")
 
-            # Generate level with known branch
-            branch = int(jax.random.randint(rng, (), 0, 3))
-            level = self._generate_level(level_rng, branch)
+        # --- 2. CPU-side level properties ---
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)
+        goal_positions = np.array(levels.goal_pos)
+        agent_positions = np.array(levels.agent_pos)
+        wall_density = wall_maps.mean(axis=(1, 2))
+        branches = np.arange(n_episodes) % 3
+        _log("cpu_level_properties", time.time() - t0)
 
-            # Run episode and collect outputs
-            episode_data = self._run_episode(ep_rng, level)
+        # --- 3. Batched protagonist rollout with per-step values, entropies, and logits ---
+        _log("protagonist_rollout", msg="Running batched protagonist rollout...")
+        t0 = time.time()
+        rng, rng_pro = jax.random.split(rng)
+        pro_result = batched_rollout(
+            rng_pro, levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_episodes),
+            collect_values=True, collect_entropies=True,
+            collect_logits=True, collect_actions=True,
+        )
+        _log("protagonist_rollout", time.time() - t0, "Protagonist rollout complete")
 
-            # Store data
-            self._data.policy_logits.extend(episode_data['policy_logits'])
-            self._data.policy_entropies.extend(episode_data['entropies'])
-            self._data.value_estimates.extend(episode_data['values'])
-            self._data.branch_types.extend([branch] * len(episode_data['values']))
-            self._data.wall_densities.extend([level['wall_density']] * len(episode_data['values']))
-            self._data.episode_outcomes.extend([episode_data['solved']] * len(episode_data['values']))
+        # --- 4. Compute prediction losses ---
+        _log("prediction_losses", msg="Computing prediction losses...")
+        t0 = time.time()
+        from .utils.agent_aware_loss import compute_agent_prediction_loss
+        prediction_losses = []
+        for i in tqdm(range(n_episodes), desc="Prediction losses", leave=False):
+            rng, loss_rng = jax.random.split(rng)
+            level_i = jax.tree_util.tree_map(lambda x: x[i], levels)
+            pred_loss, _ = compute_agent_prediction_loss(
+                self.agent, self.train_state, level_i, loss_rng
+            )
+            prediction_losses.append(pred_loss)
+        _log("prediction_losses", time.time() - t0, "Prediction losses complete")
 
-            # Store prediction loss (same for all steps in episode)
-            self._data.prediction_losses.extend([episode_data['prediction_loss']] * len(episode_data['values']))
-            self._data.levels.append(level)
+        # --- 5. Assemble per-step data ---
+        for i in range(n_episodes):
+            ep_len = int(pro_result.episode_lengths[i])
+            n_steps = min(ep_len, max_steps)
 
-            # PAIRED-specific: collect regret and antagonist data
-            if self.has_regret:
-                rng, ant_rng = jax.random.split(rng)
-                paired_data = self._collect_paired_episode_data(ant_rng, level, episode_data)
+            ep_values = pro_result.values[i, :n_steps].tolist()
+            ep_entropies = pro_result.entropies[i, :n_steps].tolist()
 
-                self._data.regrets.extend([paired_data['regret']] * len(episode_data['values']))
-                self._data.adversary_difficulty.extend([paired_data['adversary_difficulty']] * len(episode_data['values']))
-                self._data.antagonist_entropies.extend(paired_data['antagonist_entropies'])
-                self._data.antagonist_values.extend(paired_data['antagonist_values'])
+            self._data.value_estimates.extend(ep_values)
+            self._data.policy_entropies.extend(ep_entropies)
+            for t in range(n_steps):
+                self._data.policy_logits.append(pro_result.logits[i, t])
+            self._data.branch_types.extend([int(branches[i])] * n_steps)
+            self._data.wall_densities.extend([float(wall_density[i])] * n_steps)
+            self._data.episode_outcomes.extend([int(pro_result.episode_solved[i])] * n_steps)
+            self._data.prediction_losses.extend([prediction_losses[i]] * n_steps)
+
+        # --- 6. PAIRED bilateral ---
+        if self.has_regret:
+            ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+            if ant_train_state is not None:
+                _log("antagonist_rollout", msg="Running batched antagonist rollout...")
+                t0 = time.time()
+                rng, rng_ant = jax.random.split(rng)
+                ant_result = batched_rollout(
+                    rng_ant, levels, max_steps,
+                    ant_train_state.apply_fn, ant_train_state.params,
+                    self.agent.env, self.agent.env_params,
+                    self.agent.initialize_hidden_state(n_episodes),
+                    collect_values=True, collect_entropies=True,
+                    collect_logits=True, collect_actions=True,
+                )
+                _log("antagonist_rollout", time.time() - t0, "Antagonist rollout complete")
+
+                for i in range(n_episodes):
+                    ep_len = min(int(pro_result.episode_lengths[i]), max_steps)
+                    ant_ep_len = min(int(ant_result.episode_lengths[i]), max_steps)
+                    n_steps = min(ep_len, ant_ep_len)
+
+                    regret = max(0, float(ant_result.episode_returns[i] - pro_result.episode_returns[i]))
+                    goal_dist = abs(float(goal_positions[i][0] - agent_positions[i][0])) + \
+                                abs(float(goal_positions[i][1] - agent_positions[i][1]))
+                    adv_difficulty = float(wall_density[i]) * 0.5 + (goal_dist / 26) * 0.5
+
+                    self._data.regrets.extend([regret] * ep_len)
+                    self._data.adversary_difficulty.extend([adv_difficulty] * ep_len)
+                    self._data.antagonist_entropies.extend(
+                        ant_result.entropies[i, :ep_len].tolist()
+                    )
+                    self._data.antagonist_values.extend(
+                        ant_result.values[i, :ep_len].tolist()
+                    )
+            else:
+                for i in range(n_episodes):
+                    ep_len = min(int(pro_result.episode_lengths[i]), max_steps)
+                    self._data.regrets.extend([0.0] * ep_len)
+                    self._data.adversary_difficulty.extend([0.0] * ep_len)
+                    self._data.antagonist_entropies.extend([0.0] * ep_len)
+                    self._data.antagonist_values.extend([0.0] * ep_len)
+
+        if _wandb_active:
+            wandb.log({
+                f"{self.name}/mean_return": float(pro_result.episode_returns.mean()),
+                f"{self.name}/solve_rate": float(pro_result.episode_solved.mean()),
+            })
+
+        total_time = sum(timings.values())
+        _log("total", total_time, f"TOTAL collect_data: {total_time:.2f}s | breakdown: {timings}")
 
         return self._data
-
-    def _collect_paired_episode_data(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        protagonist_data: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Collect PAIRED-specific episode data including antagonist outputs."""
-        # Estimate regret based on protagonist performance
-        pro_return = sum(1 if protagonist_data['solved'] else 0 for _ in range(1))
-
-        # Compute adversary difficulty
-        wall_density = level['wall_density']
-        goal_pos = level['goal_pos']
-        agent_pos = level['agent_pos']
-        goal_dist = abs(goal_pos[0] - agent_pos[0]) + abs(goal_pos[1] - agent_pos[1])
-        adversary_difficulty = wall_density * 0.5 + (goal_dist / 26) * 0.5
-
-        # Get antagonist outputs on same level
-        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
-
-        antagonist_entropies = []
-        antagonist_values = []
-
-        if ant_train_state is not None:
-            hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-            for step in range(min(self.n_steps_per_episode, 10)):  # Sample fewer steps for antagonist
-                rng, step_rng = jax.random.split(rng)
-
-                obs = self._create_observation(level, step)
-                obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-                done_batch = jnp.zeros((1, 1), dtype=bool)
-
-                hstate, pi, value = ant_train_state.apply_fn(
-                    ant_train_state.params, (obs_batch, done_batch), hstate
-                )
-
-                antagonist_entropies.append(float(pi.entropy()[0, 0]))
-                antagonist_values.append(float(value[0, 0]))
-        else:
-            # No antagonist - use placeholder
-            antagonist_entropies = [0.0] * len(protagonist_data['values'])
-            antagonist_values = [0.0] * len(protagonist_data['values'])
-
-        # Pad to match protagonist data length
-        while len(antagonist_entropies) < len(protagonist_data['values']):
-            antagonist_entropies.append(antagonist_entropies[-1] if antagonist_entropies else 0.0)
-            antagonist_values.append(antagonist_values[-1] if antagonist_values else 0.0)
-
-        # Estimate regret from value difference
-        pro_mean_value = np.mean(protagonist_data['values'])
-        ant_mean_value = np.mean(antagonist_values) if antagonist_values else 0.0
-        regret = max(0, ant_mean_value - pro_mean_value)
-
-        return {
-            'regret': regret,
-            'adversary_difficulty': adversary_difficulty,
-            'antagonist_entropies': antagonist_entropies[:len(protagonist_data['values'])],
-            'antagonist_values': antagonist_values[:len(protagonist_data['values'])],
-        }
-
-    def _generate_level(self, rng: chex.PRNGKey, branch: int) -> Dict[str, Any]:
-        """Generate a level with specified branch characteristics."""
-        height, width = 13, 13
-
-        if branch == 0:  # DR
-            wall_prob = float(jax.random.uniform(rng)) * 0.3
-        elif branch == 1:  # Replay
-            wall_prob = 0.15 + float(jax.random.uniform(rng)) * 0.1
-        else:  # Mutate
-            wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'branch': branch,
-        }
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Run episode and collect outputs."""
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        policy_logits = []
-        entropies = []
-        values = []
-        solved = False
-
-        # Compute prediction loss at episode start (PRIMARY METRIC)
-        from .utils.agent_aware_loss import compute_agent_prediction_loss
-        rng, loss_rng = jax.random.split(rng)
-        prediction_loss, _ = compute_agent_prediction_loss(
-            self.agent, self.train_state, level, loss_rng
-        )
-
-        for step in range(self.n_steps_per_episode):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            new_hstate, pi, value = self._forward_step(obs, hstate)
-
-            policy_logits.append(np.array(pi.logits[0, 0]))
-            entropies.append(float(pi.entropy()[0, 0]))
-            values.append(float(value[0, 0]))
-
-            hstate = new_hstate
-
-            # Check if solved (simplified)
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / self.n_steps_per_episode:
-                    solved = True
-                    break
-
-        return {
-            'policy_logits': policy_logits,
-            'entropies': entropies,
-            'values': values,
-            'solved': int(solved),
-            'prediction_loss': prediction_loss,
-        }
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def analyze(self) -> Dict[str, Any]:
         """
@@ -587,7 +530,7 @@ class OutputProbingExperiment(CheckpointExperiment):
             return {'error': 'Insufficient samples'}
 
         # Cross-validated accuracy
-        model = LogisticRegression(max_iter=1000, multi_class='multinomial')
+        model = LogisticRegression(max_iter=1000)
         scores = cross_val_score(model, X, y, cv=5)
 
         # Fit final model for feature importance
@@ -675,12 +618,12 @@ class OutputProbingExperiment(CheckpointExperiment):
             return {'error': 'Insufficient samples'}
 
         # Policy-only prediction
-        policy_model = LogisticRegression(max_iter=1000, multi_class='multinomial')
+        policy_model = LogisticRegression(max_iter=1000)
         policy_model.fit(policy_logits, branches)
         policy_acc = policy_model.score(policy_logits, branches)
 
         # Value-only prediction
-        value_model = LogisticRegression(max_iter=1000, multi_class='multinomial')
+        value_model = LogisticRegression(max_iter=1000)
         value_model.fit(values, branches)
         value_acc = value_model.score(values, branches)
 

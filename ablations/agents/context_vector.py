@@ -164,6 +164,7 @@ class ContextVectorAgent(BaseAgent):
             probe_tracking = create_probe_tracking_state(
                 buffer_size=config.get("probe_tracking_buffer_size", 500),
                 hstate_dim=DEFAULT_HSTATE_DIM,
+                batch_size=config["num_train_envs"],
             )
             pareto_history = create_pareto_history_state()
 

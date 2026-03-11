@@ -1,5 +1,6 @@
 """Utility functions for interpretability experiments."""
 
+from .batched_rollout import batched_rollout, RolloutResult
 from .calibration_utils import (
     compute_multi_point_calibration,
     compute_branch_conditioned_ece,
@@ -62,6 +63,9 @@ from .agent_aware_loss import (
 )
 
 __all__ = [
+    # Batched rollout
+    "batched_rollout",
+    "RolloutResult",
     # Calibration
     "compute_multi_point_calibration",
     "compute_branch_conditioned_ece",

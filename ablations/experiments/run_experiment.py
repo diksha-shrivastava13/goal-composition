@@ -267,7 +267,7 @@ def run_experiment(
 
     # Collect data
     print("  Collecting data...")
-    data = experiment.collect_data(rng)
+    experiment.data = experiment.collect_data(rng)
 
     # Analyze
     print("  Analyzing...")
@@ -293,7 +293,12 @@ def run_experiment(
         elif isinstance(obj, (np.int32, np.int64)):
             return int(obj)
         else:
-            return obj
+            # Skip non-serializable objects (e.g., matplotlib Figures)
+            try:
+                json.dumps(obj)
+                return obj
+            except (TypeError, ValueError):
+                return None
 
     results_serializable = convert_to_serializable(results)
     viz_serializable = convert_to_serializable(viz_data)

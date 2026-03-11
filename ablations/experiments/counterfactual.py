@@ -33,6 +33,7 @@ from .utils.history_injection import (
     inject_context_vector,
     inject_episodic_memory,
 )
+from .utils.batched_rollout import batched_rollout
 
 
 class InjectionType(Enum):
@@ -114,11 +115,38 @@ class CounterfactualExperiment(CheckpointExperiment):
         """
         Collect data under each injection condition.
         """
-        results = {}
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
+        timings = {}
 
-        # Determine which injection types to use based on training method
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
+        results = {}
+        n = self.n_episodes_per_condition
+        max_steps = 256
+
+        # Determine injection types based on training method
         if self.has_regret:
-            # PAIRED: Use bilateral injection types
             injection_types = [
                 InjectionType.NONE,
                 InjectionType.SUCCESS_HISTORY,
@@ -128,7 +156,6 @@ class CounterfactualExperiment(CheckpointExperiment):
                 InjectionType.LOW_REGRET_TO_HIGH,
             ]
         else:
-            # Standard injection types
             injection_types = [
                 InjectionType.NONE,
                 InjectionType.SUCCESS_HISTORY,
@@ -136,317 +163,197 @@ class CounterfactualExperiment(CheckpointExperiment):
                 InjectionType.RANDOM_HISTORY,
             ]
 
-        for injection_type in injection_types:
+        for injection_type in tqdm(injection_types, desc="Injection conditions"):
             rng, cond_rng = jax.random.split(rng)
+            cond_key = injection_type.value
+            _log(f"{cond_key}/start", msg=f"Running condition: {cond_key}")
 
-            result = self._run_condition(cond_rng, injection_type)
-            results[injection_type] = result
+            # --- Generate all levels for this condition ---
+            _log(f"{cond_key}/generate_levels", msg="Generating levels...")
+            t0 = time.time()
+            rng_levels, rng_inject, rng_rollout = jax.random.split(cond_rng, 3)
+            level_rngs = jax.random.split(rng_levels, n)
+            levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+            jax.block_until_ready(levels)
+            _log(f"{cond_key}/generate_levels", time.time() - t0)
+
+            # --- Create injected hidden states for batch ---
+            _log(f"{cond_key}/inject_hstate", msg="Creating injected hidden states...")
+            t0 = time.time()
+            init_hstate = self._create_batched_injected_state(rng_inject, injection_type, n)
+            _log(f"{cond_key}/inject_hstate", time.time() - t0)
+
+            # --- Batched rollout ---
+            _log(f"{cond_key}/rollout", msg="Running batched rollout...")
+            t0 = time.time()
+            result = batched_rollout(
+                rng_rollout, levels, max_steps,
+                self.train_state.apply_fn, self.train_state.params,
+                self.agent.env, self.agent.env_params,
+                init_hstate,
+                collect_values=True,
+                collect_entropies=True,
+                collect_actions=True,
+            )
+            jax.block_until_ready(result.episode_returns)
+            _log(f"{cond_key}/rollout", time.time() - t0)
+
+            # --- Compute prediction losses (CPU loop) ---
+            _log(f"{cond_key}/pred_losses", msg="Computing prediction losses...")
+            t0 = time.time()
+            from .utils.agent_aware_loss import compute_agent_prediction_loss
+            all_prediction_losses = []
+            for i in tqdm(range(n), desc=f"Pred losses ({cond_key})", leave=False):
+                rng, loss_rng = jax.random.split(rng)
+                pred_loss, _ = compute_agent_prediction_loss(
+                    self.agent, self.train_state,
+                    jax.tree_util.tree_map(lambda x: x[i], levels),
+                    loss_rng
+                )
+                all_prediction_losses.append(pred_loss)
+            _log(f"{cond_key}/pred_losses", time.time() - t0)
+
+            # --- Assemble action distribution ---
+            all_actions = []
+            for i in range(n):
+                ep_len = int(result.episode_lengths[i])
+                all_actions.extend(np.array(result.actions[i, :ep_len]).tolist())
+            if all_actions:
+                action_counts = np.bincount(all_actions, minlength=7)
+                action_dist = action_counts / (len(all_actions) + 1e-6)
+            else:
+                action_dist = np.zeros(7)
+
+            # --- Compute mean values/entropies per episode, then average ---
+            mean_values = []
+            mean_entropies = []
+            for i in range(n):
+                ep_len = int(result.episode_lengths[i])
+                if ep_len > 0:
+                    vals = np.array(result.values[i, :ep_len])
+                    ents = np.array(result.entropies[i, :ep_len])
+                    mean_values.append(float(np.nanmean(vals)))
+                    mean_entropies.append(float(np.nanmean(ents)))
+                else:
+                    mean_values.append(0.0)
+                    mean_entropies.append(0.0)
+
+            injection_result = InjectionResult(
+                injection_type=injection_type,
+                n_episodes=n,
+                solve_rate=float(np.mean(result.episode_solved)),
+                mean_return=float(np.mean(result.episode_returns)),
+                mean_value_estimate=float(np.mean(mean_values)),
+                mean_policy_entropy=float(np.mean(mean_entropies)),
+                action_distribution=action_dist,
+                mean_prediction_loss=float(np.mean(all_prediction_losses)),
+                prediction_losses=all_prediction_losses,
+            )
+            results[injection_type] = injection_result
 
             if injection_type == InjectionType.NONE:
-                self._baseline_result = result
+                self._baseline_result = injection_result
+
+            _log(f"{cond_key}/done", msg=f"Condition complete: solve_rate={injection_result.solve_rate:.3f}")
 
         self._injection_results = results
         return results
 
-    def _run_condition(
+    def _create_batched_injected_state(
         self,
         rng: chex.PRNGKey,
         injection_type: InjectionType,
-    ) -> InjectionResult:
-        """Run episodes under a specific injection condition."""
-        all_solved = []
-        all_returns = []
-        all_values = []
-        all_entropies = []
-        all_actions = []
-        all_prediction_losses = []
-
-        for ep_idx in range(self.n_episodes_per_condition):
-            rng, ep_rng, level_rng, inject_rng, loss_rng = jax.random.split(rng, 5)
-
-            # Generate test level
-            level = self._generate_level(level_rng)
-
-            # Create injected hidden state
-            injected_hstate = self._create_injected_state(inject_rng, injection_type)
-
-            # Run episode with injected state
-            result = self._run_episode(ep_rng, level, injected_hstate)
-
-            all_solved.append(result['solved'])
-            all_returns.append(result['total_return'])
-            all_values.append(result.get('mean_value', 0.0))
-            all_entropies.append(result.get('mean_entropy', 0.0))
-            all_actions.extend(result.get('actions', []))
-
-            # Compute prediction loss for this episode (PRIMARY CAUSAL METRIC)
-            from .utils.agent_aware_loss import compute_agent_prediction_loss
-            pred_loss, _ = compute_agent_prediction_loss(
-                self.agent, self.train_state, level, loss_rng
-            )
-            all_prediction_losses.append(pred_loss)
-
-        # Compute action distribution
-        if all_actions:
-            action_counts = np.bincount(all_actions, minlength=7)
-            action_dist = action_counts / (len(all_actions) + 1e-6)
-        else:
-            action_dist = np.zeros(7)
-
-        return InjectionResult(
-            injection_type=injection_type,
-            n_episodes=self.n_episodes_per_condition,
-            solve_rate=float(np.mean(all_solved)),
-            mean_return=float(np.mean(all_returns)),
-            mean_value_estimate=float(np.mean(all_values)),
-            mean_policy_entropy=float(np.mean(all_entropies)),
-            action_distribution=action_dist,
-            mean_prediction_loss=float(np.mean(all_prediction_losses)),
-            prediction_losses=all_prediction_losses,
-        )
-
-    def _create_injected_state(
-        self,
-        rng: chex.PRNGKey,
-        injection_type: InjectionType,
+        n: int,
     ) -> Any:
-        """Create hidden state with injected history."""
-        # Initialize base hidden state
-        base_hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
+        """Create batched hidden states with injected history for n environments."""
+        # Base hidden state for full batch
+        base_hstate = self.agent.initialize_hidden_state(n)
 
         if injection_type == InjectionType.NONE:
             return base_hstate
 
-        # Get hidden state components
-        h_c, h_h = base_hstate
-
         if injection_type == InjectionType.SUCCESS_HISTORY:
-            # Inject pattern associated with success
             pattern = create_success_history(self.n_injection_episodes)
-            h_c_new, h_h_new = inject_hidden_state(
-                h_c, h_h, pattern, self.injection_strength
+            return inject_hidden_state(
+                base_hstate, pattern, self.injection_strength
             )
 
         elif injection_type == InjectionType.FAILURE_HISTORY:
-            # Inject pattern associated with failure
             pattern = create_failure_history(self.n_injection_episodes)
-            h_c_new, h_h_new = inject_hidden_state(
-                h_c, h_h, pattern, self.injection_strength
+            return inject_hidden_state(
+                base_hstate, pattern, self.injection_strength
             )
 
         elif injection_type == InjectionType.RANDOM_HISTORY:
-            # Inject random pattern
-            h_c_shape = h_c.shape
-            h_h_shape = h_h.shape
-
-            rng_c, rng_h = jax.random.split(rng)
-            noise_c = jax.random.normal(rng_c, h_c_shape) * self.injection_strength * 0.5
-            noise_h = jax.random.normal(rng_h, h_h_shape) * self.injection_strength * 0.5
-
-            h_c_new = h_c + noise_c
-            h_h_new = h_h + noise_h
+            return inject_hidden_state(
+                base_hstate, "random", self.injection_strength
+            )
 
         elif injection_type == InjectionType.ANTAGONIST_STATE:
-            # PAIRED bilateral: inject antagonist h-state into protagonist
-            h_c_new, h_h_new = self._get_antagonist_state(rng)
+            # Run antagonist on n levels for 10 steps to populate hidden state
+            return self._get_batched_antagonist_state(rng, n)
 
         elif injection_type == InjectionType.HIGH_REGRET_TO_LOW:
-            # PAIRED: inject state from high-regret context into low-regret evaluation
-            h_c_new, h_h_new = self._get_regret_conditioned_state(rng, source_regret='high')
+            return self._get_batched_regret_conditioned_state(rng, n, source_regret='high')
 
         elif injection_type == InjectionType.LOW_REGRET_TO_HIGH:
-            # PAIRED: inject state from low-regret context into high-regret evaluation
-            h_c_new, h_h_new = self._get_regret_conditioned_state(rng, source_regret='low')
+            return self._get_batched_regret_conditioned_state(rng, n, source_regret='low')
 
         else:
             return base_hstate
 
-        return (h_c_new, h_h_new)
-
-    def _get_antagonist_state(self, rng: chex.PRNGKey) -> Tuple[Any, Any]:
+    def _get_batched_antagonist_state(
+        self,
+        rng: chex.PRNGKey,
+        n: int,
+    ) -> Any:
         """
-        Get antagonist hidden state for bilateral injection (PAIRED).
-
-        Key test: Does injecting antagonist state improve protagonist performance?
-        If yes → protagonist lacks information antagonist has.
+        Get antagonist hidden states for bilateral injection (PAIRED).
+        Runs antagonist for 10 steps on n levels to populate hidden states.
         """
         ant_train_state = getattr(self.train_state, 'ant_train_state', None)
-
         if ant_train_state is None:
-            # No antagonist available - return random initialization
-            base_hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-            return base_hstate
+            return self.agent.initialize_hidden_state(n)
 
-        # Run antagonist on a sample level to get its hidden state
-        rng, level_rng, rollout_rng = jax.random.split(rng, 3)
-        level = self._generate_level(level_rng)
+        rng, rng_levels, rng_rollout = jax.random.split(rng, 3)
+        level_rngs = jax.random.split(rng_levels, n)
+        conditioning_levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
 
-        # Initialize antagonist hidden state
-        ant_hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
+        # Short rollout (10 steps) to populate antagonist hidden state
+        result = batched_rollout(
+            rng_rollout, conditioning_levels, 10,
+            ant_train_state.apply_fn,
+            ant_train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            return_final_hstate=True,
+        )
+        return result.final_hstate
 
-        # Run a few steps to populate hidden state
-        for step in range(10):
-            rng, step_rng = jax.random.split(rng)
-            obs = self._create_observation(level, step)
-
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-            done_batch = jnp.zeros((1, 1), dtype=bool)
-
-            ant_hstate, pi, value = ant_train_state.apply_fn(
-                ant_train_state.params, (obs_batch, done_batch), ant_hstate
-            )
-
-        return ant_hstate
-
-    def _get_regret_conditioned_state(
+    def _get_batched_regret_conditioned_state(
         self,
         rng: chex.PRNGKey,
-        source_regret: str,  # 'high' or 'low'
-    ) -> Tuple[Any, Any]:
+        n: int,
+        source_regret: str,
+    ) -> Any:
         """
-        Get hidden state from a regret-conditioned context (PAIRED).
-
-        Used to test whether states from high-regret contexts transfer
-        differently than states from low-regret contexts.
+        Get hidden states from regret-conditioned context (PAIRED).
+        Runs protagonist for 20 steps on n conditioning levels.
         """
-        rng, level_rng, rollout_rng = jax.random.split(rng, 3)
+        rng, rng_levels, rng_rollout = jax.random.split(rng, 3)
+        level_rngs = jax.random.split(rng_levels, n)
+        conditioning_levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
 
-        # Generate level with appropriate difficulty
-        if source_regret == 'high':
-            # High regret: hard level (high wall density)
-            level = self._generate_level(level_rng)
-            level['wall_density'] = 0.35  # Higher difficulty
-        else:
-            # Low regret: easy level (low wall density)
-            level = self._generate_level(level_rng)
-            level['wall_density'] = 0.1  # Lower difficulty
-
-        # Run protagonist on this level to get conditioned hidden state
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        for step in range(20):  # More steps for better context
-            rng, step_rng = jax.random.split(rng)
-            obs = self._create_observation(level, step)
-
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-            done_batch = jnp.zeros((1, 1), dtype=bool)
-
-            hstate, pi, value = self.train_state.apply_fn(
-                self.train_state.params, (obs_batch, done_batch), hstate
-            )
-
-        return hstate
-
-    def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a test level."""
-        height, width = 13, 13
-
-        wall_prob = 0.15 + float(jax.random.uniform(rng)) * 0.1
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
+        # Short rollout (20 steps) to build conditioned hidden state
+        result = batched_rollout(
+            rng_rollout, conditioning_levels, 20,
+            self.train_state.apply_fn,
+            self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            return_final_hstate=True,
         )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        initial_hstate: Any,
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Run a single episode with given initial state."""
-        hstate = initial_hstate
-
-        total_return = 0.0
-        solved = False
-        values = []
-        entropies = []
-        actions = []
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            new_hstate, pi, value = self._forward_step(obs, hstate)
-
-            values.append(float(value[0, 0]))
-            entropies.append(float(pi.entropy()[0, 0]))
-
-            action = pi.sample(seed=step_rng)
-            actions.append(int(action[0, 0]))
-
-            hstate = new_hstate
-
-            # Simulate step
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        return {
-            'total_return': total_return,
-            'solved': solved,
-            'n_steps': step + 1,
-            'mean_value': float(np.mean(values)),
-            'mean_entropy': float(np.mean(entropies)),
-            'actions': actions,
-        }
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
+        return result.final_hstate
 
     def analyze(self) -> Dict[str, Any]:
         """

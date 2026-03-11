@@ -242,6 +242,9 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
             'n_levels': len(self._data.losses),
         }
 
+        # Per-level losses for cross-agent statistical tests
+        results['per_level_losses'] = self._data.losses.tolist()
+
         # Random baseline comparison
         random_baseline = compute_random_baseline_loss()
         mean_loss = float(np.mean(self._data.losses))
@@ -365,7 +368,7 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
         Compare results across multiple agents.
 
         This is a static method that takes results from multiple runs
-        and performs cross-agent comparison.
+        and performs cross-agent comparison with statistical significance tests.
 
         Args:
             results_list: List of results dicts from different agents
@@ -385,6 +388,7 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
         }
 
         # Collect summary stats from each agent
+        per_level_losses = []  # For pairwise tests
         for i, result in enumerate(results_list):
             summary = result.get('summary', {})
             comparison['agents'].append({
@@ -394,12 +398,52 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
                 'mean_loss': summary.get('mean_loss', float('inf')),
                 'std_loss': summary.get('std_loss', 0),
             })
+            # Collect per-level losses for statistical tests
+            level_losses = result.get('per_level_losses', [])
+            per_level_losses.append(np.array(level_losses) if level_losses else None)
 
         # Rank by mean loss (lower is better)
         sorted_agents = sorted(comparison['agents'], key=lambda x: x['mean_loss'])
         comparison['rankings']['by_mean_loss'] = [
             a['agent_type'] for a in sorted_agents
         ]
+
+        # Statistical significance tests
+        stat_tests = {}
+
+        # Pairwise t-tests between agents (if per-level data available)
+        has_per_level = all(p is not None and len(p) > 1 for p in per_level_losses)
+        if has_per_level:
+            pairwise = {}
+            for i in range(len(per_level_losses)):
+                for j in range(i + 1, len(per_level_losses)):
+                    agent_i = comparison['agents'][i]['agent_type']
+                    agent_j = comparison['agents'][j]['agent_type']
+                    t_stat, p_value = stats.ttest_ind(per_level_losses[i], per_level_losses[j])
+                    pairwise[f'{agent_i}_vs_{agent_j}'] = {
+                        't_statistic': float(t_stat),
+                        'p_value': float(p_value),
+                        'significant_at_005': bool(p_value < 0.05),
+                        'significant_at_001': bool(p_value < 0.01),
+                        'effect_size_cohens_d': float(
+                            (np.mean(per_level_losses[i]) - np.mean(per_level_losses[j]))
+                            / np.sqrt((np.var(per_level_losses[i]) + np.var(per_level_losses[j])) / 2 + 1e-10)
+                        ),
+                    }
+            stat_tests['pairwise_t_tests'] = pairwise
+
+            # One-way ANOVA across all agents
+            f_stat, anova_p = stats.f_oneway(*per_level_losses)
+            stat_tests['anova'] = {
+                'f_statistic': float(f_stat),
+                'p_value': float(anova_p),
+                'significant_at_005': bool(anova_p < 0.05),
+                'n_groups': len(per_level_losses),
+            }
+        else:
+            stat_tests['note'] = 'Per-level loss data not available; only ranking by mean loss.'
+
+        comparison['statistical_tests'] = stat_tests
 
         # Add expected ordering note
         expected_ordering = [

@@ -16,13 +16,19 @@ PAIRED-specific:
 """
 
 from typing import Dict, Any, List, Optional, Tuple
+import time
+import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
 import chex
 from scipy.stats import pearsonr
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from .base import CheckpointExperiment
+from .utils.batched_rollout import batched_rollout
 from .utils.calibration_utils import (
     compute_multi_point_calibration,
     compute_branch_conditioned_ece,
@@ -74,135 +80,150 @@ class ValueCalibrationExperiment(CheckpointExperiment):
         return "value_calibration"
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Collect value predictions and actual returns at multiple timesteps."""
+        """Collect value predictions and actual returns at multiple timesteps (GPU-batched)."""
         n_episodes = self.config.get("n_episodes", 500)
         timesteps = self.config.get("calibration_timesteps", [1, 10, 50, 100, 200])
         max_episode_length = self.config.get("max_episode_length", 256)
         gamma = self.config.get("gamma", 0.995)
+        timings = {}
 
-        # Data containers
-        values_by_timestep = {t: [] for t in timesteps}
-        returns_by_timestep = {t: [] for t in timesteps}
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase: str, elapsed: float = None, msg: str = None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[value_calibration] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[value_calibration] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"value_calibration/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"value_calibration/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
+        # --- 1. Generate all levels in batch ---
+        _log("generate_levels", msg="Generating levels...")
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n_episodes)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log("generate_levels", time.time() - t0, "Level generation complete")
+
+        # --- 2. CPU-side level properties ---
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)
+        goal_positions = np.array(levels.goal_pos)
+        agent_positions = np.array(levels.agent_pos)
+        wall_density = wall_maps.mean(axis=(1, 2))
+        goal_distance = np.sqrt(np.sum((goal_positions - agent_positions) ** 2, axis=-1))
+        branches = np.arange(n_episodes) % 3
+        _log("cpu_level_properties", time.time() - t0)
+
+        # --- 3. Batched protagonist rollout ---
+        _log("protagonist_rollout", msg="Running batched protagonist rollout...")
+        t0 = time.time()
+        rng, rng_pro = jax.random.split(rng)
+        pro_result = batched_rollout(
+            rng_pro, levels, max_episode_length,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_episodes),
+            collect_values=True, collect_rewards=True,
+        )
+        pro_values = pro_result.values
+        pro_rewards = pro_result.rewards
+        pro_lengths = pro_result.episode_lengths
+        _log("protagonist_rollout", time.time() - t0, "Protagonist rollout complete")
+
+        # --- 4. Compute returns from each timestep (vectorized) ---
+        t0 = time.time()
+        returns_all = self._compute_batch_returns(pro_rewards, gamma, max_episode_length)
+        _log("compute_returns", time.time() - t0)
+
+        # --- 5. Extract at calibration timesteps ---
+        values_by_timestep = {}
+        returns_by_timestep = {}
+        for t in timesteps:
+            valid = pro_lengths > t  # episodes that lasted past this timestep
+            values_by_timestep[t] = pro_values[valid, t]
+            returns_by_timestep[t] = returns_all[valid, t]
+
+        # --- 6. Episode-level data ---
+        solved = np.array([
+            float(pro_rewards[i, pro_lengths[i] - 1]) > 0 if pro_lengths[i] > 0 else False
+            for i in range(n_episodes)
+        ])
+
         episode_data = {
-            "initial_values": [],
-            "final_returns": [],
-            "branches": [],
-            "difficulties": [],
-            "solved": [],
-            "episode_lengths": [],
-            "values_over_time": [],
-            "rewards_over_time": [],
-            "goal_distances": [],
+            "initial_values": pro_values[:, 0],
+            "final_returns": returns_all[:, 0],
+            "branches": branches,
+            "difficulties": wall_density,
+            "solved": solved,
+            "episode_lengths": pro_lengths,
+            "values_over_time": pro_values,
+            "rewards_over_time": pro_rewards,
+            "goal_distances": goal_distance,
         }
 
-        # PAIRED-specific data containers
+        if _wandb_active:
+            wandb.log({
+                "value_calibration/mean_return": float(returns_all[:, 0].mean()),
+                "value_calibration/mean_initial_value": float(pro_values[:, 0].mean()),
+                "value_calibration/solve_rate": float(solved.mean()),
+            })
+
+        # --- 7. PAIRED bilateral ---
         paired_data = None
         if self.has_regret:
-            paired_data = {
-                "regrets": [],
-                "antagonist_values": [],
-                "antagonist_returns": [],
-                "protagonist_returns": [],
-            }
-
-        for i in range(n_episodes):
-            rng, rng_level, rng_reset, rng_rollout = jax.random.split(rng, 4)
-
-            # Generate level
-            level = self.agent.sample_random_level(rng_level)
-
-            # Simulated branch assignment
-            branch = i % 3  # Cycle through DR=0, Replay=1, Mutate=2
-
-            # Difficulty proxy
-            wall_density = float(level.wall_map.mean())
-
-            # Goal distance
-            goal_pos = np.array(level.goal_pos)
-            agent_pos = np.array(level.agent_pos)
-            goal_distance = float(np.sqrt(np.sum((goal_pos - agent_pos) ** 2)))
-
-            # Reset environment
-            obs, env_state = self.agent.env.reset_to_level(
-                rng_reset, level, self.agent.env_params
-            )
-
-            # Initialize hidden state
-            hstate = self.agent.initialize_hidden_state(1)
-
-            # Run episode and collect data
-            values = []
-            rewards = []
-            done = False
-
-            for step in range(max_episode_length):
-                rng_rollout, rng_action = jax.random.split(rng_rollout)
-
-                # Get value prediction
-                obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-                done_batch = jnp.array([[done]])
-                hstate, pi, value = self.train_state.apply_fn(
-                    self.train_state.params, (obs_batch, done_batch), hstate
+            ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+            if ant_train_state is not None:
+                _log("antagonist_rollout", msg="Running batched antagonist rollout...")
+                t0 = time.time()
+                rng, rng_ant = jax.random.split(rng)
+                ant_result = batched_rollout(
+                    rng_ant, levels, max_episode_length,
+                    ant_train_state.apply_fn, ant_train_state.params,
+                    self.agent.env, self.agent.env_params,
+                    self.agent.initialize_hidden_state(n_episodes),
+                    collect_values=True, collect_rewards=True,
                 )
-                v = float(value[0, 0])
-                values.append(v)
+                ant_values = ant_result.values
+                ant_rewards = ant_result.rewards
+                ant_lengths = ant_result.episode_lengths
+                _log("antagonist_rollout", time.time() - t0, "Antagonist rollout complete")
 
-                # Step environment
-                action = pi.sample(seed=rng_action)[0, 0]
-                obs, env_state, reward, done, _ = self.agent.env.step(
-                    rng_action, env_state, action, self.agent.env_params
-                )
-                rewards.append(float(reward))
+                ant_returns_all = self._compute_batch_returns(ant_rewards, gamma, max_episode_length)
 
-                if done:
-                    break
+                paired_data = {
+                    "antagonist_values": ant_values[:, 0],
+                    "antagonist_returns": ant_returns_all[:, 0],
+                    "protagonist_returns": returns_all[:, 0],
+                    "regrets": ant_returns_all[:, 0] - returns_all[:, 0],
+                }
 
-            # Pad to max_length for consistent arrays
-            actual_length = len(values)
-            values = values + [np.nan] * (max_episode_length - len(values))
-            rewards = rewards + [0.0] * (max_episode_length - len(rewards))
+                if _wandb_active:
+                    wandb.log({
+                        "value_calibration/antagonist_mean_return": float(ant_returns_all[:, 0].mean()),
+                        "value_calibration/mean_regret": float(paired_data["regrets"].mean()),
+                    })
+            else:
+                paired_data = {
+                    "antagonist_values": np.zeros(n_episodes),
+                    "antagonist_returns": np.zeros(n_episodes),
+                    "protagonist_returns": returns_all[:, 0],
+                    "regrets": np.zeros(n_episodes),
+                }
 
-            values = np.array(values)
-            rewards = np.array(rewards)
-
-            # Compute returns from each timestep
-            returns_from_t = self._compute_returns_from_timestep(
-                rewards, gamma, max_episode_length
-            )
-
-            # Collect at specified timesteps
-            for t in timesteps:
-                if t < actual_length:
-                    values_by_timestep[t].append(values[t])
-                    returns_by_timestep[t].append(returns_from_t[t])
-
-            # Episode-level data
-            episode_data["initial_values"].append(values[0])
-            episode_data["final_returns"].append(returns_from_t[0])
-            episode_data["branches"].append(branch)
-            episode_data["difficulties"].append(wall_density)
-            episode_data["solved"].append(float(rewards[actual_length - 1]) > 0 if actual_length > 0 else False)
-            episode_data["episode_lengths"].append(actual_length)
-            episode_data["values_over_time"].append(values)
-            episode_data["rewards_over_time"].append(rewards)
-            episode_data["goal_distances"].append(goal_distance)
-
-            # PAIRED-specific: collect antagonist data and compute regret
-            if paired_data is not None:
-                rng, ant_rng = jax.random.split(rng)
-                ant_result = self._run_antagonist_episode(ant_rng, level, gamma, max_episode_length)
-                paired_data["antagonist_values"].append(ant_result["initial_value"])
-                paired_data["antagonist_returns"].append(ant_result["final_return"])
-                paired_data["protagonist_returns"].append(returns_from_t[0])
-                # Regret = antagonist return - protagonist return
-                regret = ant_result["final_return"] - returns_from_t[0]
-                paired_data["regrets"].append(regret)
-
-        # Convert to arrays
-        values_by_timestep = {t: np.array(v) for t, v in values_by_timestep.items()}
-        returns_by_timestep = {t: np.array(r) for t, r in returns_by_timestep.items()}
-        episode_data = {k: np.array(v) for k, v in episode_data.items()}
-
+        # --- 8. Assemble result ---
         result = {
             "values_by_timestep": values_by_timestep,
             "returns_by_timestep": returns_by_timestep,
@@ -210,11 +231,14 @@ class ValueCalibrationExperiment(CheckpointExperiment):
             "timesteps": timesteps,
             "n_episodes": n_episodes,
             "gamma": gamma,
+            "timings": timings,
         }
 
-        # Add PAIRED-specific data
         if paired_data is not None:
-            result["paired_data"] = {k: np.array(v) for k, v in paired_data.items()}
+            result["paired_data"] = paired_data
+
+        total_time = sum(timings.values())
+        _log("total", total_time, f"TOTAL collect_data: {total_time:.2f}s | breakdown: {timings}")
 
         return result
 
@@ -234,67 +258,28 @@ class ValueCalibrationExperiment(CheckpointExperiment):
 
         return returns
 
-    def _run_antagonist_episode(
+    def _compute_batch_returns(
         self,
-        rng: chex.PRNGKey,
-        level,
+        rewards: np.ndarray,
         gamma: float,
-        max_episode_length: int,
-    ) -> Dict[str, float]:
-        """Run antagonist episode and collect value/return data (PAIRED bilateral)."""
-        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+        max_length: int,
+    ) -> np.ndarray:
+        """Compute discounted returns from each timestep for all episodes.
 
-        if ant_train_state is None:
-            return {
-                "initial_value": 0.0,
-                "final_return": 0.0,
-            }
+        Args:
+            rewards: (n_episodes, max_length)
+            gamma: Discount factor.
+            max_length: Max episode length.
 
-        rng, rng_reset = jax.random.split(rng)
-
-        # Reset environment
-        obs, env_state = self.agent.env.reset_to_level(
-            rng_reset, level, self.agent.env_params
-        )
-
-        # Initialize antagonist hidden state
-        hstate = self.agent.initialize_hidden_state(1)
-
-        values = []
-        rewards = []
-
-        for step in range(max_episode_length):
-            rng, rng_action = jax.random.split(rng)
-
-            # Get value prediction from antagonist
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-            done_batch = jnp.array([[False]])
-            hstate, pi, value = ant_train_state.apply_fn(
-                ant_train_state.params, (obs_batch, done_batch), hstate
-            )
-            v = float(value[0, 0])
-            values.append(v)
-
-            # Step environment
-            action = pi.sample(seed=rng_action)[0, 0]
-            obs, env_state, reward, done, _ = self.agent.env.step(
-                rng_action, env_state, action, self.agent.env_params
-            )
-            rewards.append(float(reward))
-
-            if done:
-                break
-
-        # Compute return
-        rewards = np.array(rewards)
-        final_return = 0.0
-        for r in reversed(rewards):
-            final_return = r + gamma * final_return
-
-        return {
-            "initial_value": values[0] if values else 0.0,
-            "final_return": final_return,
-        }
+        Returns:
+            returns: (n_episodes, max_length) — G_t for each timestep.
+        """
+        returns = np.zeros_like(rewards)
+        running = np.zeros(rewards.shape[0])
+        for t in range(max_length - 1, -1, -1):
+            running = rewards[:, t] + gamma * running
+            returns[:, t] = running
+        return returns
 
     def analyze(self) -> Dict[str, Any]:
         """Compute calibration metrics."""

@@ -306,8 +306,8 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
 
             # Also compute value error as secondary metric
             obs = create_observation_from_level(level)
-            hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
+            hstate = self.agent.initialize_hidden_state(1)
+            obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
             done_batch = jnp.zeros((1, 1), dtype=bool)
 
             # Get value estimate (works for all agent types)
@@ -368,8 +368,8 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
             from .utils.agent_aware_loss import create_observation_from_level
 
             obs = create_observation_from_level(level)
-            hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
+            hstate = self.agent.initialize_hidden_state(1)
+            obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
             done_batch = jnp.zeros((1, 1), dtype=bool)
 
             outputs = ant_train_state.apply_fn(

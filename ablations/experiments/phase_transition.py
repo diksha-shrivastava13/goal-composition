@@ -135,6 +135,21 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
         # Compute actual prediction/probe loss
         prediction_loss = self._compute_prediction_loss()
 
+        # Estimate Fisher information from gradient samples (every 5th collection)
+        fisher_mean = 0.0
+        fisher_rank = 0.0
+        if step % (self.collection_interval * 5) == 0 and hasattr(self, '_last_gradient_samples'):
+            try:
+                grads = np.array(self._last_gradient_samples)
+                if grads.ndim == 2 and grads.shape[0] >= 2:
+                    fisher_result = estimate_fisher_information(grads)
+                    fisher_mean = fisher_result['mean_fisher']
+                    fisher_rank = fisher_result['effective_rank']
+                    # Snapshot for trajectory analysis in analyze()
+                    self._data.gradient_samples.append(self._last_gradient_samples.copy())
+            except Exception:
+                pass
+
         # Store data
         self._data.steps.append(step)
         self._data.training_losses.append(float(training_loss))
@@ -147,10 +162,20 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
         self._data.hidden_state_norms.append(float(hidden_norm))
         self._data.prediction_losses.append(float(prediction_loss))
 
+        # Store gradient norm as a 1-element sample for Fisher estimation
+        if grad_norm > 0:
+            if not hasattr(self, '_last_gradient_samples'):
+                self._last_gradient_samples = []
+            self._last_gradient_samples.append([float(grad_norm)])
+            # Keep last N samples
+            self._last_gradient_samples = self._last_gradient_samples[-self.n_gradient_samples:]
+
         return {
             'phase_transition/effective_dim': effective_dim,
             'phase_transition/hidden_norm': hidden_norm,
             'phase_transition/prediction_loss': prediction_loss,
+            'phase_transition/fisher_mean': fisher_mean,
+            'phase_transition/fisher_rank': fisher_rank,
         }
 
     def _estimate_representation_metrics(self) -> Tuple[float, float]:
@@ -180,10 +205,10 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
 
                 # Get hidden state
                 rng, h_rng = jax.random.split(rng)
-                hstate = self.agent.initialize_carry(h_rng, batch_dims=(1,))
+                hstate = self.agent.initialize_hidden_state(1)
 
                 # Forward pass
-                obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
+                obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
                 done_batch = jnp.zeros((1, 1), dtype=bool)
 
                 new_hstate, _, _ = self.train_state.apply_fn(
@@ -304,7 +329,7 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
 
         results = {}
 
-        # 1. Loss dynamics
+        # 1. Loss dynamics (now includes curvature)
         results['loss_dynamics'] = self._analyze_loss_dynamics(data)
 
         # 2. Representation dynamics
@@ -316,7 +341,31 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
         # 4. Correlation between metrics
         results['metric_correlations'] = self._analyze_correlations(data)
 
-        # 5. Strong caveats
+        # 5. Fisher information trajectory (from training_hook collections)
+        if self._data.gradient_samples:
+            grads = [np.array(g) for g in self._data.gradient_samples if len(g) >= 2]
+            if grads:
+                fisher_trajectory = []
+                for g in grads:
+                    g_arr = np.array(g)
+                    if g_arr.ndim == 2 and g_arr.shape[0] >= 2:
+                        try:
+                            fi = estimate_fisher_information(g_arr)
+                            fisher_trajectory.append({
+                                'mean_fisher': fi['mean_fisher'],
+                                'effective_rank': fi['effective_rank'],
+                            })
+                        except Exception:
+                            pass
+                if fisher_trajectory:
+                    results['fisher_trajectory'] = {
+                        'mean_fisher_values': [f['mean_fisher'] for f in fisher_trajectory],
+                        'effective_rank_values': [f['effective_rank'] for f in fisher_trajectory],
+                        'final_mean_fisher': fisher_trajectory[-1]['mean_fisher'],
+                        'final_effective_rank': fisher_trajectory[-1]['effective_rank'],
+                    }
+
+        # 6. Strong caveats
         results['caveats'] = self._get_caveats()
 
         self._results = results
@@ -341,6 +390,17 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
         early_idx = n_total // 3
         late_idx = 2 * n_total // 3
 
+        # Loss curvature (second derivative proxy)
+        curvature_result = {}
+        if len(steps) >= 10:
+            curvatures = compute_loss_curvature(loss, steps, window=max(5, len(steps) // 10))
+            curvature_result = {
+                'mean_curvature': float(np.mean(curvatures)),
+                'max_curvature': float(np.max(np.abs(curvatures))),
+                'curvature_variance': float(np.var(curvatures)),
+                'high_curvature_steps': int(np.sum(np.abs(curvatures) > 2 * np.std(curvatures))),
+            }
+
         return {
             'early_loss': float(np.mean(loss[:early_idx])),
             'mid_loss': float(np.mean(loss[early_idx:late_idx])),
@@ -349,6 +409,7 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
             'final_loss': float(loss[-1]) if len(loss) > 0 else 0.0,
             'smoothed_loss': loss_smooth.tolist(),
             'smoothed_steps': steps_smooth.tolist(),
+            **curvature_result,
         }
 
     def _analyze_representation_dynamics(self, data: Dict[str, np.ndarray]) -> Dict[str, Any]:

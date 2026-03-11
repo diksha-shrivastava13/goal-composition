@@ -38,9 +38,8 @@ def compute_saliency_map(
 
     def value_fn(image, agent_dir, hstate):
         """Compute value from inputs."""
-        # Reconstruct observation
-        obs_dict = type(obs)(image=image, agent_dir=agent_dir)
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs_dict)
+        # Reconstruct observation with batch dims
+        obs_batch = type(obs)(image[None, None, ...], agent_dir[None, None, ...])
         done_batch = jnp.zeros((1, 1), dtype=bool)
 
         _, _, value = apply_fn(params, (obs_batch, done_batch), hstate)
@@ -48,8 +47,7 @@ def compute_saliency_map(
 
     def action_entropy_fn(image, agent_dir, hstate):
         """Compute policy entropy from inputs."""
-        obs_dict = type(obs)(image=image, agent_dir=agent_dir)
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs_dict)
+        obs_batch = type(obs)(image[None, None, ...], agent_dir[None, None, ...])
         done_batch = jnp.zeros((1, 1), dtype=bool)
 
         _, pi, _ = apply_fn(params, (obs_batch, done_batch), hstate)

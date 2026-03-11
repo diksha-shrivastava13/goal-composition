@@ -60,7 +60,7 @@ class DRCoverageExperiment(CheckpointExperiment):
 
     def __init__(
         self,
-        n_levels: int = 500,
+        n_levels: int = 1000,
         n_grid_bins: int = 10,
         feature_names: List[str] = None,
         **kwargs,
@@ -83,79 +83,125 @@ class DRCoverageExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> CoverageData:
         """
-        Collect DR-sampled levels and their features.
+        Collect DR-sampled levels and their features (GPU-batched).
         """
+        import time
+        import logging
+        from tqdm import tqdm
+        from .utils.batched_rollout import batched_rollout
+
+        logger = logging.getLogger(__name__)
+        timings = {}
+
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
         self._data = CoverageData()
 
-        for i in range(self.n_levels):
-            rng, level_rng, ep_rng, loss_rng = jax.random.split(rng, 4)
+        # --- 1. Generate all levels in batch ---
+        _log("generate_levels", msg="Generating levels...")
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, self.n_levels)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log("generate_levels", time.time() - t0, "Level generation complete")
 
-            # Generate random level (DR style)
-            level = self._generate_random_level(level_rng)
+        # --- 2. Extract CPU-side level properties ---
+        _log("cpu_level_properties", msg="Computing level properties...")
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)
+        goal_positions = np.array(levels.goal_pos)
+        agent_positions = np.array(levels.agent_pos)
 
-            # Extract features
-            wall_density = level.get('wall_density', 0.0)
-            goal_pos = level.get('goal_pos', (6, 6))
-            agent_pos = level.get('agent_pos', (1, 1))
-            goal_distance = np.sqrt(
-                (goal_pos[0] - agent_pos[0])**2 +
-                (goal_pos[1] - agent_pos[1])**2
-            )
-            path_length = self._compute_path_length(level)
-            is_solvable = path_length > 0
+        wall_density = wall_maps.mean(axis=(1, 2))
+        goal_distance = np.sqrt(np.sum((goal_positions - agent_positions) ** 2, axis=-1))
 
-            # Run episode
-            result = self._run_episode(ep_rng, level)
+        path_lengths = np.array([
+            self._compute_path_length({
+                'wall_map': wall_maps[i],
+                'agent_pos': tuple(agent_positions[i]),
+                'goal_pos': tuple(goal_positions[i]),
+            })
+            for i in tqdm(range(self.n_levels), desc="BFS path lengths", leave=False)
+        ])
+        is_solvable = path_lengths > 0
+        _log("cpu_level_properties", time.time() - t0, "Level properties complete")
 
-            # Compute prediction loss
-            from .utils.agent_aware_loss import compute_agent_prediction_loss
+        # --- 3. Batched rollout ---
+        _log("batched_rollout", msg="Running batched rollout...")
+        t0 = time.time()
+        rng, rng_rollout = jax.random.split(rng)
+        n_levels = self.n_levels
+        max_steps = 256
+        result = batched_rollout(
+            rng_rollout, levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_levels),
+            collect_rewards=True,
+        )
+        _log("batched_rollout", time.time() - t0, "Batched rollout complete")
+
+        # --- 4. Compute prediction losses ---
+        _log("prediction_losses", msg="Computing prediction losses...")
+        t0 = time.time()
+        from .utils.agent_aware_loss import compute_agent_prediction_loss
+        prediction_losses = []
+        for i in tqdm(range(self.n_levels), desc="Prediction losses", leave=False):
+            rng, loss_rng = jax.random.split(rng)
+            level_i = jax.tree_util.tree_map(lambda x: x[i], levels)
             pred_loss, _ = compute_agent_prediction_loss(
-                self.agent, self.train_state, level, loss_rng
+                self.agent, self.train_state, level_i, loss_rng
             )
+            prediction_losses.append(pred_loss)
+        _log("prediction_losses", time.time() - t0, "Prediction losses complete")
 
-            # Store data
-            self._data.wall_densities.append(wall_density)
-            self._data.goal_distances.append(goal_distance)
-            self._data.path_lengths.append(path_length)
-            self._data.is_solvable.append(is_solvable)
-            self._data.episode_returns.append(result.get('total_return', 0.0))
-            self._data.episode_solved.append(result.get('solved', False))
-            self._data.prediction_losses.append(pred_loss)
+        # --- 5. Assemble data ---
+        self._data.wall_densities = wall_density.tolist()
+        self._data.goal_distances = goal_distance.tolist()
+        self._data.path_lengths = path_lengths.tolist()
+        self._data.is_solvable = is_solvable.tolist()
+        self._data.episode_returns = result.episode_returns.tolist()
+        self._data.episode_solved = result.episode_solved.tolist()
+        self._data.prediction_losses = prediction_losses
 
-            # Feature vector for coverage analysis
-            # Normalize features to [0, 1]
-            norm_density = wall_density
-            norm_distance = min(goal_distance / 18.0, 1.0)  # Max ~18 for 13x13
-            self._data.feature_vectors.append(np.array([norm_density, norm_distance]))
+        # Feature vectors for coverage analysis (normalized)
+        norm_density = wall_density
+        norm_distance = np.minimum(goal_distance / 18.0, 1.0)
+        self._data.feature_vectors = [
+            np.array([norm_density[i], norm_distance[i]])
+            for i in range(self.n_levels)
+        ]
+
+        if _wandb_active:
+            wandb.log({
+                f"{self.name}/mean_return": float(result.episode_returns.mean()),
+                f"{self.name}/solve_rate": float(result.episode_solved.mean()),
+            })
+
+        total_time = sum(timings.values())
+        _log("total", total_time, f"TOTAL collect_data: {total_time:.2f}s | breakdown: {timings}")
 
         return self._data
-
-    def _generate_random_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a random level (DR style)."""
-        height, width = 13, 13
-
-        # Uniform random wall density
-        wall_prob = float(jax.random.uniform(rng)) * 0.4  # 0 to 0.4
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
 
     def _compute_path_length(self, level: Dict[str, Any]) -> int:
         """Compute BFS path length."""
@@ -184,77 +230,6 @@ class DRCoverageExperiment(CheckpointExperiment):
                     queue.append(((nx, ny), dist + 1))
 
         return -1  # Unsolvable
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Run episode on level."""
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        total_return = 0.0
-        solved = False
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            hstate, pi, value = self._forward_step(obs, hstate)
-            action = pi.sample(seed=step_rng)
-
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        return {
-            'total_return': total_return,
-            'solved': solved,
-            'n_steps': step + 1,
-        }
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def analyze(self) -> Dict[str, Any]:
         """

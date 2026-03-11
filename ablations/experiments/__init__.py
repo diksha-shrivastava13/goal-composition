@@ -163,7 +163,7 @@ def get_experiment_by_name(name: str):
     """Get experiment class by name.
 
     Delegates to get_experiment_class which has the complete registry
-    of all 36 experiments (14 universal + 22 PAIRED-specific).
+    of all 38 experiments (16 universal + 22 PAIRED-specific).
     """
     return get_experiment_class(name)
 

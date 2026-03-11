@@ -199,311 +199,127 @@ class CausalInterventionExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, InterventionResult]:
         """
-        Collect data under each intervention condition.
+        Collect data under each intervention condition (GPU-batched).
 
         Returns dict mapping intervention type to results.
         """
+        import time
+        import logging
+        from tqdm import tqdm
+        from .utils.batched_rollout import batched_rollout
+
+        logger = logging.getLogger(__name__)
+        timings = {}
+
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
         results = {}
+        n_eps = self.n_episodes_per_intervention
+        max_steps = 256
 
-        for intervention in self.interventions:
-            rng, int_rng = jax.random.split(rng)
+        for intervention in tqdm(self.interventions, desc="Interventions"):
+            _log(f"intervention_{intervention.value}", msg=f"Running {intervention.value}...")
+            t0 = time.time()
 
-            result = self._run_intervention(int_rng, intervention)
-            results[intervention] = result
+            # Generate levels for this intervention
+            rng, rng_levels = jax.random.split(rng)
+            level_rngs = jax.random.split(rng_levels, n_eps)
+            levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+            jax.block_until_ready(levels)
 
+            # Batched rollout
+            rng, rng_rollout = jax.random.split(rng)
+            result = batched_rollout(
+                rng_rollout, levels, max_steps,
+                self.train_state.apply_fn, self.train_state.params,
+                self.agent.env, self.agent.env_params,
+                self.agent.initialize_hidden_state(n_eps),
+                collect_values=True, collect_entropies=True,
+                collection_steps=[-1],
+            )
+
+            # Extract hidden states from terminal hstates
+            hidden_states = result.hstates_by_step["-1"]
+
+            # Compute per-episode mean values and entropies
+            value_estimates = []
+            policy_entropies = []
+            for i in range(n_eps):
+                ep_len = int(result.episode_lengths[i])
+                v_vals = result.values[i, :ep_len]
+                e_vals = result.entropies[i, :ep_len]
+                valid_v = v_vals[~np.isnan(v_vals)]
+                valid_e = e_vals[~np.isnan(e_vals)]
+                value_estimates.append(float(np.mean(valid_v)) if len(valid_v) > 0 else 0.0)
+                policy_entropies.append(float(np.mean(valid_e)) if len(valid_e) > 0 else 0.0)
+
+            # Compute prediction losses
+            from .utils.agent_aware_loss import compute_agent_prediction_loss
+            prediction_losses = []
+            for i in tqdm(range(n_eps), desc=f"Pred losses ({intervention.value})", leave=False):
+                rng, loss_rng = jax.random.split(rng)
+                level_i = jax.tree_util.tree_map(lambda x: x[i], levels)
+                try:
+                    loss, _ = compute_agent_prediction_loss(
+                        self.agent, self.train_state, level_i, loss_rng
+                    )
+                    prediction_losses.append(loss)
+                except Exception:
+                    prediction_losses.append(1.0)
+
+            int_result = InterventionResult(
+                intervention_type=intervention,
+                n_episodes=n_eps,
+                solve_rate=float(result.episode_solved.mean()),
+                mean_return=float(result.episode_returns.mean()),
+                mean_steps=float(result.episode_lengths.mean()),
+                hidden_states=hidden_states,
+                value_estimates=value_estimates,
+                policy_entropies=policy_entropies,
+                prediction_losses=prediction_losses,
+            )
+
+            results[intervention] = int_result
             if intervention == InterventionType.NORMAL:
-                self._baseline_result = result
+                self._baseline_result = int_result
+
+            elapsed = time.time() - t0
+            _log(f"intervention_{intervention.value}", elapsed,
+                 f"{intervention.value}: solve_rate={int_result.solve_rate:.3f}, "
+                 f"mean_return={int_result.mean_return:.3f}")
 
         self._intervention_results = results
+
+        if _wandb_active:
+            for int_type, res in results.items():
+                wandb.log({
+                    f"{self.name}/{int_type.value}/solve_rate": res.solve_rate,
+                    f"{self.name}/{int_type.value}/mean_return": res.mean_return,
+                })
+
+        total_time = sum(timings.values())
+        _log("total", total_time, f"TOTAL collect_data: {total_time:.2f}s")
+
         return results
-
-    def _run_intervention(
-        self,
-        rng: chex.PRNGKey,
-        intervention: InterventionType,
-    ) -> InterventionResult:
-        """Run episodes under a specific intervention."""
-        all_hidden_states = []
-        all_values = []
-        all_entropies = []
-        all_solved = []
-        all_returns = []
-        all_steps = []
-        all_prediction_losses = []
-
-        for ep_idx in range(self.n_episodes_per_intervention):
-            self._current_episode_idx = ep_idx  # For progressive difficulty
-            rng, ep_rng, level_rng, loss_rng = jax.random.split(rng, 4)
-
-            # Generate level according to intervention
-            level = self._generate_level_for_intervention(level_rng, intervention)
-
-            # Run episode
-            result = self._run_episode(ep_rng, level)
-
-            # Collect metrics
-            h_c, h_h = result['final_hstate']
-            hidden_flat = np.concatenate([
-                np.array(h_c).flatten(),
-                np.array(h_h).flatten()
-            ])
-            all_hidden_states.append(hidden_flat)
-            all_values.append(result.get('mean_value', 0.0))
-            all_entropies.append(result.get('mean_entropy', 0.0))
-            all_solved.append(result['solved'])
-            all_returns.append(result['total_return'])
-            all_steps.append(result['n_steps'])
-
-            # Compute prediction loss for this episode
-            pred_loss = self._compute_episode_prediction_loss(loss_rng, level)
-            all_prediction_losses.append(pred_loss)
-
-        return InterventionResult(
-            intervention_type=intervention,
-            n_episodes=self.n_episodes_per_intervention,
-            solve_rate=float(np.mean(all_solved)),
-            mean_return=float(np.mean(all_returns)),
-            mean_steps=float(np.mean(all_steps)),
-            hidden_states=np.stack(all_hidden_states),
-            value_estimates=all_values,
-            policy_entropies=all_entropies,
-            prediction_losses=all_prediction_losses,
-        )
-
-    def _compute_episode_prediction_loss(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-    ) -> float:
-        """
-        Compute actual prediction/probe loss for an episode's level.
-
-        Uses agent-aware loss computation.
-        """
-        try:
-            from .utils.agent_aware_loss import compute_agent_prediction_loss
-
-            loss, _ = compute_agent_prediction_loss(
-                self.agent,
-                self.train_state,
-                level,
-                rng,
-            )
-            return loss
-        except Exception:
-            return 1.0  # Default max loss on error
-
-    def _generate_level_for_intervention(
-        self,
-        rng: chex.PRNGKey,
-        intervention: InterventionType,
-    ) -> Dict[str, Any]:
-        """Generate a level according to intervention constraints."""
-        height, width = 13, 13
-
-        # Default parameters
-        wall_prob = 0.15
-
-        # ===== Universal interventions =====
-        if intervention == InterventionType.NORMAL:
-            wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-
-        elif intervention == InterventionType.ONLY_EASY:
-            wall_prob = 0.05 + float(jax.random.uniform(rng)) * 0.1
-
-        elif intervention == InterventionType.ONLY_HARD:
-            wall_prob = 0.25 + float(jax.random.uniform(rng)) * 0.1
-
-        elif intervention == InterventionType.HIGH_WALL_DENSITY:
-            wall_prob = 0.3 + float(jax.random.uniform(rng)) * 0.1
-
-        elif intervention == InterventionType.LOW_WALL_DENSITY:
-            wall_prob = 0.02 + float(jax.random.uniform(rng)) * 0.05
-
-        # ===== ACCEL-specific interventions =====
-        elif intervention == InterventionType.DR_ONLY:
-            wall_prob = float(jax.random.uniform(rng)) * 0.3
-
-        elif intervention == InterventionType.NO_MUTATION:
-            wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.15
-
-        elif intervention == InterventionType.ALL_REPLAY:
-            wall_prob = 0.15 + float(jax.random.uniform(rng)) * 0.1
-
-        # ===== PAIRED-specific interventions =====
-        elif intervention == InterventionType.NO_ADVERSARY:
-            # Random level generation (no adversarial structure)
-            wall_prob = float(jax.random.uniform(rng)) * 0.3
-
-        elif intervention == InterventionType.EASY_ADVERSARY:
-            # Constrained adversary: low difficulty
-            wall_prob = 0.05 + float(jax.random.uniform(rng)) * 0.1
-
-        elif intervention == InterventionType.HARD_ADVERSARY:
-            # Constrained adversary: high difficulty
-            wall_prob = 0.25 + float(jax.random.uniform(rng)) * 0.15
-
-        elif intervention == InterventionType.FROZEN_ADVERSARY:
-            # Fixed adversary behavior (similar difficulty each time)
-            wall_prob = 0.15  # Fixed, no randomness
-
-        # ===== DR-specific interventions =====
-        elif intervention == InterventionType.FIXED_DIFFICULTY:
-            # Fixed moderate difficulty
-            wall_prob = 0.15
-
-        elif intervention == InterventionType.PROGRESSIVE_DIFFICULTY:
-            # Linearly increase difficulty over episodes
-            progress = self._current_episode_idx / max(self.n_episodes_per_intervention, 1)
-            wall_prob = 0.05 + progress * 0.25  # 0.05 -> 0.30
-
-        elif intervention == InterventionType.CLUSTERED_SAMPLING:
-            # Sample from discrete difficulty clusters
-            cluster = int(jax.random.randint(rng, (), 0, 3))
-            wall_prob = [0.08, 0.18, 0.28][cluster]
-
-        # Generate level
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-
-        # Goal/agent placement varies by intervention
-        if intervention in [InterventionType.HARD_ADVERSARY, InterventionType.ONLY_HARD]:
-            # Place goal and agent far apart
-            goal_pos = (
-                int(jax.random.randint(rng_goal, (), height - 4, height - 1)),
-                int(jax.random.randint(rng_goal, (), width - 4, width - 1)),
-            )
-            agent_pos = (
-                int(jax.random.randint(rng_agent, (), 1, 4)),
-                int(jax.random.randint(rng_agent, (), 1, 4)),
-            )
-        elif intervention in [InterventionType.EASY_ADVERSARY, InterventionType.ONLY_EASY]:
-            # Place goal and agent close together
-            goal_pos = (
-                int(jax.random.randint(rng_goal, (), 5, 8)),
-                int(jax.random.randint(rng_goal, (), 5, 8)),
-            )
-            agent_y = goal_pos[0] + int(jax.random.randint(rng_agent, (), -2, 3))
-            agent_x = goal_pos[1] + int(jax.random.randint(rng_agent, (), -2, 3))
-            agent_pos = (
-                int(np.clip(agent_y, 1, height - 2)),
-                int(np.clip(agent_x, 1, width - 2)),
-            )
-        else:
-            # Random placement
-            goal_pos = (
-                int(jax.random.randint(rng_goal, (), 1, height - 1)),
-                int(jax.random.randint(rng_goal, (), 1, width - 1)),
-            )
-            agent_pos = (
-                int(jax.random.randint(rng_agent, (), 1, height - 1)),
-                int(jax.random.randint(rng_agent, (), 1, width - 1)),
-            )
-
-        level = {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'intervention': intervention.value,
-        }
-
-        # Add branch info only for methods that use it
-        if self.has_branches:
-            if intervention == InterventionType.DR_ONLY:
-                level['branch'] = 0
-            elif intervention == InterventionType.ALL_REPLAY:
-                level['branch'] = 1
-            elif intervention == InterventionType.NO_MUTATION:
-                level['branch'] = int(jax.random.randint(rng, (), 0, 2))
-            else:
-                level['branch'] = int(jax.random.randint(rng, (), 0, self.branch_count))
-
-        return level
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Run a single episode."""
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        total_return = 0.0
-        solved = False
-        values = []
-        entropies = []
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            new_hstate, pi, value = self._forward_step(obs, hstate)
-
-            values.append(float(value[0, 0]))
-            entropies.append(float(pi.entropy()[0, 0]))
-
-            action = pi.sample(seed=step_rng)
-            hstate = new_hstate
-
-            # Simulate step
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_density'])
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        return {
-            'total_return': total_return,
-            'solved': solved,
-            'final_hstate': hstate,
-            'n_steps': step + 1,
-            'mean_value': float(np.mean(values)),
-            'mean_entropy': float(np.mean(entropies)),
-        }
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def analyze(self) -> Dict[str, Any]:
         """

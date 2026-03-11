@@ -17,6 +17,13 @@ from jaxued.environments.maze import Level, make_level_generator, make_level_mut
 from jaxued.level_sampler import LevelSampler
 from jaxued.wrappers import AutoReplayWrapper
 
+# Patch Level to support dict-style access (level['wall_map'], 'wall_map' in level, level.get(...))
+# Many experiment files use dict-style access but Level is a flax struct.
+if not hasattr(Level, '__getitem__'):
+    Level.__getitem__ = lambda self, key: getattr(self, key)
+    Level.__contains__ = lambda self, key: hasattr(self, key)
+    Level.get = lambda self, key, default=None: getattr(self, key, default)
+
 
 def setup_environment(
     max_height: int = 13,
