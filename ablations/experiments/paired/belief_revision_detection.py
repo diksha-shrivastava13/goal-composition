@@ -12,6 +12,13 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_hstates,
+    get_values_from_rollout,
+    get_action_distribution,
+)
 
 
 @dataclass
@@ -73,59 +80,53 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
         return self._trajectory_data
 
     def _collect_step_data(self, rng: chex.PRNGKey, step: int) -> Dict[str, Any]:
-        """Collect data for a single step."""
-        hstates = []
-        values = []
-        policy_logits = []
+        """Collect data for a single step using real network evaluations."""
+        rng, level_rng, h_rng, val_rng, act_rng = jax.random.split(rng, 5)
 
-        # Simulate adversary features with occasional spikes (revision triggers)
-        base_difficulty = 0.3 + 0.3 * (step / self.trajectory_length)
+        # Generate real levels for this step
+        levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
 
-        # Add occasional curriculum shifts (potential revision triggers)
-        if step % 30 == 15:  # Spike every 30 steps
-            difficulty_spike = 0.2
-        else:
-            difficulty_spike = 0.0
+        # Extract level features to characterize adversary context
+        batch_features = extract_level_features_batch(levels)
+        mean_wall_density = float(batch_features['wall_density'].mean())
+        mean_goal_distance = float(batch_features['goal_distance'].mean())
+
+        # Detect level type shifts by comparing current wall density distribution
+        # to expected baseline (no artificial spike injection)
+        wall_density_std = float(batch_features['wall_density'].std())
+        level_type_shift = wall_density_std > 0.15  # High variance indicates mixed types
 
         adversary_features = {
-            'difficulty': base_difficulty + difficulty_spike + float(jax.random.uniform(rng)) * 0.05,
-            'level_type_shift': difficulty_spike > 0.1,
-            'wall_density': 0.15 + 0.1 * (step / self.trajectory_length) + difficulty_spike * 0.2,
+            'difficulty': mean_wall_density + mean_goal_distance * 0.1,
+            'level_type_shift': level_type_shift,
+            'wall_density': mean_wall_density,
         }
 
-        for i in range(self.n_samples_per_step):
-            rng, h_rng, v_rng, p_rng = jax.random.split(rng, 4)
+        # Get real protagonist hidden states
+        hstates = get_pro_hstates(h_rng, levels, self)
 
-            # Sample hidden state
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-            # Add adversary-driven shift during spikes
-            if difficulty_spike > 0.1:
-                h[:100] += difficulty_spike * 5.0
-            hstates.append(h)
+        # Get real value estimates
+        value_matrix = get_values_from_rollout(
+            self.train_state, self.agent, levels, val_rng
+        )
+        values = value_matrix.mean(axis=1)  # Per-level mean value
 
-            # Sample value (changes during revision events)
-            value = 0.7 - adversary_features['difficulty'] * 0.4
-            if difficulty_spike > 0.1:
-                value -= 0.1  # Value drops during revision
-            value += float(jax.random.uniform(v_rng)) * 0.1
-            values.append(value)
-
-            # Sample policy logits (4 actions)
-            base_logits = np.array([0.0, 0.0, 0.0, 0.0])
-            if difficulty_spike > 0.1:
-                # More uniform policy during revision
-                base_logits += np.array([0.5, 0.5, 0.5, 0.5])
-            logits = base_logits + np.array(jax.random.normal(p_rng, (4,))) * 0.5
-            policy_logits.append(logits)
+        # Get real policy logits and entropies
+        logits_matrix, entropy_matrix = get_action_distribution(
+            self.train_state, self.agent, levels, act_rng
+        )
+        # Mean logits across timesteps per level, then mean across levels
+        policy_logits_mean = logits_matrix.mean(axis=1).mean(axis=0)  # (n_actions,)
+        mean_entropy = float(entropy_matrix.mean())
 
         return {
             'step': step,
-            'hstate_mean': np.mean(hstates, axis=0),
-            'hstate_std': np.std(hstates, axis=0),
-            'value_mean': float(np.mean(values)),
-            'value_std': float(np.std(values)),
-            'policy_logits_mean': np.mean(policy_logits, axis=0),
-            'policy_entropy': float(self._compute_entropy(np.mean(policy_logits, axis=0))),
+            'hstate_mean': hstates.mean(axis=0),
+            'hstate_std': hstates.std(axis=0),
+            'value_mean': float(values.mean()),
+            'value_std': float(values.std()),
+            'policy_logits_mean': policy_logits_mean,
+            'policy_entropy': mean_entropy,
             'adversary_features': adversary_features,
         }
 

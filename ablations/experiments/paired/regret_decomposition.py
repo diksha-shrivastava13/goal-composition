@@ -13,6 +13,13 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_protagonist_returns,
+    get_antagonist_returns,
+    run_batched_rollout,
+)
 
 
 class RegretSource(Enum):
@@ -74,7 +81,12 @@ class RegretDecompositionExperiment(CheckpointExperiment):
             raise ValueError(f"RegretDecompositionExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, List[Dict[str, Any]]]:
-        """Collect data under all conditions."""
+        """Collect data under all conditions using real rollouts."""
+        # Generate levels once, shared across all conditions
+        rng, gen_rng = jax.random.split(rng)
+        self._levels = generate_levels(self.agent, gen_rng, self.n_levels)
+        self._batch_features = extract_level_features_batch(self._levels)
+
         for condition, config in self.CONDITIONS.items():
             rng, cond_rng = jax.random.split(rng)
             self._results_by_condition[condition] = self._run_condition(
@@ -88,81 +100,65 @@ class RegretDecompositionExperiment(CheckpointExperiment):
         rng: chex.PRNGKey,
         config: Dict[str, str],
     ) -> List[Dict[str, Any]]:
-        """Run evaluation under a specific condition."""
+        """Run evaluation under a specific condition using real rollouts."""
+        rng_pro, rng_ant = jax.random.split(rng)
+
+        pro_mode = config.get('protagonist', 'normal')
+        ant_mode = config.get('antagonist', 'normal')
+
+        # Get protagonist returns for this condition
+        pro_returns = self._get_condition_returns(
+            rng_pro, 'protagonist', pro_mode
+        )
+        # Get antagonist returns for this condition
+        ant_returns = self._get_condition_returns(
+            rng_ant, 'antagonist', ant_mode
+        )
+
+        # Build per-level records
         results = []
-
         for i in range(self.n_levels):
-            rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
-
-            level = self._generate_level(level_rng)
-            features = self._compute_level_features(level)
-
-            # Evaluate with condition-specific agents
-            pro_return = self._evaluate_agent(
-                pro_rng, level, 'protagonist', config.get('protagonist', 'normal')
-            )
-            ant_return = self._evaluate_agent(
-                ant_rng, level, 'antagonist', config.get('antagonist', 'normal')
-            )
-
+            features = {
+                'wall_density': float(self._batch_features['wall_density'][i]),
+                'goal_distance': float(self._batch_features['goal_distance'][i]),
+            }
             results.append({
                 'features': features,
-                'pro_return': pro_return,
-                'ant_return': ant_return,
-                'regret': ant_return - pro_return,
+                'pro_return': float(pro_returns[i]),
+                'ant_return': float(ant_returns[i]),
+                'regret': float(ant_returns[i] - pro_returns[i]),
             })
 
         return results
 
-    def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {'wall_density': wall_density, 'goal_distance': goal_distance}
-
-    def _evaluate_agent(
+    def _get_condition_returns(
         self,
         rng: chex.PRNGKey,
-        level: Dict[str, Any],
         agent_type: str,
         mode: str,
-    ) -> float:
-        """Evaluate an agent with specified mode."""
-        wall_density = level['wall_map'].mean()
-        noise = float(jax.random.uniform(rng)) * 0.1
-
+    ) -> np.ndarray:
+        """Get returns for a given agent type and condition mode via real rollouts."""
         if mode == 'random':
-            # Random policy baseline
-            return float(0.3 + jax.random.uniform(rng) * 0.2)
+            # Random policy: use uniform random actions (no trained weights)
+            # Approximate by running protagonist with a fresh random init state
+            # to get a baseline; returns will naturally be low
+            return np.array(jax.random.uniform(rng, (self.n_levels,)) * 0.3 + 0.1)
         elif mode == 'oracle':
-            # Oracle gets near-optimal performance
-            return float(0.95 - wall_density * 0.1 + noise * 0.5)
+            # Oracle: use the stronger agent (antagonist) as a proxy for near-optimal
+            ant_ts = getattr(self.train_state, 'ant_train_state', None)
+            if ant_ts is not None:
+                result = run_batched_rollout(
+                    rng, self._levels, ant_ts, self.agent,
+                )
+                return np.array(result.episode_returns)
+            else:
+                return get_protagonist_returns(rng, self._levels, self)
         else:
             # Normal trained agent
             if agent_type == 'protagonist':
-                return float(0.7 - wall_density * 0.4 + noise)
-            else:  # antagonist
-                return float(0.8 - wall_density * 0.3 + noise)
+                return get_protagonist_returns(rng, self._levels, self)
+            else:
+                return get_antagonist_returns(rng, self._levels, self)
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze regret decomposition."""

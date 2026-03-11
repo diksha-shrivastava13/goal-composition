@@ -12,6 +12,10 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels, extract_level_features_batch, get_pro_hstates,
+    get_pro_ant_returns, levels_to_dicts, compute_bfs_path_length,
+)
 
 
 @dataclass
@@ -74,46 +78,75 @@ class CausalModelExtractionExperiment(CheckpointExperiment):
             raise ValueError(f"CausalModelExtractionExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
-        """Collect observational data for causal analysis."""
+        """Collect observational data for causal analysis using real network evaluations."""
+        rng, level_rng, hstate_rng, return_rng = jax.random.split(rng, 4)
+
+        # Generate real levels in batch
+        levels = generate_levels(self.agent, level_rng, self.n_samples)
+
+        # Get real hidden states from protagonist network
+        hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = hstates.shape[1]
+
+        # Get real returns
+        pro_returns, _, _ = get_pro_ant_returns(return_rng, levels, self)
+
+        # Extract real level features
+        features_batch = extract_level_features_batch(levels)
+
+        # Convert levels to dicts for BFS path length computation
+        level_dicts = levels_to_dicts(levels, self.n_samples)
+
         for i in range(self.n_samples):
-            rng, sample_rng = jax.random.split(rng)
-            data = self._collect_sample(sample_rng)
-            self._data.append(data)
+            wall_density = float(features_batch['wall_density'][i])
+            goal_distance = float(features_batch['goal_distance'][i])
+
+            # Compute derived causal variables from real level structure
+            bfs_length = compute_bfs_path_length(level_dicts[i])
+            optimal_steps = float(bfs_length) if bfs_length >= 0 else goal_distance * 2.0
+            path_difficulty = wall_density * 0.5 + goal_distance * 0.1
+            collision_risk = wall_density * 0.8
+            agent_pos = level_dicts[i]['agent_pos']
+            agent_position = float(np.sqrt(sum(x**2 for x in agent_pos)))
+
+            self._data.append({
+                'wall_density': wall_density,
+                'goal_distance': goal_distance,
+                'agent_position': agent_position,
+                'path_difficulty': path_difficulty,
+                'optimal_steps': optimal_steps,
+                'collision_risk': collision_risk,
+                'return': float(pro_returns[i]),
+                'hstate': hstates[i],
+            })
 
         return self._data
 
     def _collect_sample(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Collect a single sample with all variables."""
-        rng, f_rng, h_rng = jax.random.split(rng, 3)
-
-        # Generate observational data following causal structure
-        wall_density = 0.1 + float(jax.random.uniform(f_rng)) * 0.3
-        goal_distance = 2.0 + float(jax.random.uniform(f_rng)) * 10.0
-        agent_position = float(jax.random.uniform(f_rng)) * 5.0  # Distance from center
-
-        # Causal children
-        path_difficulty = wall_density * 0.5 + goal_distance * 0.1 + float(jax.random.normal(f_rng)) * 0.1
-        optimal_steps = path_difficulty * 5 + agent_position * 0.5 + float(jax.random.normal(f_rng)) * 2
-        collision_risk = wall_density * 0.8 + float(jax.random.uniform(f_rng)) * 0.1
-        returns = 1.0 - optimal_steps * 0.05 - collision_risk * 0.3 + float(jax.random.normal(f_rng)) * 0.1
-
-        # Hidden state (encodes causal structure if learned correctly)
-        h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-        # Add causal encoding
-        h[:30] += wall_density * 2.0  # Wall density encoding
-        h[30:60] += goal_distance * 0.3  # Goal distance encoding
-        h[60:90] += path_difficulty * 1.5  # Derived: path difficulty
-        h[90:120] += collision_risk * 2.0  # Derived: collision risk
-
+        """Return a random sample from already-collected data for intervention experiments."""
+        if self._data:
+            idx = int(jax.random.randint(rng, (), 0, len(self._data)))
+            return dict(self._data[idx])  # shallow copy so interventions don't mutate originals
+        # Fallback: generate a single real sample
+        rng, level_rng, h_rng, ret_rng = jax.random.split(rng, 4)
+        levels = generate_levels(self.agent, level_rng, 1)
+        hstates = get_pro_hstates(h_rng, levels, self)
+        pro_returns, _, _ = get_pro_ant_returns(ret_rng, levels, self)
+        features = extract_level_features_batch(levels)
+        level_dicts = levels_to_dicts(levels, 1)
+        bfs_length = compute_bfs_path_length(level_dicts[0])
+        wall_density = float(features['wall_density'][0])
+        goal_distance = float(features['goal_distance'][0])
+        agent_pos = level_dicts[0]['agent_pos']
         return {
             'wall_density': wall_density,
             'goal_distance': goal_distance,
-            'agent_position': agent_position,
-            'path_difficulty': path_difficulty,
-            'optimal_steps': optimal_steps,
-            'collision_risk': collision_risk,
-            'return': returns,
-            'hstate': h,
+            'agent_position': float(np.sqrt(sum(x**2 for x in agent_pos))),
+            'path_difficulty': wall_density * 0.5 + goal_distance * 0.1,
+            'optimal_steps': float(bfs_length) if bfs_length >= 0 else goal_distance * 2.0,
+            'collision_risk': wall_density * 0.8,
+            'return': float(pro_returns[0]),
+            'hstate': hstates[0],
         }
 
     def _extract_causal_graph(self) -> List[CausalEdge]:

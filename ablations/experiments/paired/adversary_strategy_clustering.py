@@ -19,6 +19,12 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_ant_returns,
+    get_pro_hstates,
+)
 
 
 @dataclass
@@ -83,94 +89,56 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
             raise ValueError(f"AdversaryStrategyClusteringExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[AdversaryRollout]:
-        """Collect adversary rollouts."""
+        """Collect adversary rollouts using real network data."""
         checkpoint_step = getattr(self.train_state, 'update_count', 0)
+        n = self.n_rollouts_per_checkpoint
 
-        for i in range(self.n_rollouts_per_checkpoint):
-            rng, rollout_rng = jax.random.split(rng)
-            rollout = self._collect_adversary_rollout(rollout_rng, checkpoint_step)
-            self._rollouts.append(rollout)
+        # Generate all levels in a single batched call
+        rng, gen_rng, hstate_rng, eval_rng = jax.random.split(rng, 4)
+        levels = generate_levels(self.agent, gen_rng, n)
+
+        # Extract features for all levels
+        batch_features = extract_level_features_batch(levels)
+
+        # Get real protagonist hidden states (used as embedding for clustering)
+        hstates_all = get_pro_hstates(hstate_rng, levels, self)
+        # hstates_all shape: (n, hidden_dim)
+
+        # Get real protagonist and antagonist returns for regret
+        pro_returns, ant_returns, regrets = get_pro_ant_returns(
+            eval_rng, levels, self
+        )
+
+        # Build per-rollout records
+        for i in range(n):
+            features = {
+                'wall_density': float(batch_features['wall_density'][i]),
+                'goal_distance': float(batch_features['goal_distance'][i]),
+                'open_space_ratio': float(batch_features['open_space_ratio'][i]),
+            }
+
+            # Use the hidden state vector as a single-step "sequence"
+            # for compatibility with _embed_sequences (which takes mean over axis=0)
+            hstate_i = hstates_all[i]  # shape: (hidden_dim,)
+            # Wrap in (1, hidden_dim) so mean(axis=0) is a no-op
+            hstate_seq = hstate_i[np.newaxis, :]
+
+            # Actions: not directly available from rollout; use a placeholder
+            # The clustering primarily relies on hstates and features
+            max_actions = 50
+            n_actions = 7
+            rng, action_rng = jax.random.split(rng)
+            actions = np.array(jax.random.randint(action_rng, (max_actions,), 0, n_actions))
+
+            self._rollouts.append(AdversaryRollout(
+                actions=actions,
+                hstates=hstate_seq,
+                level_features=features,
+                regret=float(regrets[i]),
+                checkpoint_step=checkpoint_step,
+            ))
 
         return self._rollouts
-
-    def _collect_adversary_rollout(
-        self,
-        rng: chex.PRNGKey,
-        checkpoint_step: int,
-    ) -> AdversaryRollout:
-        """Collect single adversary level-generation rollout."""
-        # Simulate adversary level generation
-        # In actual implementation, this would use the adversary network
-
-        max_actions = 50  # Level generation typically takes ~50 actions
-        hidden_dim = 256
-        n_actions = 7  # Action space size
-
-        # Generate action sequence
-        rng, action_rng, hstate_rng = jax.random.split(rng, 3)
-        actions = np.array(jax.random.randint(action_rng, (max_actions,), 0, n_actions))
-        hstates = np.array(jax.random.normal(hstate_rng, (max_actions, hidden_dim)))
-
-        # Generate resulting level
-        level = self._generate_level_from_actions(actions, rng)
-        features = self._compute_level_features(level)
-
-        # Compute regret (would use actual protagonist/antagonist)
-        rng, regret_rng = jax.random.split(rng)
-        regret = float(jax.random.uniform(regret_rng)) * 0.5 + features['wall_density'] * 0.3
-
-        return AdversaryRollout(
-            actions=actions,
-            hstates=hstates,
-            level_features=features,
-            regret=regret,
-            checkpoint_step=checkpoint_step,
-        )
-
-    def _generate_level_from_actions(
-        self,
-        actions: np.ndarray,
-        rng: chex.PRNGKey,
-    ) -> Dict[str, Any]:
-        """Generate level from action sequence (simplified)."""
-        height, width = 13, 13
-
-        # Use action statistics to determine level properties
-        action_diversity = len(np.unique(actions)) / 7.0
-        wall_prob = 0.1 + action_diversity * 0.2
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-
-        return {
-            'wall_density': wall_density,
-            'goal_distance': goal_distance,
-            'open_space_ratio': 1.0 - wall_density,
-        }
 
     def analyze(self) -> Dict[str, Any]:
         """Cluster adversary strategies."""

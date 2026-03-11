@@ -12,6 +12,16 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    generate_constrained_levels,
+    extract_level_features_batch,
+    get_pro_hstates,
+    get_pro_ant_returns,
+    get_values_from_rollout,
+    get_action_distribution,
+    levels_to_dicts,
+)
 
 
 @dataclass
@@ -67,112 +77,84 @@ class CounterfactualCurriculumExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, CurriculumProfile]:
         """Collect data for all curriculum regimes."""
-        # Generate shared evaluation levels
+        # Generate shared evaluation levels using real environment
         rng, levels_rng = jax.random.split(rng)
-        self._shared_levels = self._generate_shared_levels(levels_rng)
+        self._shared_levels_pytree = generate_levels(
+            self.agent, levels_rng, self.n_eval_levels
+        )
 
-        # Evaluate each curriculum
+        # Evaluate each curriculum regime on the shared levels
+        # All regimes use the same trained protagonist (different constraint sets
+        # simulate different curriculum biases via level selection)
+        regime_constraints = {
+            'paired': None,  # No constraints, full distribution
+            'dr': None,  # Same levels, same agent (baseline comparison)
+            'paired_no_antagonist': {'wall_density': (0.0, 0.2)},
+            'paired_frozen_adversary': {'wall_density': (0.1, 0.3)},
+            'replay_of_paired': {'wall_density': (0.05, 0.35)},
+        }
+
         for regime in self.REGIMES:
             rng, eval_rng = jax.random.split(rng)
-            self._profiles[regime] = self._evaluate_curriculum(eval_rng, regime)
+            constraints = regime_constraints.get(regime)
+            self._profiles[regime] = self._evaluate_curriculum(
+                eval_rng, regime, constraints
+            )
 
         return self._profiles
-
-    def _generate_shared_levels(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
-        """Generate shared evaluation levels."""
-        levels = []
-        for i in range(self.n_eval_levels):
-            rng, level_rng = jax.random.split(rng)
-            levels.append(self._generate_level(level_rng))
-        return levels
-
-    def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
 
     def _evaluate_curriculum(
         self,
         rng: chex.PRNGKey,
         regime: str,
+        constraints: Optional[Dict[str, Any]],
     ) -> CurriculumProfile:
-        """Evaluate agent from a specific curriculum."""
-        hstates = []
-        values = []
-        policy_entropies = []
-        returns = []
-        level_features = []
+        """Evaluate agent on levels for a specific curriculum regime."""
+        rng, level_rng, h_rng, val_rng, act_rng, ret_rng = jax.random.split(rng, 6)
 
-        # Curriculum-specific biases (simplified simulation)
-        regime_biases = {
-            'paired': {'value_bias': 0.0, 'entropy_bias': 0.0},
-            'dr': {'value_bias': -0.05, 'entropy_bias': 0.1},
-            'paired_no_antagonist': {'value_bias': 0.05, 'entropy_bias': -0.05},
-            'paired_frozen_adversary': {'value_bias': 0.02, 'entropy_bias': 0.05},
-            'replay_of_paired': {'value_bias': -0.02, 'entropy_bias': 0.02},
-        }
-        bias = regime_biases.get(regime, {'value_bias': 0.0, 'entropy_bias': 0.0})
+        # Generate regime-specific levels or use shared levels
+        if constraints is not None:
+            levels = generate_constrained_levels(
+                self.agent, level_rng, self.n_eval_levels, constraints
+            )
+        else:
+            levels = self._shared_levels_pytree
 
-        for level in self._shared_levels:
-            rng, eval_rng, hstate_rng = jax.random.split(rng, 3)
+        # Extract level features
+        batch_features = extract_level_features_batch(levels)
+        level_features = [
+            {k: float(v[i]) for k, v in batch_features.items()}
+            for i in range(self.n_eval_levels)
+        ]
 
-            features = self._compute_level_features(level)
-            level_features.append(features)
+        # Get real protagonist hidden states
+        hstates = get_pro_hstates(h_rng, levels, self)
 
-            # Simulate agent representations with curriculum-specific characteristics
-            hstate = np.array(jax.random.normal(hstate_rng, (self.hidden_dim,)))
-            # Add curriculum-specific structure
-            if regime == 'paired':
-                hstate[:50] *= 1.2  # PAIRED uses more regret-encoding dims
-            elif regime == 'dr':
-                hstate *= 0.9  # DR has less structured representations
+        # Get real value estimates
+        value_matrix = get_values_from_rollout(
+            self.train_state, self.agent, levels, val_rng
+        )
+        values = value_matrix.mean(axis=1)
 
-            hstates.append(hstate)
+        # Get real policy entropies
+        _logits, entropy_matrix = get_action_distribution(
+            self.train_state, self.agent, levels, act_rng
+        )
+        policy_entropies = entropy_matrix.mean(axis=1)
 
-            # Value with curriculum bias
-            wall_density = features['wall_density']
-            value = 0.7 - wall_density * 0.3 + bias['value_bias']
-            value += float(jax.random.uniform(eval_rng)) * 0.1
-            values.append(value)
-
-            # Policy entropy with curriculum bias
-            entropy = 1.5 + wall_density * 0.5 + bias['entropy_bias']
-            entropy += float(jax.random.uniform(eval_rng)) * 0.2
-            policy_entropies.append(entropy)
-
-            # Return
-            ret = value + float(jax.random.normal(eval_rng)) * 0.1
-            returns.append(ret)
+        # Get real returns
+        pro_returns, _ant_returns, _regrets = get_pro_ant_returns(
+            ret_rng, levels, self
+        )
 
         return CurriculumProfile(
             curriculum_name=regime,
             hstates=np.array(hstates),
             values=np.array(values),
             policy_entropies=np.array(policy_entropies),
-            returns=np.array(returns),
+            returns=np.array(pro_returns),
             level_features=level_features,
         )
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {'wall_density': wall_density, 'goal_distance': goal_distance}
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze curriculum comparisons."""

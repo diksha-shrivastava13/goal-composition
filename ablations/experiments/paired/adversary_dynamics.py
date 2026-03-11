@@ -10,14 +10,14 @@ Questions this experiment addresses:
 4. What level features does adversary learn to manipulate?
 """
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 import numpy as np
 import jax
-import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.batched_rollout import batched_rollout
 
 
 @dataclass
@@ -82,108 +82,142 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
         """
         Collect adversary-generated levels and performance data.
 
-        For PAIRED: Simulates adversary level generation and evaluates
-        protagonist/antagonist performance to compute regret.
+        For PAIRED: Generates levels in batch via vmap, then runs batched
+        protagonist (and optionally antagonist) rollouts to compute regret.
         """
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
+        timings = {}
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
         # Check if this is PAIRED
         if self.training_method != "paired":
             return AdversaryData()  # Return empty for non-PAIRED
 
         self._data = AdversaryData()
+        n = self.n_episodes
+        max_steps = 256
 
-        for ep_idx in range(self.n_episodes):
-            rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
+        # --- Generate all levels at once ---
+        _log("generate_levels", msg="Generating levels via vmap...")
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log("generate_levels", time.time() - t0, "Level generation complete")
 
-            # Generate adversary-style level (simulated)
-            level = self._generate_adversary_level(level_rng, ep_idx)
+        # --- Extract level features from Level pytrees ---
+        _log("extract_features", msg="Extracting level features...")
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)
+        goal_positions = np.array(levels.goal_pos)
+        agent_positions = np.array(levels.agent_pos)
+        wall_density = wall_maps.mean(axis=(1, 2))
 
-            # Extract level features
-            wall_density = level.get('wall_density', 0.0)
-            goal_pos = level.get('goal_pos', (6, 6))
-            agent_pos = level.get('agent_pos', (1, 1))
-            goal_distance = np.sqrt(
-                (goal_pos[0] - agent_pos[0])**2 +
-                (goal_pos[1] - agent_pos[1])**2
+        goal_distances = np.sqrt(
+            np.sum((goal_positions - agent_positions) ** 2, axis=-1)
+        ) if goal_positions.ndim > 1 else np.sqrt(
+            (goal_positions - agent_positions) ** 2
+        )
+        _log("extract_features", time.time() - t0)
+
+        # --- Batched protagonist rollout ---
+        _log("protagonist_rollout", msg="Running batched protagonist rollout...")
+        t0 = time.time()
+        rng, rng_pro = jax.random.split(rng)
+        pro_result = batched_rollout(
+            rng_pro, levels, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collection_steps=[-1],
+        )
+        jax.block_until_ready(pro_result.episode_returns)
+        _log("protagonist_rollout", time.time() - t0)
+
+        # --- Batched antagonist rollout (PAIRED bilateral) ---
+        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+        if ant_train_state is not None:
+            _log("antagonist_rollout", msg="Running batched antagonist rollout...")
+            t0 = time.time()
+            rng, rng_ant = jax.random.split(rng)
+            ant_result = batched_rollout(
+                rng_ant, levels, max_steps,
+                ant_train_state.apply_fn, ant_train_state.params,
+                self.agent.env, self.agent.env_params,
+                self.agent.initialize_hidden_state(n),
+                collection_steps=[-1],
             )
-            path_length = self._compute_path_length(level)
-
-            # Evaluate protagonist performance
-            pro_result = self._run_episode(pro_rng, level, agent_type='protagonist')
-
-            # Evaluate antagonist performance (if available, else simulate)
-            ant_result = self._run_episode(ant_rng, level, agent_type='antagonist')
-
-            # Compute regret
-            regret = ant_result.get('total_return', 0.0) - pro_result.get('total_return', 0.0)
-
-            # Store data
-            self._data.wall_densities.append(wall_density)
-            self._data.goal_distances.append(goal_distance)
-            self._data.path_lengths.append(path_length if path_length > 0 else -1)
-            self._data.protagonist_returns.append(pro_result.get('total_return', 0.0))
-            self._data.antagonist_returns.append(ant_result.get('total_return', 0.0))
-            self._data.regrets.append(regret)
-            self._data.episode_indices.append(ep_idx)
-
-            # Store level features for diversity analysis
-            features = np.array([wall_density, goal_distance / 18.0, path_length / 30.0 if path_length > 0 else 0.0])
-            self._data.level_features.append(features)
-
-        return self._data
-
-    def _generate_adversary_level(
-        self,
-        rng: chex.PRNGKey,
-        episode_idx: int,
-    ) -> Dict[str, Any]:
-        """
-        Generate a level as an adversary would.
-
-        Simulates adversary behavior: tries to create levels that are
-        solvable by antagonist but challenging for protagonist.
-        """
-        height, width = 13, 13
-
-        # Adversary learns to increase difficulty over time (simulated)
-        base_difficulty = 0.1 + 0.2 * (episode_idx / max(self.n_episodes, 1))
-        noise = float(jax.random.uniform(rng)) * 0.1
-        wall_prob = min(0.35, base_difficulty + noise)
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-
-        # Adversary might learn to place goal far from agent
-        # (increases difficulty for protagonist)
-        if episode_idx > self.n_episodes // 2:
-            # Later episodes: more distant placement
-            goal_pos = (
-                int(jax.random.randint(rng_goal, (), height - 4, height - 1)),
-                int(jax.random.randint(rng_goal, (), width - 4, width - 1)),
-            )
-            agent_pos = (
-                int(jax.random.randint(rng_agent, (), 1, 4)),
-                int(jax.random.randint(rng_agent, (), 1, 4)),
-            )
+            jax.block_until_ready(ant_result.episode_returns)
+            _log("antagonist_rollout", time.time() - t0)
+            ant_returns = np.array(ant_result.episode_returns)
         else:
-            # Early episodes: random placement
-            goal_pos = (
-                int(jax.random.randint(rng_goal, (), 1, height - 1)),
-                int(jax.random.randint(rng_goal, (), 1, width - 1)),
-            )
-            agent_pos = (
-                int(jax.random.randint(rng_agent, (), 1, height - 1)),
-                int(jax.random.randint(rng_agent, (), 1, width - 1)),
-            )
+            # No separate antagonist; use protagonist returns as stand-in
+            ant_returns = np.array(pro_result.episode_returns)
 
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'adversary_generated': True,
-        }
+        pro_returns = np.array(pro_result.episode_returns)
+        regrets = ant_returns - pro_returns
+
+        # --- CPU-side path length computation ---
+        _log("path_lengths", msg="Computing BFS path lengths (CPU)...")
+        t0 = time.time()
+        path_lengths = np.empty(n, dtype=np.float64)
+        for i in tqdm(range(n), desc="BFS path lengths", leave=False):
+            level_dict = {
+                'wall_map': wall_maps[i],
+                'goal_pos': tuple(int(x) for x in goal_positions[i])
+                    if goal_positions.ndim > 1
+                    else (int(goal_positions[i]),),
+                'agent_pos': tuple(int(x) for x in agent_positions[i])
+                    if agent_positions.ndim > 1
+                    else (int(agent_positions[i]),),
+            }
+            pl = self._compute_path_length(level_dict)
+            path_lengths[i] = pl if pl > 0 else -1
+        _log("path_lengths", time.time() - t0)
+
+        # --- Populate AdversaryData ---
+        self._data.wall_densities = wall_density.tolist()
+        self._data.goal_distances = goal_distances.tolist() if hasattr(goal_distances, 'tolist') else [float(goal_distances)]
+        self._data.path_lengths = path_lengths.tolist()
+        self._data.protagonist_returns = pro_returns.tolist()
+        self._data.antagonist_returns = ant_returns.tolist()
+        self._data.regrets = regrets.tolist()
+        self._data.episode_indices = list(range(n))
+
+        # Level features for diversity analysis
+        safe_path = np.where(path_lengths > 0, path_lengths / 30.0, 0.0)
+        goal_dist_arr = np.array(self._data.goal_distances)
+        features = np.stack([
+            wall_density,
+            goal_dist_arr / 18.0,
+            safe_path,
+        ], axis=-1)
+        self._data.level_features = [features[i] for i in range(n)]
+
+        _log("collect_data_done", msg=f"Data collection complete ({n} episodes)")
+        return self._data
 
     def _compute_path_length(self, level: Dict[str, Any]) -> int:
         """Compute BFS path length from agent to goal."""
@@ -212,92 +246,6 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
                     queue.append(((nx, ny), dist + 1))
 
         return -1  # Unsolvable
-
-    def _run_episode(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        agent_type: str = 'protagonist',
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Run episode with protagonist or antagonist."""
-        # Initialize hidden state
-        hstate = self.agent.initialize_carry(rng, batch_dims=(1,))
-
-        total_return = 0.0
-        solved = False
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            # Create observation
-            obs = self._create_observation(level, step)
-
-            # Forward pass
-            hstate, pi, value = self._forward_step(obs, hstate)
-
-            # Sample action
-            action = pi.sample(seed=step_rng)
-
-            # Simulate step
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 10:
-                # Protagonist and antagonist have different solve rates
-                # Antagonist is typically better (that's how PAIRED works)
-                base_solve_prob = 0.3 * (1 - level['wall_density'])
-                if agent_type == 'antagonist':
-                    solve_prob = base_solve_prob * 1.5  # Antagonist is better
-                else:
-                    solve_prob = base_solve_prob
-
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    solved = True
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-
-            if done:
-                break
-
-        return {
-            'total_return': total_return,
-            'solved': solved,
-            'n_steps': step + 1,
-        }
-
-    def _create_observation(self, level: Dict[str, Any], step: int) -> Any:
-        """Create observation from level state."""
-        height, width = level['wall_map'].shape
-
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs: Any, hstate: Any) -> Tuple[Any, Any, Any]:
-        """Run single forward step."""
-        params = self.train_state.params
-        apply_fn = self.train_state.apply_fn
-
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
-
-        return new_hstate, pi, value
 
     def analyze(self) -> Dict[str, Any]:
         """

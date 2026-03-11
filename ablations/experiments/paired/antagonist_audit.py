@@ -12,6 +12,13 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    generate_constrained_levels,
+    extract_level_features_batch,
+    get_pro_ant_returns,
+    get_action_distribution,
+)
 
 
 @dataclass
@@ -68,7 +75,7 @@ class AntagonistAuditExperiment(CheckpointExperiment):
             raise ValueError(f"AntagonistAuditExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, AuditResult]:
-        """Collect audit data for all level types."""
+        """Collect audit data for all level types using real rollouts."""
         for level_type, constraints in self.LEVEL_TYPES.items():
             rng, type_rng = jax.random.split(rng)
             self._audit_results[level_type] = self._audit_level_type(
@@ -83,128 +90,56 @@ class AntagonistAuditExperiment(CheckpointExperiment):
         level_type: str,
         constraints: Dict[str, tuple],
     ) -> AuditResult:
-        """Audit antagonist on a specific level type."""
-        ant_returns = []
-        pro_returns = []
+        """Audit antagonist on a specific level type using real rollouts."""
+        rng, gen_rng, eval_rng, entropy_rng = jax.random.split(rng, 4)
 
+        # Generate levels (constrained or unconstrained)
+        if constraints:
+            levels = generate_constrained_levels(
+                self.agent, gen_rng, self.n_levels_per_type, constraints
+            )
+        else:
+            levels = generate_levels(self.agent, gen_rng, self.n_levels_per_type)
+
+        # Extract features for all levels
+        batch_features = extract_level_features_batch(levels)
+
+        # Get real protagonist and antagonist returns via rollouts
+        pro_returns_arr, ant_returns_arr, _ = get_pro_ant_returns(
+            eval_rng, levels, self
+        )
+
+        # Get real action entropies for antagonist
+        ant_ts = getattr(self.train_state, 'ant_train_state', self.train_state)
+        _, ant_entropies = get_action_distribution(
+            ant_ts, self.agent, levels, entropy_rng
+        )
+        # Mean entropy per episode (across time steps)
+        mean_entropies_per_level = ant_entropies.mean(axis=1)
+
+        # Build per-level strategy data
         for i in range(self.n_levels_per_type):
-            rng, level_rng, ant_rng, pro_rng = jax.random.split(rng, 4)
-
-            # Generate level with constraints
-            level = self._generate_constrained_level(level_rng, constraints)
-
-            # Evaluate both agents
-            ant_return = self._evaluate_antagonist(ant_rng, level)
-            pro_return = self._evaluate_protagonist(pro_rng, level)
-
-            ant_returns.append(ant_return)
-            pro_returns.append(pro_return)
-
-            # Collect strategy data for diversity analysis
-            rng, strat_rng = jax.random.split(rng)
+            level_features = {
+                'wall_density': float(batch_features['wall_density'][i]),
+                'goal_distance': float(batch_features['goal_distance'][i]),
+            }
             self._strategy_data.append({
                 'level_type': level_type,
-                'ant_return': ant_return,
-                'pro_return': pro_return,
-                'level_features': self._compute_level_features(level),
-                'ant_action_entropy': self._get_action_entropy(strat_rng, 'antagonist', level),
+                'ant_return': float(ant_returns_arr[i]),
+                'pro_return': float(pro_returns_arr[i]),
+                'level_features': level_features,
+                'ant_action_entropy': float(mean_entropies_per_level[i]),
             })
 
         return AuditResult(
             level_type=level_type,
             n_levels=self.n_levels_per_type,
-            antagonist_mean_return=float(np.mean(ant_returns)),
-            antagonist_std_return=float(np.std(ant_returns)),
-            protagonist_mean_return=float(np.mean(pro_returns)),
-            protagonist_std_return=float(np.std(pro_returns)),
-            gap=float(np.mean(ant_returns) - np.mean(pro_returns)),
+            antagonist_mean_return=float(np.mean(ant_returns_arr)),
+            antagonist_std_return=float(np.std(ant_returns_arr)),
+            protagonist_mean_return=float(np.mean(pro_returns_arr)),
+            protagonist_std_return=float(np.std(pro_returns_arr)),
+            gap=float(np.mean(ant_returns_arr) - np.mean(pro_returns_arr)),
         )
-
-    def _generate_constrained_level(
-        self,
-        rng: chex.PRNGKey,
-        constraints: Dict[str, tuple],
-    ) -> Dict[str, Any]:
-        """Generate a level satisfying constraints."""
-        height, width = 13, 13
-
-        # Wall density constraint
-        if 'wall_density' in constraints:
-            min_wd, max_wd = constraints['wall_density']
-            wall_prob = min_wd + float(jax.random.uniform(rng)) * (max_wd - min_wd)
-        else:
-            wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-
-        # Goal distance constraint
-        if 'goal_distance' in constraints:
-            min_dist, max_dist = constraints['goal_distance']
-            # Place agent near corner, goal at controlled distance
-            agent_pos = (2, 2)
-            target_dist = min_dist + float(jax.random.uniform(rng_goal)) * (max_dist - min_dist)
-            angle = float(jax.random.uniform(rng_goal)) * 2 * np.pi
-            goal_y = int(agent_pos[0] + target_dist * np.sin(angle))
-            goal_x = int(agent_pos[1] + target_dist * np.cos(angle))
-            goal_pos = (
-                max(1, min(height - 2, goal_y)),
-                max(1, min(width - 2, goal_x)),
-            )
-        else:
-            goal_pos = (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                       int(jax.random.randint(rng_goal, (), 1, width-1)))
-            agent_pos = (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                        int(jax.random.randint(rng_agent, (), 1, width-1)))
-
-        return {
-            'wall_map': wall_map,
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {'wall_density': wall_density, 'goal_distance': goal_distance}
-
-    def _evaluate_antagonist(self, rng: chex.PRNGKey, level: Dict[str, Any]) -> float:
-        """Evaluate antagonist (simplified)."""
-        features = self._compute_level_features(level)
-        # Antagonist is stronger but degrades on out-of-distribution
-        base_return = 0.8 - features['wall_density'] * 0.3
-        # Degrade on extreme levels
-        if features['wall_density'] > 0.35 or features['goal_distance'] > 10:
-            base_return -= 0.15
-        noise = float(jax.random.uniform(rng)) * 0.1
-        return float(base_return + noise)
-
-    def _evaluate_protagonist(self, rng: chex.PRNGKey, level: Dict[str, Any]) -> float:
-        """Evaluate protagonist (simplified)."""
-        features = self._compute_level_features(level)
-        base_return = 0.7 - features['wall_density'] * 0.4
-        noise = float(jax.random.uniform(rng)) * 0.1
-        return float(base_return + noise)
-
-    def _get_action_entropy(
-        self,
-        rng: chex.PRNGKey,
-        agent: str,
-        level: Dict[str, Any],
-    ) -> float:
-        """Get action entropy (simplified)."""
-        features = self._compute_level_features(level)
-        # Higher entropy on harder levels
-        base_entropy = 1.5 + features['wall_density'] * 0.5
-        if agent == 'antagonist':
-            base_entropy *= 0.9  # Antagonist more confident
-        return float(base_entropy + float(jax.random.uniform(rng)) * 0.2)
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze antagonist audit results."""

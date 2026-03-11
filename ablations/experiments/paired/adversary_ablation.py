@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.batched_rollout import batched_rollout
 from ...common.metrics import compute_bilateral_cka
 
 
@@ -97,209 +98,121 @@ class AdversaryAblationExperiment(CheckpointExperiment):
             raise ValueError(f"AdversaryAblationExperiment requires PAIRED, got {self.training_method}")
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[Tuple[str, str], ConditionResult]:
-        """Run all factorial conditions."""
+        """Run all factorial conditions using GPU-batched rollouts."""
+        import time
+        import logging
+        from tqdm import tqdm
+
+        logger = logging.getLogger(__name__)
+        timings = {}
+
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
+        n = self.n_levels_per_condition
+        max_steps = 256
+
         for adv_cond in AdversaryCondition:
             for ant_cond in AntagonistCondition:
+                cond_key = f"{adv_cond.value}_{ant_cond.value}"
                 rng, cond_rng = jax.random.split(rng)
-                result = self._run_condition(cond_rng, adv_cond, ant_cond)
+
+                # --- 1. Generate all levels for this condition ---
+                _log(f"{cond_key}/generate_levels", msg="Generating levels...")
+                t0 = time.time()
+                rng_levels, rng_pro, rng_ant = jax.random.split(cond_rng, 3)
+                level_rngs = jax.random.split(rng_levels, n)
+                levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+                jax.block_until_ready(levels)
+                _log(f"{cond_key}/generate_levels", time.time() - t0)
+
+                # --- 2. Extract CPU-side level properties ---
+                _log(f"{cond_key}/cpu_level_properties", msg="Computing level properties...")
+                t0 = time.time()
+                wall_maps = np.array(levels.wall_map)
+                goal_positions = np.array(levels.goal_pos)
+                agent_positions = np.array(levels.agent_pos)
+
+                wall_density = wall_maps.mean(axis=(1, 2))
+                path_lengths = np.array([
+                    self._compute_path_length({
+                        'wall_map': wall_maps[i],
+                        'agent_pos': tuple(agent_positions[i]),
+                        'goal_pos': tuple(goal_positions[i]),
+                    })
+                    for i in tqdm(range(n), desc=f"BFS path lengths ({cond_key})", leave=False)
+                ])
+                _log(f"{cond_key}/cpu_level_properties", time.time() - t0)
+
+                # --- 3. Protagonist batched rollout ---
+                _log(f"{cond_key}/pro_rollout", msg="Running protagonist rollout...")
+                t0 = time.time()
+                pro_result = batched_rollout(
+                    rng_pro, levels, max_steps,
+                    self.train_state.pro_train_state.apply_fn,
+                    self.train_state.pro_train_state.params,
+                    self.agent.env, self.agent.env_params,
+                    self.agent.initialize_hidden_state(n),
+                    collection_steps=[-1],
+                )
+                _log(f"{cond_key}/pro_rollout", time.time() - t0)
+
+                # --- 4. Antagonist batched rollout ---
+                _log(f"{cond_key}/ant_rollout", msg="Running antagonist rollout...")
+                t0 = time.time()
+                # Both LIVE and FROZEN use ant_train_state (frozen uses same checkpoint)
+                ant_train_state = self.train_state.ant_train_state
+                ant_result = batched_rollout(
+                    rng_ant, levels, max_steps,
+                    ant_train_state.apply_fn,
+                    ant_train_state.params,
+                    self.agent.env, self.agent.env_params,
+                    self.agent.initialize_hidden_state(n),
+                    collection_steps=[-1],
+                )
+                _log(f"{cond_key}/ant_rollout", time.time() - t0)
+
+                # --- 5. Assemble condition result ---
+                pro_hstates = pro_result.hstates_by_step["-1"]
+                ant_hstates = ant_result.hstates_by_step["-1"]
+                regrets = ant_result.episode_returns - pro_result.episode_returns
+
+                result = ConditionResult(
+                    adversary_condition=adv_cond,
+                    antagonist_condition=ant_cond,
+                    n_levels=n,
+                    pro_solve_rate=float(pro_result.episode_solved.mean()),
+                    pro_mean_return=float(pro_result.episode_returns.mean()),
+                    ant_solve_rate=float(ant_result.episode_solved.mean()),
+                    ant_mean_return=float(ant_result.episode_returns.mean()),
+                    mean_regret=float(regrets.mean()),
+                    pro_hstates=pro_hstates,
+                    ant_hstates=ant_hstates,
+                    mean_wall_density=float(wall_density.mean()),
+                    mean_path_length=float(path_lengths.mean()),
+                )
                 self._results_by_condition[(adv_cond.value, ant_cond.value)] = result
+                _log(f"{cond_key}/done", msg=f"Condition complete: regret={result.mean_regret:.3f}")
 
         return self._results_by_condition
-
-    def _run_condition(
-        self,
-        rng: chex.PRNGKey,
-        adv_cond: AdversaryCondition,
-        ant_cond: AntagonistCondition,
-    ) -> ConditionResult:
-        """Run evaluation under specific condition."""
-        pro_solve_rates = []
-        pro_returns = []
-        ant_solve_rates = []
-        ant_returns = []
-        regrets = []
-        wall_densities = []
-        path_lengths = []
-        pro_hstates_list = []
-        ant_hstates_list = []
-
-        for i in range(self.n_levels_per_condition):
-            rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
-
-            # Generate level based on adversary condition
-            level = self._generate_level_for_condition(level_rng, adv_cond)
-
-            # Evaluate protagonist
-            pro_result = self._evaluate_protagonist(pro_rng, level)
-
-            # Evaluate antagonist based on condition
-            ant_result = self._evaluate_antagonist(ant_rng, level, ant_cond)
-
-            # Store results
-            pro_solve_rates.append(float(pro_result['solved']))
-            pro_returns.append(pro_result['return'])
-            ant_solve_rates.append(float(ant_result['solved']))
-            ant_returns.append(ant_result['return'])
-            regrets.append(ant_result['return'] - pro_result['return'])
-            wall_densities.append(float(level['wall_map'].mean()))
-            path_lengths.append(float(self._compute_path_length(level)))
-
-            # Store hidden states
-            pro_hstates_list.append(self._flatten_hstate(pro_result['hstate']))
-            ant_hstates_list.append(self._flatten_hstate(ant_result['hstate']))
-
-        return ConditionResult(
-            adversary_condition=adv_cond,
-            antagonist_condition=ant_cond,
-            n_levels=self.n_levels_per_condition,
-            pro_solve_rate=float(np.mean(pro_solve_rates)),
-            pro_mean_return=float(np.mean(pro_returns)),
-            ant_solve_rate=float(np.mean(ant_solve_rates)),
-            ant_mean_return=float(np.mean(ant_returns)),
-            mean_regret=float(np.mean(regrets)),
-            pro_hstates=np.stack(pro_hstates_list),
-            ant_hstates=np.stack(ant_hstates_list),
-            mean_wall_density=float(np.mean(wall_densities)),
-            mean_path_length=float(np.mean(path_lengths)),
-        )
-
-    def _generate_level_for_condition(
-        self,
-        rng: chex.PRNGKey,
-        adv_cond: AdversaryCondition,
-    ) -> Dict[str, Any]:
-        """Generate level based on adversary condition."""
-        height, width = 13, 13
-
-        if adv_cond == AdversaryCondition.NO_ADVERSARY:
-            # Pure random levels
-            wall_prob = float(jax.random.uniform(rng)) * 0.3
-        elif adv_cond == AdversaryCondition.FROZEN:
-            # Use baseline adversary distribution
-            wall_prob = 0.15 + float(jax.random.uniform(rng)) * 0.1
-        elif adv_cond == AdversaryCondition.EASY:
-            # Constrained easy: low wall density, short paths
-            wall_prob = float(jax.random.uniform(rng)) * 0.1
-        elif adv_cond == AdversaryCondition.HARD:
-            # Constrained hard: high wall density
-            wall_prob = 0.25 + float(jax.random.uniform(rng)) * 0.15
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-    def _evaluate_protagonist(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Evaluate protagonist on level."""
-        return self._evaluate_agent(rng, level, self.train_state.pro_train_state, max_steps)
-
-    def _evaluate_antagonist(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        ant_cond: AntagonistCondition,
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Evaluate antagonist on level."""
-        if ant_cond == AntagonistCondition.LIVE:
-            agent_state = self.train_state.ant_train_state
-        else:
-            # For frozen, use same state but could use saved checkpoint
-            agent_state = self.train_state.ant_train_state
-
-        return self._evaluate_agent(rng, level, agent_state, max_steps)
-
-    def _evaluate_agent(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        agent_state,
-        max_steps: int,
-    ) -> Dict[str, Any]:
-        """Generic agent evaluation."""
-        hstate = self._initialize_hstate(rng)
-        total_return = 0.0
-        final_hstate = hstate
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            new_hstate, pi, value = self._forward_step(obs, hstate, agent_state)
-
-            action = pi.sample(seed=step_rng)
-            hstate = new_hstate
-            final_hstate = hstate
-
-            # Simplified reward simulation
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_map'].mean())
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-            if done:
-                break
-
-        return {
-            'return': total_return,
-            'hstate': final_hstate,
-            'solved': total_return > 0,
-        }
-
-    def _initialize_hstate(self, rng: chex.PRNGKey):
-        """Initialize hidden state."""
-        hidden_dim = 256
-        return (jnp.zeros((1, hidden_dim)), jnp.zeros((1, hidden_dim)))
-
-    def _create_observation(self, level: Dict[str, Any], step: int):
-        """Create observation."""
-        height, width = level['wall_map'].shape
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs, hstate, agent_state):
-        """Forward pass."""
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-        new_hstate, pi, value = agent_state.apply_fn(
-            agent_state.params, (obs_batch, done_batch), hstate
-        )
-        return new_hstate, pi, value
 
     def _flatten_hstate(self, hstate) -> np.ndarray:
         """Flatten hidden state tuple to array."""

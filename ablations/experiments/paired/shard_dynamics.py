@@ -13,6 +13,10 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels, extract_level_features_batch, get_pro_hstates,
+    get_action_distribution,
+)
 
 
 class ShardState(Enum):
@@ -100,88 +104,54 @@ class ShardDynamicsExperiment(CheckpointExperiment):
         return self._trajectory_data
 
     def _collect_step_data(self, rng: chex.PRNGKey, step: int) -> Dict[str, Any]:
-        """Collect data for a single step."""
-        hstates = []
-        actions = []
-        policy_logits_list = []
-        level_features_list = []
+        """Collect data for a single step using real network evaluations."""
+        rng, level_rng, hstate_rng, action_rng = jax.random.split(rng, 4)
 
         # Adversary curriculum phase
         curriculum_phase = 'early' if step < 15 else ('mid' if step < 35 else 'late')
-        adversary_difficulty = 0.2 + 0.5 * (step / self.trajectory_length)
 
-        for i in range(self.n_samples_per_step):
-            rng, h_rng, f_rng, p_rng = jax.random.split(rng, 4)
+        # Generate real levels
+        levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
 
-            # Level features
-            wall_density = 0.1 + float(jax.random.uniform(f_rng)) * 0.35
-            goal_distance = 2.0 + float(jax.random.uniform(f_rng)) * 10.0
-            open_space = 1.0 - wall_density
+        # Get real hidden states from protagonist network
+        hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = hstates.shape[1]
 
-            level_features = {
-                'wall_density': wall_density,
-                'goal_distance': goal_distance,
-                'open_space': open_space,
+        # Get real action logits from protagonist
+        logits, _ = get_action_distribution(
+            self.train_state, self.agent, levels, action_rng,
+        )
+        # logits shape: (n, max_steps, n_actions) -> take last step per episode
+        policy_logits = logits[:, -1, :]  # (n, n_actions)
+        # Pad or truncate to 4 actions to match analyze() expectations
+        n_actions = policy_logits.shape[1]
+        if n_actions < 4:
+            policy_logits = np.pad(policy_logits, ((0, 0), (0, 4 - n_actions)))
+        elif n_actions > 4:
+            policy_logits = policy_logits[:, :4]
+        actions = np.argmax(policy_logits, axis=-1)
+
+        # Extract real level features
+        features_batch = extract_level_features_batch(levels)
+        level_features_list = [
+            {
+                'wall_density': float(features_batch['wall_density'][i]),
+                'goal_distance': float(features_batch['goal_distance'][i]),
+                'open_space': float(features_batch['open_space_ratio'][i]),
             }
-            level_features_list.append(level_features)
+            for i in range(self.n_samples_per_step)
+        ]
 
-            # Hidden state with competing shard structure
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-
-            # Shard 1: Navigation shard - activates for high wall density
-            nav_activation = 0.0
-            if wall_density > 0.25:
-                nav_activation = (wall_density - 0.25) * 4.0
-                h[:40] += nav_activation * 1.5
-
-            # Shard 2: Exploration shard - activates for large goal distance
-            explore_activation = 0.0
-            if goal_distance > 6.0:
-                explore_activation = (goal_distance - 6.0) / 6.0
-                h[40:80] += explore_activation * 1.2
-
-            # Shard 3: Efficiency shard - activates for open spaces
-            efficiency_activation = 0.0
-            if open_space > 0.75:
-                efficiency_activation = (open_space - 0.75) * 4.0
-                h[80:120] += efficiency_activation * 1.0
-
-            # Shard 4: Caution shard - emerges late in training
-            caution_activation = 0.0
-            if step > 25 and wall_density > 0.2:
-                caution_activation = (step - 25) / 25.0 * wall_density
-                h[120:160] += caution_activation * 0.8
-
-            # Shard 5: Adversary-response shard - responds to curriculum difficulty
-            adversary_activation = adversary_difficulty * 0.5
-            h[160:200] += adversary_activation
-
-            hstates.append(h)
-
-            # Policy logits influenced by competing shards
-            base_logits = np.zeros(4)
-
-            # Different shards prefer different actions
-            base_logits[0] += nav_activation * 0.5  # Careful movement
-            base_logits[1] += explore_activation * 0.4  # Exploratory
-            base_logits[2] += efficiency_activation * 0.3  # Direct path
-            base_logits[3] += caution_activation * 0.6  # Wait/observe
-
-            # Add noise
-            logits = base_logits + np.array(jax.random.normal(p_rng, (4,))) * 0.3
-            policy_logits_list.append(logits)
-
-            # Sample action
-            probs = np.exp(logits - np.max(logits))
-            probs = probs / probs.sum()
-            action = int(jax.random.choice(p_rng, 4, p=probs))
-            actions.append(action)
+        # Compute adversary difficulty from real level statistics
+        mean_wall = float(np.mean(features_batch['wall_density']))
+        mean_dist = float(np.mean(features_batch['goal_distance']))
+        adversary_difficulty = mean_wall * 0.5 + mean_dist * 0.05
 
         return {
             'step': step,
-            'hstates': np.array(hstates),
-            'actions': np.array(actions),
-            'policy_logits': np.array(policy_logits_list),
+            'hstates': hstates,
+            'actions': actions,
+            'policy_logits': policy_logits,
             'level_features': level_features_list,
             'adversary_features': {
                 'difficulty': adversary_difficulty,

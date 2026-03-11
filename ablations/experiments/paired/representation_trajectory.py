@@ -12,6 +12,13 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_hstates,
+    get_values_from_rollout,
+    get_action_distribution,
+)
 
 
 @dataclass
@@ -74,38 +81,36 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         rng: chex.PRNGKey,
         step: int,
     ) -> TrajectoryPoint:
-        """Collect data for a single trajectory point."""
-        hstates = []
-        values = []
-        entropies = []
+        """Collect data for a single trajectory point using real network evaluations."""
+        rng, level_rng, h_rng, val_rng, act_rng = jax.random.split(rng, 5)
 
-        # Simulate adversary features at this step
+        # Generate real levels for this trajectory point
+        levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
+
+        # Extract level features to characterize adversary context
+        batch_features = extract_level_features_batch(levels)
+        mean_wall_density = float(batch_features['wall_density'].mean())
+        mean_goal_distance = float(batch_features['goal_distance'].mean())
+
         adversary_features = {
-            'difficulty': 0.3 + 0.4 * (step / self.trajectory_length) + float(jax.random.uniform(rng)) * 0.1,
-            'wall_density_target': 0.1 + 0.2 * (step / self.trajectory_length),
+            'difficulty': mean_wall_density + mean_goal_distance * 0.1,
+            'wall_density_target': mean_wall_density,
         }
 
-        for i in range(self.n_samples_per_step):
-            rng, sample_rng, h_rng = jax.random.split(rng, 3)
+        # Get real protagonist hidden states
+        hstates = get_pro_hstates(h_rng, levels, self)
 
-            # Sample hidden state with trajectory-dependent structure
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
+        # Get real value estimates
+        value_matrix = get_values_from_rollout(
+            self.train_state, self.agent, levels, val_rng
+        )
+        values = value_matrix.mean(axis=1)
 
-            # Add drift over training
-            h[:50] += step * 0.01  # Autonomous drift
-            # Add adversary influence
-            h[50:100] += adversary_features['difficulty'] * 2.0
-
-            hstates.append(h)
-
-            # Simulated value and entropy
-            value = 0.7 - adversary_features['difficulty'] * 0.3 + float(jax.random.uniform(sample_rng)) * 0.1
-            values.append(value)
-
-            entropy = 1.5 + adversary_features['difficulty'] * 0.5
-            entropies.append(entropy)
-
-        hstates = np.array(hstates)
+        # Get real policy entropies
+        _logits, entropy_matrix = get_action_distribution(
+            self.train_state, self.agent, levels, act_rng
+        )
+        entropies = entropy_matrix.mean(axis=1)
 
         return TrajectoryPoint(
             step=step,

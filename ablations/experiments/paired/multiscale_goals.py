@@ -13,6 +13,10 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels, extract_level_features_batch, get_pro_hstates,
+    get_values_from_rollout, get_action_distribution, get_pro_ant_returns,
+)
 
 
 class TemporalScale(Enum):
@@ -77,69 +81,67 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         return self._episode_data
 
     def _collect_episode(self, rng: chex.PRNGKey, episode_idx: int) -> Dict[str, Any]:
-        """Collect data for a single episode."""
-        hstates = []
-        values = []
-        actions = []
-        rewards = []
-        level_features = []
+        """Collect data for a single episode using real network evaluations."""
+        rng, level_rng, hstate_rng, val_rng, action_rng, ret_rng = jax.random.split(rng, 6)
 
-        # Episode-level adversary decision
-        rng, adv_rng = jax.random.split(rng)
-        episode_difficulty = 0.3 + float(jax.random.uniform(adv_rng)) * 0.4
+        # Generate a single real level for this episode
+        levels = generate_levels(self.agent, level_rng, 1)
 
-        for step in range(self.max_steps_per_episode):
-            rng, step_rng, h_rng, v_rng, a_rng = jax.random.split(rng, 5)
+        # Get real hidden states from protagonist
+        hstate_single = get_pro_hstates(hstate_rng, levels, self)  # (1, hidden_dim)
+        self.hidden_dim = hstate_single.shape[1]
 
-            # Level features (change slowly within episode)
-            wall_density = episode_difficulty * 0.8 + float(jax.random.uniform(step_rng)) * 0.1
-            goal_distance = 10.0 - step * 0.2 + float(jax.random.uniform(step_rng)) * 0.5
+        # Get real value trajectory from rollout
+        values_traj = get_values_from_rollout(
+            self.train_state, self.agent, levels, val_rng,
+            max_steps=self.max_steps_per_episode,
+        )  # (1, max_steps)
+        values_ep = values_traj[0]  # (max_steps,)
 
-            level_features.append({
+        # Get real action logits
+        logits, entropies = get_action_distribution(
+            self.train_state, self.agent, levels, action_rng,
+            max_steps=self.max_steps_per_episode,
+        )  # logits: (1, max_steps, n_actions)
+        actions_ep = np.argmax(logits[0], axis=-1)  # (max_steps,)
+
+        # Get real return for episode difficulty proxy
+        pro_returns, _, _ = get_pro_ant_returns(ret_rng, levels, self)
+        episode_return = float(pro_returns[0])
+
+        # Extract level features
+        features_batch = extract_level_features_batch(levels)
+        wall_density = float(features_batch['wall_density'][0])
+        goal_distance = float(features_batch['goal_distance'][0])
+        episode_difficulty = wall_density * 0.5 + goal_distance * 0.05
+
+        # Build per-step hstates by tiling the terminal hstate
+        # (the real hstate captures the episode-level representation)
+        n_steps = min(self.max_steps_per_episode, len(values_ep))
+        hstates = np.tile(hstate_single[0], (n_steps, 1))  # (max_steps, hidden_dim)
+
+        # Build per-step level features
+        level_features = [
+            {
                 'wall_density': wall_density,
                 'goal_distance': goal_distance,
                 'step': step,
-            })
+            }
+            for step in range(n_steps)
+        ]
 
-            # Hidden state with multi-scale structure
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-
-            # Immediate goal (reactive): First 30 dims
-            h[:30] += wall_density * 2.0
-
-            # Short-term goal (local planning): Dims 30-80
-            h[30:80] += goal_distance * 0.2
-
-            # Medium-term goal (episode strategy): Dims 80-150
-            h[80:150] += episode_difficulty * 1.5
-
-            # Long-term goal (cross-episode learning): Dims 150-220
-            h[150:220] += episode_idx * 0.01  # Accumulates over episodes
-
-            hstates.append(h)
-
-            # Value function (combines all scales)
-            value = 0.7 - episode_difficulty * 0.3 - step * 0.01
-            value += float(jax.random.uniform(v_rng)) * 0.1
-            values.append(value)
-
-            # Action (influenced by different scales)
-            action = int(jax.random.randint(a_rng, (), 0, 4))
-            actions.append(action)
-
-            # Reward
-            reward = -0.01 + float(jax.random.uniform(step_rng)) * 0.1
-            if goal_distance < 2.0:
-                reward += 1.0
-            rewards.append(reward)
+        # Compute rewards from value differences (approximate)
+        rewards = np.zeros(n_steps)
+        rewards[:-1] = values_ep[1:n_steps] - values_ep[:n_steps-1] * 0.99
+        rewards[-1] = episode_return - float(np.sum(rewards[:-1]))
 
         return {
             'episode_idx': episode_idx,
             'episode_difficulty': episode_difficulty,
-            'hstates': np.array(hstates),
-            'values': np.array(values),
-            'actions': np.array(actions),
-            'rewards': np.array(rewards),
+            'hstates': hstates,
+            'values': values_ep[:n_steps],
+            'actions': actions_ep[:n_steps],
+            'rewards': rewards,
             'level_features': level_features,
         }
 

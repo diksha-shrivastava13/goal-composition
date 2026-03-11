@@ -295,7 +295,8 @@ class PAIREDBaseAgent(ABC):
             probe_tx = optax.adam(learning_rate=config.get("probe_lr", 1e-3))
             probe_opt_state = probe_tx.init(probe_params)
             probe_tracking = create_probe_tracking_state(
-                buffer_size=config.get("probe_tracking_buffer_size", 500)
+                buffer_size=config.get("probe_tracking_buffer_size", 500),
+                batch_size=config["num_train_envs"],
             )
 
         # Initialize PAIRED-specific history tracking

@@ -13,6 +13,17 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    generate_constrained_levels,
+    extract_level_features_batch,
+    get_pro_hstates,
+    get_pro_ant_returns,
+    get_values_from_rollout,
+    get_action_distribution,
+    levels_to_dicts,
+    extract_level_features_single,
+)
 
 
 class InterventionPhase(Enum):
@@ -120,128 +131,54 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         n_steps: int,
         constraints: Optional[Dict[str, Tuple[float, float]]],
     ) -> PhaseData:
-        """Collect data during a single phase."""
-        hstates = []
-        values = []
-        policy_entropies = []
-        returns = []
-        level_features = []
+        """Collect data during a single phase using real network evaluations."""
+        rng, level_rng, h_rng, val_rng, act_rng, ret_rng = jax.random.split(rng, 6)
 
-        for i in range(n_steps):
-            rng, level_rng, eval_rng, hstate_rng = jax.random.split(rng, 4)
+        # Generate real levels
+        if constraints:
+            levels = generate_constrained_levels(
+                self.agent, level_rng, n_steps, constraints
+            )
+        else:
+            levels = generate_levels(self.agent, level_rng, n_steps)
 
-            # Generate level with optional constraints
-            if constraints:
-                level = self._generate_constrained_level(level_rng, constraints)
-            else:
-                level = self._generate_level(level_rng)
+        # Extract level features
+        batch_features = extract_level_features_batch(levels)
+        level_features = [
+            {k: float(v[i]) for k, v in batch_features.items()}
+            for i in range(n_steps)
+        ]
 
-            features = self._compute_level_features(level)
-            level_features.append(features)
+        # Get real protagonist hidden states
+        hstates = get_pro_hstates(h_rng, levels, self)
 
-            # Get agent representations (simplified)
-            hstate = np.array(jax.random.normal(hstate_rng, (self.hidden_dim,)))
-            hstates.append(hstate)
+        # Get real value estimates from protagonist rollout
+        value_matrix = get_values_from_rollout(
+            self.train_state, self.agent, levels, val_rng
+        )
+        # Aggregate per-level: mean value across timesteps
+        values = value_matrix.mean(axis=1)
 
-            # Simulate value and policy
-            wall_density = features['wall_density']
-            value = 0.7 - wall_density * 0.3 + float(jax.random.uniform(eval_rng)) * 0.1
-            values.append(value)
+        # Get real policy entropies from protagonist rollout
+        _logits, entropy_matrix = get_action_distribution(
+            self.train_state, self.agent, levels, act_rng
+        )
+        # Aggregate per-level: mean entropy across timesteps
+        policy_entropies = entropy_matrix.mean(axis=1)
 
-            # Policy entropy (higher for harder levels)
-            entropy = 1.5 + wall_density * 0.5 + float(jax.random.uniform(eval_rng)) * 0.2
-            policy_entropies.append(entropy)
-
-            # Return
-            ret = value + float(jax.random.normal(eval_rng)) * 0.1
-            returns.append(ret)
+        # Get real returns
+        pro_returns, _ant_returns, _regrets = get_pro_ant_returns(
+            ret_rng, levels, self
+        )
 
         return PhaseData(
             phase=phase,
             hstates=np.array(hstates),
             values=np.array(values),
             policy_entropies=np.array(policy_entropies),
-            returns=np.array(returns),
+            returns=np.array(pro_returns),
             level_features=level_features,
         )
-
-    def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
-
-    def _generate_constrained_level(
-        self,
-        rng: chex.PRNGKey,
-        constraints: Dict[str, Tuple[float, float]],
-    ) -> Dict[str, Any]:
-        """Generate a level satisfying constraints."""
-        height, width = 13, 13
-
-        # Determine wall probability based on constraints
-        if 'wall_density' in constraints:
-            min_val, max_val = constraints['wall_density']
-            wall_prob = min_val + float(jax.random.uniform(rng)) * (max_val - min_val)
-        elif 'open_space_ratio' in constraints:
-            min_val, max_val = constraints['open_space_ratio']
-            # Open space = 1 - wall_density
-            wall_prob = 1.0 - (min_val + float(jax.random.uniform(rng)) * (max_val - min_val))
-            wall_prob = max(0.05, min(0.5, wall_prob))
-        elif 'corridor_ratio' in constraints:
-            # For corridors, use medium-high wall density
-            wall_prob = 0.3 + float(jax.random.uniform(rng)) * 0.15
-        else:
-            wall_prob = 0.15
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-
-        # Handle goal distance constraint
-        if 'goal_distance' in constraints:
-            min_dist, max_dist = constraints['goal_distance']
-            # Place goal far from agent
-            agent_pos = (int(jax.random.randint(rng_agent, (), 1, 3)),
-                        int(jax.random.randint(rng_agent, (), 1, 3)))
-            goal_pos = (int(jax.random.randint(rng_goal, (), height-3, height-1)),
-                       int(jax.random.randint(rng_goal, (), width-3, width-1)))
-        else:
-            goal_pos = (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                       int(jax.random.randint(rng_goal, (), 1, width-1)))
-            agent_pos = (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                        int(jax.random.randint(rng_agent, (), 1, width-1)))
-
-        return {
-            'wall_map': wall_map,
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {
-            'wall_density': wall_density,
-            'goal_distance': goal_distance,
-            'open_space_ratio': 1.0 - wall_density,
-        }
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze intervention effects."""

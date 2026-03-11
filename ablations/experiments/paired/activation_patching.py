@@ -13,6 +13,12 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_hstates,
+    levels_to_dicts,
+)
 
 
 class PatchTarget(Enum):
@@ -78,54 +84,35 @@ class ActivationPatchingExperiment(CheckpointExperiment):
             raise ValueError(f"ActivationPatchingExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-        """Collect levels and hidden states."""
-        # Generate diverse levels
-        for i in range(self.n_pairs * 2):
-            rng, level_rng = jax.random.split(rng)
-            self._levels.append(self._generate_level(level_rng))
+        """Collect levels and hidden states using real network evaluations."""
+        n_total = self.n_pairs * 2
+        rng, level_rng, h_rng = jax.random.split(rng, 3)
 
-        # Get hidden states (simplified)
-        rng, hstate_rng = jax.random.split(rng)
-        self._hstates = np.array(
-            jax.random.normal(hstate_rng, (len(self._levels), self.hidden_dim))
-        )
+        # Generate real levels
+        levels_pytree = generate_levels(self.agent, level_rng, n_total)
 
-        # Add feature-correlated structure to hidden states
-        for i, level in enumerate(self._levels):
-            features = self._compute_level_features(level)
-            # First 50 dims encode wall density
-            self._hstates[i, :50] += features['wall_density'] * 2.0
-            # Next 50 dims encode goal distance
-            self._hstates[i, 50:100] += features['goal_distance'] * 0.5
+        # Convert to list of dicts for downstream compatibility
+        self._levels = levels_to_dicts(levels_pytree, n_total)
+
+        # Get real protagonist hidden states
+        self._hstates = get_pro_hstates(h_rng, levels_pytree, self)
+
+        # Update hidden_dim from actual data
+        self.hidden_dim = self._hstates.shape[1]
 
         # Identify important dimensions
         self._identify_important_dims()
 
         return self._levels, self._hstates
 
-    def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.3
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
-
     def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
         """Compute level features."""
         wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
+        goal_pos = level['goal_pos']
+        agent_pos = level['agent_pos']
         goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
+            (goal_pos[0] - agent_pos[0])**2 +
+            (goal_pos[1] - agent_pos[1])**2
         ))
         return {'wall_density': wall_density, 'goal_distance': goal_distance}
 

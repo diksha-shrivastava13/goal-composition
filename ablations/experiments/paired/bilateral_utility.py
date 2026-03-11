@@ -13,6 +13,11 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_ant_returns,
+)
 
 
 @dataclass
@@ -55,70 +60,34 @@ class BilateralUtilityExperiment(CheckpointExperiment):
             raise ValueError(f"BilateralUtilityExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
-        """Collect level data with returns from all agents."""
+        """Collect level data with real returns from protagonist and antagonist."""
+        # Generate all levels in a single batched call
+        rng, gen_rng, eval_rng = jax.random.split(rng, 3)
+        levels = generate_levels(self.agent, gen_rng, self.n_levels)
+
+        # Extract features for all levels at once
+        batch_features = extract_level_features_batch(levels)
+
+        # Get real protagonist and antagonist returns via rollouts
+        pro_returns, ant_returns, regrets = get_pro_ant_returns(
+            eval_rng, levels, self
+        )
+
+        # Build per-level records
         for i in range(self.n_levels):
-            rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
-
-            # Generate level via adversary
-            level = self._generate_adversary_level(level_rng)
-            features = self._compute_level_features(level)
-
-            # Evaluate protagonist and antagonist
-            pro_return = self._evaluate_protagonist(pro_rng, level)
-            ant_return = self._evaluate_antagonist(ant_rng, level)
-            regret = ant_return - pro_return
-
+            features = {
+                'wall_density': float(batch_features['wall_density'][i]),
+                'goal_distance': float(batch_features['goal_distance'][i]),
+                'open_space_ratio': float(batch_features['open_space_ratio'][i]),
+            }
             self._data.append({
                 'features': features,
-                'pro_return': pro_return,
-                'ant_return': ant_return,
-                'regret': regret,
+                'pro_return': float(pro_returns[i]),
+                'ant_return': float(ant_returns[i]),
+                'regret': float(regrets[i]),
             })
 
         return self._data
-
-    def _generate_adversary_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate level via adversary."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {
-            'wall_density': wall_density,
-            'goal_distance': goal_distance,
-            'open_space_ratio': 1.0 - wall_density,
-        }
-
-    def _evaluate_protagonist(self, rng: chex.PRNGKey, level: Dict[str, Any]) -> float:
-        """Evaluate protagonist on level (simplified)."""
-        wall_density = level['wall_map'].mean()
-        noise = float(jax.random.uniform(rng)) * 0.1
-        return float(0.7 - wall_density * 0.4 + noise)
-
-    def _evaluate_antagonist(self, rng: chex.PRNGKey, level: Dict[str, Any]) -> float:
-        """Evaluate antagonist on level (simplified)."""
-        wall_density = level['wall_map'].mean()
-        noise = float(jax.random.uniform(rng)) * 0.1
-        # Antagonist typically performs better
-        return float(0.8 - wall_density * 0.3 + noise)
 
     def analyze(self) -> Dict[str, Any]:
         """Compare utility functions across all three agents."""

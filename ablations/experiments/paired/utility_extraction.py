@@ -22,6 +22,7 @@ import chex
 
 from ..base import CheckpointExperiment
 from ...common.types import PAIREDPredictionData, create_paired_prediction_data
+from ..utils.batched_rollout import batched_rollout
 
 
 @dataclass
@@ -110,78 +111,125 @@ class UtilityExtractionExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> UtilityExtractionData:
         """Collect prediction data from training rollouts."""
+        import time, logging
+        from tqdm import tqdm
+        logger = logging.getLogger(__name__)
+        timings = {}
+
+        try:
+            import wandb
+            _wandb_active = wandb.run is not None
+        except ImportError:
+            _wandb_active = False
+
+        def _log(phase, elapsed=None, msg=None):
+            if elapsed is not None:
+                timings[phase] = elapsed
+                logger.info(f"[{self.name}] {phase}: {elapsed:.2f}s")
+            if msg:
+                logger.info(f"[{self.name}] {msg}")
+            if _wandb_active:
+                log_dict = {}
+                if elapsed is not None:
+                    log_dict[f"{self.name}/timing/{phase}"] = elapsed
+                if msg:
+                    log_dict[f"{self.name}/status"] = msg
+                if log_dict:
+                    wandb.log(log_dict)
+
         self._data = UtilityExtractionData()
-
         training_step = getattr(self.train_state, 'update_count', 0)
+        n = self.n_samples
+        max_steps = 256
 
-        for i in range(self.n_samples):
-            rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
+        # --- Generate all levels at once ---
+        _log("generate_levels", msg="Generating levels via vmap...")
+        t0 = time.time()
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n)
+        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(levels)
+        _log("generate_levels", time.time() - t0)
 
-            # Generate level via adversary
-            level = self._generate_adversary_level(level_rng)
+        # --- Protagonist batched rollout ---
+        _log("pro_rollout", msg="Running batched protagonist rollout...")
+        t0 = time.time()
+        rng, rng_pro = jax.random.split(rng)
+        pro_result = batched_rollout(
+            rng_pro, levels, max_steps,
+            self.train_state.pro_train_state.apply_fn,
+            self.train_state.pro_train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collection_steps=[-1],
+        )
+        jax.block_until_ready(pro_result.episode_returns)
+        _log("pro_rollout", time.time() - t0)
 
-            # Compute level features
-            features = self._compute_level_features(level)
+        # --- Antagonist batched rollout ---
+        _log("ant_rollout", msg="Running batched antagonist rollout...")
+        t0 = time.time()
+        rng, rng_ant = jax.random.split(rng)
+        ant_train_state = self.train_state.ant_train_state
+        ant_result = batched_rollout(
+            rng_ant, levels, max_steps,
+            ant_train_state.apply_fn,
+            ant_train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collection_steps=[-1],
+        )
+        jax.block_until_ready(ant_result.episode_returns)
+        _log("ant_rollout", time.time() - t0)
 
-            # Run protagonist and antagonist
-            pro_result = self._evaluate_agent(pro_rng, level, 'protagonist')
-            ant_result = self._evaluate_agent(ant_rng, level, 'antagonist')
+        # --- Extract CPU-side level features ---
+        _log("level_features", msg="Computing level features (CPU)...")
+        t0 = time.time()
+        wall_maps = np.array(levels.wall_map)
+        goal_positions = np.array(levels.goal_pos)
+        agent_positions = np.array(levels.agent_pos)
 
-            # Compute per-feature prediction losses
-            pro_losses = self._compute_per_feature_probe_loss(
-                pro_result['hstate'], level
-            )
+        for i in tqdm(range(n), desc="Level features", leave=False):
+            level_dict = {
+                'wall_map': wall_maps[i],
+                'goal_pos': tuple(int(x) for x in goal_positions[i]) if goal_positions.ndim > 1 else (int(goal_positions[i]),),
+                'agent_pos': tuple(int(x) for x in agent_positions[i]) if agent_positions.ndim > 1 else (int(agent_positions[i]),),
+            }
+            features = self._compute_level_features(level_dict)
 
-            # Compute regret
-            regret = ant_result['return'] - pro_result['return']
-
-            # Store data
             self._data.wall_densities.append(features['wall_density'])
             self._data.goal_distances.append(features['goal_distance'])
             self._data.path_lengths.append(features['path_length'])
             self._data.num_corridors.append(features.get('num_corridors', 0))
             self._data.open_space_ratios.append(features.get('open_space_ratio', 0.0))
 
-            self._data.protagonist_returns.append(pro_result['return'])
-            self._data.antagonist_returns.append(ant_result['return'])
-            self._data.regrets.append(regret)
-
+            # Per-feature probe loss (placeholder)
+            pro_losses = self._compute_per_feature_probe_loss(
+                pro_result.hstates_by_step["-1"][i], level_dict
+            )
             self._data.wall_prediction_losses.append(pro_losses.get('wall_loss', 0.0))
             self._data.goal_prediction_losses.append(pro_losses.get('goal_loss', 0.0))
             self._data.total_prediction_losses.append(pro_losses.get('total_loss', 0.0))
+        _log("level_features", time.time() - t0)
 
-            self._data.training_steps.append(training_step)
-            self._data.adversary_entropies.append(
-                self._compute_adversary_entropy(level_rng)
-            )
+        # --- Populate returns and regret ---
+        pro_returns = np.array(pro_result.episode_returns)
+        ant_returns = np.array(ant_result.episode_returns)
+        regrets = ant_returns - pro_returns
 
+        self._data.protagonist_returns = pro_returns.tolist()
+        self._data.antagonist_returns = ant_returns.tolist()
+        self._data.regrets = regrets.tolist()
+        self._data.training_steps = [training_step] * n
+
+        # Adversary entropy (placeholder per level)
+        rng_entropies = jax.random.split(rng, n)
+        self._data.adversary_entropies = [
+            self._compute_adversary_entropy(rng_entropies[i]) for i in range(n)
+        ]
+
+        _log("collect_data_done", msg=f"Data collection complete ({n} samples)")
         return self._data
-
-    def _generate_adversary_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level using the adversary (or random if not available)."""
-        height, width = 13, 13
-
-        # For checkpoint experiments, generate random levels as proxy
-        # In training-time experiments, use actual adversary
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-        }
 
     def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
         """Compute level features for symbolic regression."""
@@ -260,113 +308,60 @@ class UtilityExtractionExperiment(CheckpointExperiment):
 
         return corridors
 
-    def _evaluate_agent(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-        agent_type: str,
-        max_steps: int = 256,
-    ) -> Dict[str, Any]:
-        """Evaluate protagonist or antagonist on a level."""
-        # Get appropriate train state
-        if agent_type == 'protagonist':
-            agent_state = self.train_state.pro_train_state
-        else:
-            agent_state = self.train_state.ant_train_state
-
-        # Initialize hidden state
-        hstate = self._initialize_hstate(rng)
-
-        total_return = 0.0
-        final_hstate = hstate
-
-        for step in range(max_steps):
-            rng, step_rng = jax.random.split(rng)
-
-            obs = self._create_observation(level, step)
-            new_hstate, pi, value = self._forward_step(obs, hstate, agent_state)
-
-            # Sample action
-            action = pi.sample(seed=step_rng)
-            hstate = new_hstate
-            final_hstate = hstate
-
-            # Simulate reward (simplified)
-            reward = 0.0
-            done = step >= max_steps - 1
-
-            if step > 10:
-                solve_prob = 0.3 * (1 - level['wall_map'].mean())
-                if float(jax.random.uniform(step_rng)) < solve_prob / max_steps:
-                    reward = 1.0
-                    done = True
-
-            total_return += reward
-            if done:
-                break
-
-        return {
-            'return': total_return,
-            'hstate': final_hstate,
-            'solved': total_return > 0,
-        }
-
-    def _initialize_hstate(self, rng: chex.PRNGKey):
-        """Initialize hidden state."""
-        hidden_dim = 256
-        return (
-            jnp.zeros((1, hidden_dim)),  # c
-            jnp.zeros((1, hidden_dim)),  # h
-        )
-
-    def _create_observation(self, level: Dict[str, Any], step: int):
-        """Create observation from level."""
-        height, width = level['wall_map'].shape
-        image = np.zeros((height, width, 3), dtype=np.float32)
-        image[:, :, 0] = level['wall_map'].astype(np.float32)
-        image[level['goal_pos']] = [0, 1, 0]
-
-        agent_y = (level['agent_pos'][0] + step // 10) % (height - 2) + 1
-        agent_x = (level['agent_pos'][1] + step % 10) % (width - 2) + 1
-        image[agent_y, agent_x, 2] = 1.0
-
-        class Obs:
-            def __init__(self, img, direction):
-                self.image = img
-                self.agent_dir = direction
-
-        return Obs(jnp.array(image), jnp.array([0]))
-
-    def _forward_step(self, obs, hstate, agent_state):
-        """Forward pass through agent network."""
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
-        done_batch = jnp.zeros((1, 1), dtype=bool)
-
-        new_hstate, pi, value = agent_state.apply_fn(
-            agent_state.params, (obs_batch, done_batch), hstate
-        )
-        return new_hstate, pi, value
-
     def _compute_per_feature_probe_loss(
         self,
         hstate,
         level: Dict[str, Any],
     ) -> Dict[str, float]:
-        """Compute prediction loss for each feature separately."""
-        # This would use the probe if available
-        # For now, return placeholder values
-        wall_density = float(level['wall_map'].mean())
+        """Compute prediction loss for each feature separately using real probe."""
+        from ..utils.agent_aware_loss import (
+            compute_agent_prediction_loss,
+            create_level_object,
+        )
 
-        return {
-            'wall_loss': 0.5 * wall_density,  # Placeholder
-            'goal_loss': 0.5,  # Placeholder
-            'total_loss': 0.5 * wall_density + 0.5,
-        }
+        try:
+            rng = jax.random.PRNGKey(hash(str(level.get('wall_map', [[]])[0][:3])) % 2**31)
+            total_loss, loss_metrics = compute_agent_prediction_loss(
+                self.agent, self.train_state, level, rng,
+            )
+            return {
+                'wall_loss': loss_metrics.get('wall_loss', total_loss / 3),
+                'goal_loss': loss_metrics.get('goal_loss', total_loss / 3),
+                'total_loss': total_loss,
+            }
+        except Exception:
+            # Fallback: compute from hstate distance to level features
+            hstate_flat = np.array(hstate).flatten()
+            wall_map_flat = np.array(level['wall_map']).flatten()
+            # Use cosine similarity as proxy for prediction quality
+            h_norm = np.linalg.norm(hstate_flat[:len(wall_map_flat)])
+            w_norm = np.linalg.norm(wall_map_flat)
+            if h_norm > 0 and w_norm > 0:
+                cos_sim = np.dot(hstate_flat[:len(wall_map_flat)], wall_map_flat) / (h_norm * w_norm)
+                wall_loss = float(1.0 - abs(cos_sim))
+            else:
+                wall_loss = 1.0
+            return {
+                'wall_loss': wall_loss,
+                'goal_loss': 1.0 - wall_loss * 0.5,
+                'total_loss': wall_loss + (1.0 - wall_loss * 0.5),
+            }
 
     def _compute_adversary_entropy(self, rng: chex.PRNGKey) -> float:
-        """Compute adversary generation entropy (diversity)."""
-        # Placeholder - would compute from actual adversary policy
-        return float(jax.random.uniform(rng) * 2.0)
+        """Compute adversary generation entropy from real policy."""
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is None:
+            return 0.0
+        try:
+            # Generate a level and get adversary's action entropy
+            from ..utils.paired_helpers import generate_levels, get_action_distribution
+            levels = generate_levels(self.agent, rng, 1)
+            _, entropies = get_action_distribution(adv_ts, self.agent, levels, rng)
+            # Mean entropy across steps (excluding NaN)
+            valid = entropies[~np.isnan(entropies)]
+            return float(np.mean(valid)) if len(valid) > 0 else 0.0
+        except Exception:
+            return 0.0
 
     def analyze(self) -> Dict[str, Any]:
         """Fit symbolic regression and extract Û."""

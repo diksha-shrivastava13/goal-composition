@@ -12,6 +12,14 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_hstates,
+    get_ant_hstates,
+    get_real_hstates,
+    levels_to_dicts,
+)
 
 
 @dataclass
@@ -58,31 +66,26 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
             raise ValueError(f"RepresentationDivergenceExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[DivergenceSnapshot]:
-        """Collect data at current checkpoint."""
+        """Collect data at current checkpoint using real network evaluations."""
         checkpoint_step = getattr(self.train_state, 'update_count', 0)
 
-        pro_hstates = []
-        ant_hstates = []
-        level_features = []
+        rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
 
-        for i in range(self.n_levels_per_checkpoint):
-            rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
+        # Generate real levels
+        levels = generate_levels(self.agent, level_rng, self.n_levels_per_checkpoint)
 
-            # Generate level
-            level = self._generate_level(level_rng)
-            features = self._compute_level_features(level)
-            level_features.append(features)
+        # Extract level features
+        batch_features = extract_level_features_batch(levels)
+        level_features = [
+            {k: float(v[i]) for k, v in batch_features.items()}
+            for i in range(self.n_levels_per_checkpoint)
+        ]
 
-            # Get protagonist hidden state
-            pro_h = self._get_protagonist_hstate(pro_rng, level)
-            pro_hstates.append(pro_h)
+        # Get real protagonist hidden states
+        pro_hstates = get_pro_hstates(pro_rng, levels, self)
 
-            # Get antagonist hidden state
-            ant_h = self._get_antagonist_hstate(ant_rng, level)
-            ant_hstates.append(ant_h)
-
-        pro_hstates = np.array(pro_hstates)
-        ant_hstates = np.array(ant_hstates)
+        # Get real antagonist hidden states
+        ant_hstates = get_ant_hstates(ant_rng, levels, self)
 
         # Compute metrics
         cka = self._compute_cka(pro_hstates, ant_hstates)
@@ -101,57 +104,6 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
 
         self._snapshots.append(snapshot)
         return self._snapshots
-
-    def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a level."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {'wall_density': wall_density, 'goal_distance': goal_distance}
-
-    def _get_protagonist_hstate(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-    ) -> np.ndarray:
-        """Get protagonist hidden state (simplified)."""
-        features = self._compute_level_features(level)
-        h = np.array(jax.random.normal(rng, (self.hidden_dim,)))
-        # Protagonist encodes wall density in first dims
-        h[:50] += features['wall_density'] * 2.0
-        return h
-
-    def _get_antagonist_hstate(
-        self,
-        rng: chex.PRNGKey,
-        level: Dict[str, Any],
-    ) -> np.ndarray:
-        """Get antagonist hidden state (simplified)."""
-        features = self._compute_level_features(level)
-        h = np.array(jax.random.normal(rng, (self.hidden_dim,)))
-        # Antagonist encodes different aspects
-        h[50:100] += features['goal_distance'] * 0.5
-        h[100:150] += features['wall_density'] * 1.5
-        return h
 
     def _compute_cka(self, X: np.ndarray, Y: np.ndarray) -> float:
         """Compute linear CKA."""

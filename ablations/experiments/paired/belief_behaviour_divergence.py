@@ -12,6 +12,10 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels, extract_level_features_batch, get_pro_hstates,
+    get_action_distribution, get_values_from_rollout,
+)
 
 
 @dataclass
@@ -73,50 +77,111 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
             raise ValueError(f"BeliefBehaviourDivergenceExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[DivergencePoint]:
-        """Collect data for divergence analysis."""
-        # First, train probes
+        """Collect data for divergence analysis using real network evaluations."""
+        # First, train probes on real data
         rng, probe_rng = jax.random.split(rng)
         self._train_probes(probe_rng)
 
-        # Then collect and analyze data
+        # Then collect and analyze data in batch
+        rng, level_rng, hstate_rng, action_rng, val_rng = jax.random.split(rng, 5)
+
+        # Generate real levels
+        levels = generate_levels(self.agent, level_rng, self.n_samples)
+
+        # Get real hidden states
+        hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = hstates.shape[1]
+
+        # Get real action distribution (policy)
+        logits, entropies = get_action_distribution(
+            self.train_state, self.agent, levels, action_rng,
+        )
+        # Take last-step logits as representative policy per level
+        last_logits = logits[:, -1, :]  # (n, n_actions)
+
+        # Get real value estimates
+        values = get_values_from_rollout(
+            self.train_state, self.agent, levels, val_rng,
+        )  # (n, max_steps)
+        # Use mean value as the episode value estimate
+        mean_values = values.mean(axis=1)  # (n,)
+
+        # Extract real level features
+        features_batch = extract_level_features_batch(levels)
+
         for i in range(self.n_samples):
-            rng, sample_rng = jax.random.split(rng)
-            point = self._collect_sample(sample_rng, i)
-            self._data_points.append(point)
-
-        return self._data_points
-
-    def _train_probes(self, rng: chex.PRNGKey):
-        """Train probes to decode beliefs from hidden states."""
-        # Generate training data
-        training_hstates = []
-        training_features = []
-
-        for i in range(200):
-            rng, h_rng, f_rng = jax.random.split(rng, 3)
-
-            # Generate features
-            wall_density = 0.1 + float(jax.random.uniform(f_rng)) * 0.35
-            goal_distance = 2.0 + float(jax.random.uniform(f_rng)) * 10.0
+            wall_density = float(features_batch['wall_density'][i])
+            goal_distance = float(features_batch['goal_distance'][i])
             difficulty = wall_density * 0.5 + goal_distance * 0.05
 
-            features = {
+            level_features = {
                 'wall_density': wall_density,
                 'goal_distance': goal_distance,
                 'difficulty': difficulty,
             }
-            training_features.append(features)
 
-            # Generate hidden state with belief encoding
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-            # Beliefs are encoded in hidden state (but not perfectly)
-            h[:40] += wall_density * 2.0 + float(jax.random.normal(h_rng)) * 0.3
-            h[40:80] += goal_distance * 0.2 + float(jax.random.normal(h_rng)) * 0.2
-            h[80:120] += difficulty * 1.5 + float(jax.random.normal(h_rng)) * 0.4
+            h = hstates[i]
 
-            training_hstates.append(h)
+            # Decode beliefs using trained probes
+            decoded_beliefs = self._decode_beliefs(h)
 
-        training_hstates = np.array(training_hstates)
+            # Real policy from network
+            sample_logits = last_logits[i]
+            # Pad/truncate to 4 actions
+            if len(sample_logits) < 4:
+                sample_logits = np.pad(sample_logits, (0, 4 - len(sample_logits)))
+            elif len(sample_logits) > 4:
+                sample_logits = sample_logits[:4]
+            policy = np.exp(sample_logits - np.max(sample_logits))
+            policy = policy / policy.sum()
+
+            actual_value = float(mean_values[i])
+
+            # Compute divergences
+            belief_policy_divergence = self._compute_belief_policy_divergence(
+                decoded_beliefs, policy, level_features
+            )
+            belief_value_divergence = self._compute_belief_value_divergence(
+                decoded_beliefs, actual_value, level_features
+            )
+
+            self._data_points.append(DivergencePoint(
+                step=i,
+                level_features=level_features,
+                hstate=h,
+                probe_decoded_belief=decoded_beliefs,
+                actual_policy=policy,
+                actual_value=actual_value,
+                belief_policy_divergence=belief_policy_divergence,
+                belief_value_divergence=belief_value_divergence,
+            ))
+
+        return self._data_points
+
+    def _train_probes(self, rng: chex.PRNGKey):
+        """Train probes to decode beliefs from real hidden states."""
+        rng, level_rng, hstate_rng = jax.random.split(rng, 3)
+
+        n_probe_train = 200
+
+        # Generate real levels for probe training
+        levels = generate_levels(self.agent, level_rng, n_probe_train)
+
+        # Get real hidden states
+        training_hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = training_hstates.shape[1]
+
+        # Extract real features as targets
+        features_batch = extract_level_features_batch(levels)
+        training_features = []
+        for i in range(n_probe_train):
+            wall_density = float(features_batch['wall_density'][i])
+            goal_distance = float(features_batch['goal_distance'][i])
+            training_features.append({
+                'wall_density': wall_density,
+                'goal_distance': goal_distance,
+                'difficulty': wall_density * 0.5 + goal_distance * 0.05,
+            })
 
         # Train linear probes for each feature
         from sklearn.linear_model import Ridge
@@ -137,72 +202,6 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
             prediction = np.dot(hstate, weights['coef']) + weights['intercept']
             beliefs[feature_name] = float(prediction)
         return beliefs
-
-    def _collect_sample(self, rng: chex.PRNGKey, step: int) -> DivergencePoint:
-        """Collect a single sample."""
-        rng, f_rng, h_rng, p_rng, v_rng = jax.random.split(rng, 5)
-
-        # Generate level features
-        wall_density = 0.1 + float(jax.random.uniform(f_rng)) * 0.35
-        goal_distance = 2.0 + float(jax.random.uniform(f_rng)) * 10.0
-        difficulty = wall_density * 0.5 + goal_distance * 0.05
-
-        level_features = {
-            'wall_density': wall_density,
-            'goal_distance': goal_distance,
-            'difficulty': difficulty,
-        }
-
-        # Generate hidden state
-        h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-
-        # Encode beliefs (with some noise/corruption)
-        belief_noise = 0.1 + 0.2 * (step / self.n_samples)  # Noise increases
-        h[:40] += wall_density * 2.0 + float(jax.random.normal(h_rng)) * belief_noise
-        h[40:80] += goal_distance * 0.2 + float(jax.random.normal(h_rng)) * belief_noise
-        h[80:120] += difficulty * 1.5 + float(jax.random.normal(h_rng)) * belief_noise
-
-        # Decode beliefs
-        decoded_beliefs = self._decode_beliefs(h)
-
-        # Generate actual policy (may diverge from beliefs due to optimization)
-        # Policy is influenced by TRUE features, not necessarily beliefs
-        base_logits = np.zeros(4)
-        base_logits[0] = wall_density * 0.5  # Cautious action
-        base_logits[1] = (1.0 - wall_density) * 0.4  # Bold action
-        base_logits[2] = goal_distance * 0.1  # Search action
-        base_logits[3] = difficulty * 0.3  # Wait action
-
-        # Add divergence: policy sometimes ignores beliefs
-        if float(jax.random.uniform(p_rng)) < 0.3:
-            # Randomly deviate from belief-optimal policy
-            base_logits += np.array(jax.random.normal(p_rng, (4,))) * 0.5
-
-        policy_logits = base_logits + np.array(jax.random.normal(p_rng, (4,))) * 0.2
-        policy = np.exp(policy_logits - np.max(policy_logits))
-        policy = policy / policy.sum()
-
-        # Generate actual value
-        actual_value = 0.7 - difficulty * 0.4 + float(jax.random.uniform(v_rng)) * 0.1
-
-        # Compute divergences
-        belief_policy_divergence = self._compute_belief_policy_divergence(
-            decoded_beliefs, policy, level_features
-        )
-        belief_value_divergence = self._compute_belief_value_divergence(
-            decoded_beliefs, actual_value, level_features
-        )
-
-        return DivergencePoint(
-            step=step,
-            level_features=level_features,
-            hstate=h,
-            probe_decoded_belief=decoded_beliefs,
-            actual_policy=policy,
-            actual_value=actual_value,
-            belief_policy_divergence=belief_policy_divergence,
-            belief_value_divergence=belief_value_divergence,
-        )
 
     def _compute_belief_policy_divergence(
         self,

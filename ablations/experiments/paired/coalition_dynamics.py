@@ -12,6 +12,11 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_ant_returns,
+)
 
 
 @dataclass
@@ -58,7 +63,7 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
             raise ValueError(f"CoalitionDynamicsExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> TimeSeriesData:
-        """Collect time series data."""
+        """Collect time series data using real rollouts at each step."""
         steps = []
         adversary_difficulty = []
         antagonist_performance = []
@@ -66,24 +71,23 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
         regrets = []
 
         for t in range(self.trajectory_length):
-            rng, step_rng = jax.random.split(rng)
+            rng, gen_rng, eval_rng = jax.random.split(rng, 3)
 
-            # Simulate adversary difficulty evolution
-            # Adversary increases difficulty over training with oscillations
-            base_difficulty = 0.3 + 0.4 * (t / self.trajectory_length)
-            noise = float(jax.random.uniform(step_rng)) * 0.1
-            difficulty = base_difficulty + noise + 0.1 * np.sin(t * 0.1)
+            # Generate a batch of real levels for this time step
+            levels = generate_levels(self.agent, gen_rng, self.n_samples_per_step)
 
-            # Antagonist performance (responds to adversary)
-            # Antagonist improves but lags behind adversary difficulty
-            rng, ant_rng = jax.random.split(rng)
-            ant_base = 0.8 - difficulty * 0.3
-            ant_perf = ant_base + float(jax.random.uniform(ant_rng)) * 0.1
+            # Extract level features to compute adversary difficulty
+            batch_features = extract_level_features_batch(levels)
+            # Adversary difficulty = mean wall density (proxy for level hardness)
+            difficulty = float(batch_features['wall_density'].mean())
 
-            # Protagonist performance (also responds, but more slowly)
-            rng, pro_rng = jax.random.split(rng)
-            pro_base = 0.7 - difficulty * 0.4
-            pro_perf = pro_base + float(jax.random.uniform(pro_rng)) * 0.1
+            # Get real protagonist and antagonist returns via rollouts
+            pro_returns, ant_returns, step_regrets = get_pro_ant_returns(
+                eval_rng, levels, self
+            )
+
+            ant_perf = float(ant_returns.mean())
+            pro_perf = float(pro_returns.mean())
 
             steps.append(t)
             adversary_difficulty.append(difficulty)

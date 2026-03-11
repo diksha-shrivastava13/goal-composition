@@ -12,6 +12,10 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels, extract_level_features_batch, get_pro_hstates,
+    get_action_distribution, get_values_from_rollout,
+)
 
 
 @dataclass
@@ -30,10 +34,11 @@ class TeachingOpacityExperiment(CheckpointExperiment):
     Measure adversary strategy visibility to protagonist.
 
     Protocol:
-    1. Extract adversary's teaching strategy (from A2)
-    2. Probe protagonist h-state for adversary strategy prediction
-    3. Measure strategy visibility over training
-    4. Analyze opacity's effect on learning
+    1. Generate levels (representing adversary's teaching strategy)
+    2. Run protagonist on those levels to get real hidden states
+    3. Extract level features as proxy for adversary strategy
+    4. Train probes to predict strategy from protagonist h-state
+    5. Measure strategy visibility and predictability
     """
 
     @property
@@ -52,7 +57,7 @@ class TeachingOpacityExperiment(CheckpointExperiment):
         self.n_adversary_strategies = n_adversary_strategies
         self.hidden_dim = hidden_dim
         self._measurements: List[OpacityMeasurement] = []
-        self._strategy_predictor_weights: Optional[np.ndarray] = None
+        self._strategy_predictor_weights: Optional[Dict] = None
         self._require_paired()
 
     def _require_paired(self):
@@ -60,75 +65,104 @@ class TeachingOpacityExperiment(CheckpointExperiment):
             raise ValueError(f"TeachingOpacityExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[OpacityMeasurement]:
-        """Collect opacity measurements."""
-        # First train strategy predictor
+        """Collect opacity measurements using real network data."""
+        # First train strategy predictor on real data
         rng, train_rng = jax.random.split(rng)
         self._train_strategy_predictor(train_rng)
 
-        # Then collect measurements
+        # Generate real levels and get real protagonist hidden states
+        rng, level_rng, hstate_rng = jax.random.split(rng, 3)
+        levels = generate_levels(self.agent, level_rng, self.n_samples)
+        hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = hstates.shape[1]
+
+        # Extract level features as adversary strategy proxy
+        features_batch = extract_level_features_batch(levels)
+
         for i in range(self.n_samples):
-            rng, sample_rng = jax.random.split(rng)
-            measurement = self._collect_measurement(sample_rng, i)
-            self._measurements.append(measurement)
+            wall_density = float(features_batch['wall_density'][i])
+            goal_distance = float(features_batch['goal_distance'][i])
 
-        return self._measurements
+            # Adversary "strategy" = the level properties it chose
+            strategy = {
+                'difficulty': wall_density * 0.5 + goal_distance * 0.05,
+                'wall_focus': wall_density,
+                'distance_focus': goal_distance / 18.4,  # Normalize by max grid diagonal
+                'variation': float(np.std(np.array(levels.wall_map)[i])),
+                'strategy_type': float(
+                    self._classify_strategy(wall_density, goal_distance)
+                ),
+            }
 
-    def _generate_adversary_strategy(self, rng: chex.PRNGKey, step: int) -> Dict[str, float]:
-        """Generate adversary teaching strategy."""
-        rng, s_rng = jax.random.split(rng)
+            h = hstates[i]
 
-        # Strategy evolves over training
-        base_difficulty = 0.2 + 0.5 * (step / self.n_samples)
-
-        # Different strategy dimensions
-        wall_focus = 0.3 + float(jax.random.uniform(s_rng)) * 0.4
-        distance_focus = 0.2 + float(jax.random.uniform(s_rng)) * 0.5
-        variation = 0.1 + float(jax.random.uniform(s_rng)) * 0.3
-
-        # Strategy type (discrete)
-        strategy_type = int(jax.random.randint(s_rng, (), 0, self.n_adversary_strategies))
-
-        return {
-            'difficulty': base_difficulty,
-            'wall_focus': wall_focus,
-            'distance_focus': distance_focus,
-            'variation': variation,
-            'strategy_type': float(strategy_type),
-        }
-
-    def _train_strategy_predictor(self, rng: chex.PRNGKey):
-        """Train a probe to predict adversary strategy from protagonist h-state."""
-        # Generate training data
-        training_hstates = []
-        training_strategies = []
-
-        for i in range(200):
-            rng, h_rng, s_rng = jax.random.split(rng, 3)
-
-            # Generate strategy
-            strategy = self._generate_adversary_strategy(s_rng, i)
-
-            # Generate protagonist h-state with strategy encoding
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-
-            # Protagonist partially encodes adversary strategy
-            # (imperfect encoding = opacity)
-            visibility = 0.3 + float(jax.random.uniform(h_rng)) * 0.4
-            h[:30] += strategy['difficulty'] * visibility * 2.0
-            h[30:60] += strategy['wall_focus'] * visibility * 1.5
-            h[60:90] += strategy['distance_focus'] * visibility * 1.0
-
-            training_hstates.append(h)
-            training_strategies.append([
+            # Predict strategy from protagonist hidden state
+            predicted_strategy = self._predict_strategy(h)
+            true_strategy = np.array([
                 strategy['difficulty'],
                 strategy['wall_focus'],
                 strategy['distance_focus'],
             ])
 
-        training_hstates = np.array(training_hstates)
+            # Predictability = 1 - normalized prediction error
+            prediction_error = np.linalg.norm(predicted_strategy - true_strategy)
+            max_possible_error = np.sqrt(3)
+            predictability = max(0, 1 - prediction_error / max_possible_error)
+
+            # Strategy visibility = correlation-based metric
+            visibility_score = self._compute_visibility(h, strategy)
+
+            # Curriculum transparency = overall legibility
+            transparency = (predictability + visibility_score) / 2
+
+            self._measurements.append(OpacityMeasurement(
+                step=i,
+                adversary_strategy=strategy,
+                protagonist_encoding=h,
+                adversary_predictability=float(predictability),
+                strategy_visibility=float(visibility_score),
+                curriculum_transparency=float(transparency),
+            ))
+
+        return self._measurements
+
+    def _classify_strategy(self, wall_density: float, goal_distance: float) -> int:
+        """Classify level into discrete strategy type based on features."""
+        if wall_density > 0.3 and goal_distance > 8.0:
+            return 0  # Hard: dense walls + far goal
+        elif wall_density > 0.3:
+            return 1  # Wall-heavy
+        elif goal_distance > 8.0:
+            return 2  # Distance-heavy
+        elif wall_density < 0.1:
+            return 3  # Open/easy
+        else:
+            return 4  # Moderate
+
+    def _train_strategy_predictor(self, rng: chex.PRNGKey):
+        """Train a probe to predict adversary strategy from real protagonist h-state."""
+        rng, level_rng, hstate_rng = jax.random.split(rng, 3)
+
+        n_train = 200
+        levels = generate_levels(self.agent, level_rng, n_train)
+        training_hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = training_hstates.shape[1]
+
+        features_batch = extract_level_features_batch(levels)
+
+        # Build strategy targets from real level features
+        training_strategies = []
+        for i in range(n_train):
+            wd = float(features_batch['wall_density'][i])
+            gd = float(features_batch['goal_distance'][i])
+            training_strategies.append([
+                wd * 0.5 + gd * 0.05,  # difficulty
+                wd,                      # wall_focus
+                gd / 18.4,              # distance_focus (normalized)
+            ])
+
         training_strategies = np.array(training_strategies)
 
-        # Train linear predictor
         from sklearn.linear_model import Ridge
         model = Ridge(alpha=0.1)
         model.fit(training_hstates, training_strategies)
@@ -146,78 +180,20 @@ class TeachingOpacityExperiment(CheckpointExperiment):
         prediction = hstate @ self._strategy_predictor_weights['coef'].T + self._strategy_predictor_weights['intercept']
         return prediction
 
-    def _collect_measurement(self, rng: chex.PRNGKey, step: int) -> OpacityMeasurement:
-        """Collect a single opacity measurement."""
-        rng, s_rng, h_rng = jax.random.split(rng, 3)
-
-        # Generate adversary strategy
-        strategy = self._generate_adversary_strategy(s_rng, step)
-
-        # Generate protagonist h-state
-        h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-
-        # Encode strategy with varying visibility
-        # Earlier in training: more opaque, later: more visible
-        base_visibility = 0.2 + 0.4 * (step / self.n_samples)
-        noise_level = 0.5 - 0.3 * (step / self.n_samples)
-
-        visibility = base_visibility + float(jax.random.uniform(h_rng)) * 0.2
-        h[:30] += strategy['difficulty'] * visibility * 2.0 + float(jax.random.normal(h_rng)) * noise_level
-        h[30:60] += strategy['wall_focus'] * visibility * 1.5 + float(jax.random.normal(h_rng)) * noise_level
-        h[60:90] += strategy['distance_focus'] * visibility * 1.0 + float(jax.random.normal(h_rng)) * noise_level
-
-        # Compute opacity metrics
-        predicted_strategy = self._predict_strategy(h)
-        true_strategy = np.array([
+    def _compute_visibility(self, hstate: np.ndarray, strategy: Dict[str, float]) -> float:
+        """Compute how visible strategy is in h-state using probe predictions."""
+        predicted = self._predict_strategy(hstate)
+        true_vals = np.array([
             strategy['difficulty'],
             strategy['wall_focus'],
             strategy['distance_focus'],
         ])
 
-        # Predictability = 1 - normalized prediction error
-        prediction_error = np.linalg.norm(predicted_strategy - true_strategy)
-        max_possible_error = np.sqrt(3)  # Approximate max for normalized features
-        predictability = max(0, 1 - prediction_error / max_possible_error)
+        # Per-dimension accuracy (1 - relative error, clipped to [0, 1])
+        rel_errors = np.abs(predicted - true_vals) / (np.abs(true_vals) + 1e-6)
+        accuracies = np.clip(1.0 - rel_errors, 0, 1)
 
-        # Strategy visibility = correlation between h-state regions and strategy features
-        visibility_score = self._compute_visibility(h, strategy)
-
-        # Curriculum transparency = overall legibility
-        transparency = (predictability + visibility_score) / 2
-
-        return OpacityMeasurement(
-            step=step,
-            adversary_strategy=strategy,
-            protagonist_encoding=h,
-            adversary_predictability=float(predictability),
-            strategy_visibility=float(visibility_score),
-            curriculum_transparency=float(transparency),
-        )
-
-    def _compute_visibility(self, hstate: np.ndarray, strategy: Dict[str, float]) -> float:
-        """Compute how visible strategy is in h-state."""
-        # Check correlation between h-state regions and strategy features
-        correlations = []
-
-        # Difficulty visibility
-        h_difficulty_region = hstate[:30].mean()
-        expected_difficulty = strategy['difficulty'] * 2.0
-        corr = 1.0 - abs(h_difficulty_region - expected_difficulty) / (expected_difficulty + 1)
-        correlations.append(max(0, corr))
-
-        # Wall focus visibility
-        h_wall_region = hstate[30:60].mean()
-        expected_wall = strategy['wall_focus'] * 1.5
-        corr = 1.0 - abs(h_wall_region - expected_wall) / (expected_wall + 1)
-        correlations.append(max(0, corr))
-
-        # Distance focus visibility
-        h_dist_region = hstate[60:90].mean()
-        expected_dist = strategy['distance_focus'] * 1.0
-        corr = 1.0 - abs(h_dist_region - expected_dist) / (expected_dist + 1)
-        correlations.append(max(0, corr))
-
-        return float(np.mean(correlations))
+        return float(np.mean(accuracies))
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze teaching opacity."""
@@ -277,7 +253,7 @@ class TeachingOpacityExperiment(CheckpointExperiment):
             'mid_opacity': float(mid_opacity),
             'late_opacity': float(late_opacity),
             'transparency_trend_slope': float(slope),
-            'opacity_decreases_over_training': slope > 0,  # Transparency increases = opacity decreases
+            'opacity_decreases_over_training': slope > 0,
         }
 
     def _analyze_by_strategy(self) -> Dict[int, Dict[str, float]]:
@@ -302,10 +278,6 @@ class TeachingOpacityExperiment(CheckpointExperiment):
 
     def _analyze_learning_effect(self) -> Dict[str, float]:
         """Analyze how opacity affects learning (proxy metrics)."""
-        # Higher opacity (lower visibility) should correlate with:
-        # - Higher encoding variance (uncertainty)
-        # - Lower strategy predictability
-
         opacities = [1.0 - m.curriculum_transparency for m in self._measurements]
 
         # Encoding variance
@@ -329,7 +301,6 @@ class TeachingOpacityExperiment(CheckpointExperiment):
         if not self._measurements:
             return {}
 
-        # Compute R² for each strategy dimension
         true_difficulties = [m.adversary_strategy['difficulty'] for m in self._measurements]
         true_wall_focus = [m.adversary_strategy['wall_focus'] for m in self._measurements]
         true_dist_focus = [m.adversary_strategy['distance_focus'] for m in self._measurements]

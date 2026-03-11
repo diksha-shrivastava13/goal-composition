@@ -12,6 +12,10 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels, extract_level_features_batch, get_pro_hstates,
+    get_action_distribution,
+)
 
 
 @dataclass
@@ -83,61 +87,46 @@ class GoalEvolutionExperiment(CheckpointExperiment):
         return self._trajectory_data
 
     def _collect_step_data(self, rng: chex.PRNGKey, step: int) -> Dict[str, Any]:
-        """Collect data for a single step."""
-        hstates = []
-        actions = []
-        level_features_list = []
+        """Collect data for a single step using real network evaluations."""
+        rng, level_rng, hstate_rng, action_rng = jax.random.split(rng, 4)
 
-        # Simulate diverse level contexts
-        for i in range(self.n_samples_per_step):
-            rng, h_rng, f_rng, a_rng = jax.random.split(rng, 4)
+        # Generate real levels
+        levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
 
-            # Level features
-            wall_density = 0.1 + float(jax.random.uniform(f_rng)) * 0.3
-            goal_distance = 2.0 + float(jax.random.uniform(f_rng)) * 10.0
+        # Get real hidden states from protagonist network
+        hstates = get_pro_hstates(hstate_rng, levels, self)
+        self.hidden_dim = hstates.shape[1]
 
-            level_features = {
-                'wall_density': wall_density,
-                'goal_distance': goal_distance,
+        # Get real action distribution from protagonist
+        logits, _ = get_action_distribution(
+            self.train_state, self.agent, levels, action_rng,
+        )
+        # logits shape: (n, max_steps, n_actions) -> take last step per episode
+        last_logits = logits[:, -1, :]  # (n, n_actions)
+        actions = np.argmax(last_logits, axis=-1)
+
+        # Extract real level features
+        features_batch = extract_level_features_batch(levels)
+        level_features_list = [
+            {
+                'wall_density': float(features_batch['wall_density'][i]),
+                'goal_distance': float(features_batch['goal_distance'][i]),
             }
-            level_features_list.append(level_features)
+            for i in range(self.n_samples_per_step)
+        ]
 
-            # Hidden state with shard-like structure
-            h = np.array(jax.random.normal(h_rng, (self.hidden_dim,)))
-
-            # Different dimensions activate in different contexts
-            # Shard 1: Activates for high wall density (nav shard)
-            if wall_density > 0.25:
-                h[:30] += 2.0
-
-            # Shard 2: Activates for large goal distance (exploration shard)
-            if goal_distance > 8.0:
-                h[30:60] += 1.5
-
-            # Shard 3: Emerges over training (learned shard)
-            if step > 20 and wall_density > 0.2 and goal_distance > 5.0:
-                h[60:90] += step * 0.05
-
-            hstates.append(h)
-
-            # Action (4 discrete actions)
-            # Action influenced by shards
-            action_probs = np.array([0.25, 0.25, 0.25, 0.25])
-            if wall_density > 0.25:
-                action_probs[0] += 0.2  # More cautious
-            if goal_distance > 8.0:
-                action_probs[1] += 0.2  # More exploratory
-            action_probs /= action_probs.sum()
-            action = int(jax.random.choice(a_rng, 4, p=action_probs))
-            actions.append(action)
+        # Compute adversary features from level statistics
+        mean_wall = float(np.mean(features_batch['wall_density']))
+        mean_dist = float(np.mean(features_batch['goal_distance']))
+        difficulty = mean_wall * 0.5 + mean_dist * 0.05
 
         return {
             'step': step,
-            'hstates': np.array(hstates),
-            'actions': np.array(actions),
+            'hstates': hstates,
+            'actions': actions,
             'level_features': level_features_list,
             'adversary_features': {
-                'difficulty': 0.3 + 0.3 * (step / self.trajectory_length),
+                'difficulty': difficulty,
                 'curriculum_phase': 'early' if step < 15 else ('mid' if step < 35 else 'late'),
             },
         }

@@ -13,6 +13,11 @@ import jax.numpy as jnp
 import chex
 
 from ..base import CheckpointExperiment
+from ..utils.paired_helpers import (
+    generate_levels,
+    extract_level_features_batch,
+    get_pro_ant_returns,
+)
 
 
 class AdversaryPolicyExtractionExperiment(CheckpointExperiment):
@@ -45,54 +50,34 @@ class AdversaryPolicyExtractionExperiment(CheckpointExperiment):
             raise ValueError(f"Requires PAIRED, got {self.training_method}")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
-        """Sample levels from adversary."""
+        """Sample levels from adversary and evaluate with real rollouts."""
         checkpoint_step = getattr(self.train_state, 'update_count', 0)
 
+        # Generate all levels in a single batched call
+        rng, gen_rng, eval_rng = jax.random.split(rng, 3)
+        levels = generate_levels(self.agent, gen_rng, self.n_levels_per_checkpoint)
+
+        # Extract features for all levels at once
+        batch_features = extract_level_features_batch(levels)
+
+        # Get real protagonist and antagonist returns via rollouts
+        pro_returns, ant_returns, regrets = get_pro_ant_returns(
+            eval_rng, levels, self
+        )
+
+        # Build per-level records
         for i in range(self.n_levels_per_checkpoint):
-            rng, level_rng, eval_rng = jax.random.split(rng, 3)
-
-            level = self._generate_adversary_level(level_rng)
-            features = self._compute_level_features(level)
-            regret = self._compute_regret(eval_rng, level)
-
+            features = {
+                'wall_density': float(batch_features['wall_density'][i]),
+                'goal_distance': float(batch_features['goal_distance'][i]),
+            }
             self._levels_data.append({
                 'features': features,
-                'regret': regret,
+                'regret': float(regrets[i]),
                 'checkpoint_step': checkpoint_step,
             })
 
         return self._levels_data
-
-    def _generate_adversary_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate level via adversary."""
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.25
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        return {
-            'wall_map': wall_map,
-            'goal_pos': (int(jax.random.randint(rng_goal, (), 1, height-1)),
-                        int(jax.random.randint(rng_goal, (), 1, width-1))),
-            'agent_pos': (int(jax.random.randint(rng_agent, (), 1, height-1)),
-                         int(jax.random.randint(rng_agent, (), 1, width-1))),
-        }
-
-    def _compute_level_features(self, level: Dict[str, Any]) -> Dict[str, float]:
-        """Compute level features."""
-        wall_density = float(level['wall_map'].sum() / level['wall_map'].size)
-        goal_distance = float(np.sqrt(
-            (level['goal_pos'][0] - level['agent_pos'][0])**2 +
-            (level['goal_pos'][1] - level['agent_pos'][1])**2
-        ))
-        return {'wall_density': wall_density, 'goal_distance': goal_distance}
-
-    def _compute_regret(self, rng: chex.PRNGKey, level: Dict[str, Any]) -> float:
-        """Compute regret (simplified)."""
-        wall_density = level['wall_map'].mean()
-        return float(0.3 + wall_density * 0.4 + jax.random.uniform(rng) * 0.2)
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze adversary policy."""
