@@ -51,6 +51,9 @@ This is the repository structure, most of the current active work (March 2026) i
 │   │   └── visualization.py
 │   ├── configs
 │   │   ├── __init__.py
+│   │   ├── cli.py
+│   │   ├── defaults.py
+│   │   ├── experiment_defaults.py
 │   │   ├── presets.py
 │   │   └── README.md
 │   ├── experiments
@@ -124,15 +127,19 @@ This is the repository structure, most of the current active work (March 2026) i
 │   │   ├── persistent_rnn.py
 │   │   └── reset_rnn.py
 │   └── scripts
+│       ├── __init__.py
+│       ├── comprehensive_experiment_test.py
 │       ├── evaluate.py
+│       ├── README.md
 │       ├── shell
 │       │   ├── run_matrix.sh
 │       │   └── train_all.sh
+│       ├── smoke_test.py
+│       ├── test_paired_experiments.py
 │       ├── train_all.py
 │       ├── train_with_experiments.py
 │       └── train.py
 ├── docs
-│   └── research_strategy.tex
 ├── elicting_world_models
 │   ├── __init__.py
 │   └── accel_minigrid_cwm.py
