@@ -17,6 +17,7 @@ from ..utils.paired_helpers import (
     generate_levels,
     extract_level_features_batch,
     get_pro_ant_returns,
+    get_pro_hstates,
 )
 
 
@@ -44,13 +45,9 @@ class BilateralUtilityExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "bilateral_utility"
 
-    def __init__(
-        self,
-        n_levels: int = 500,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_levels = n_levels
+        self.n_levels = self.exp_config("n_levels")
         self._data: List[Dict[str, Any]] = []
         self._utility_profiles: Dict[str, AgentUtilityProfile] = {}
         self._require_paired()
@@ -60,9 +57,9 @@ class BilateralUtilityExperiment(CheckpointExperiment):
             raise ValueError(f"BilateralUtilityExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
-        """Collect level data with real returns from protagonist and antagonist."""
+        """Collect level data with real returns and hidden state features."""
         # Generate all levels in a single batched call
-        rng, gen_rng, eval_rng = jax.random.split(rng, 3)
+        rng, gen_rng, eval_rng, hstate_rng = jax.random.split(rng, 4)
         levels = generate_levels(self.agent, gen_rng, self.n_levels)
 
         # Extract features for all levels at once
@@ -73,18 +70,27 @@ class BilateralUtilityExperiment(CheckpointExperiment):
             eval_rng, levels, self
         )
 
+        # Get protagonist hidden states for richer feature extraction
+        pro_hstates = get_pro_hstates(hstate_rng, levels, self)
+        pro_hstates_np = np.array(pro_hstates)
+
         # Build per-level records
         for i in range(self.n_levels):
-            features = {
-                'wall_density': float(batch_features['wall_density'][i]),
-                'goal_distance': float(batch_features['goal_distance'][i]),
-                'open_space_ratio': float(batch_features['open_space_ratio'][i]),
-            }
+            features = {k: float(v[i]) for k, v in batch_features.items()}
+
+            # Add hidden state statistics as features
+            if pro_hstates_np.ndim >= 2:
+                h_i = pro_hstates_np[i]
+                features['hstate_mean'] = float(np.mean(h_i))
+                features['hstate_std'] = float(np.std(h_i))
+                features['hstate_norm'] = float(np.linalg.norm(h_i))
+
             self._data.append({
                 'features': features,
                 'pro_return': float(pro_returns[i]),
                 'ant_return': float(ant_returns[i]),
                 'regret': float(regrets[i]),
+                'pro_hstate': pro_hstates_np[i].copy() if pro_hstates_np.ndim >= 2 else None,
             })
 
         return self._data
@@ -96,20 +102,20 @@ class BilateralUtilityExperiment(CheckpointExperiment):
 
         results = {}
 
-        # Prepare feature matrix
+        # Prepare feature matrix from all available features
+        feature_names = list(self._data[0]['features'].keys())
         features = np.array([
-            [d['features']['wall_density'], d['features']['goal_distance']]
+            [d['features'].get(fn, 0.0) for fn in feature_names]
             for d in self._data
         ])
-        feature_names = ['wall_density', 'goal_distance']
 
         # Fit protagonist utility (proxy: regret minimization)
         regrets = np.array([d['regret'] for d in self._data])
-        u_pro = self._fit_utility(features, -regrets, 'protagonist')  # Minimize regret
+        u_pro = self._fit_utility(features, -regrets, 'protagonist')
         self._utility_profiles['protagonist'] = u_pro
 
-        # Fit adversary utility (proxy: regret maximization)
-        u_adv = self._fit_utility(features, regrets, 'adversary')  # Maximize regret
+        # Fit adversary utility (proxy: regret maximization = U* = R_ant - R_pro)
+        u_adv = self._fit_utility(features, regrets, 'adversary')
         self._utility_profiles['adversary'] = u_adv
 
         # Fit antagonist utility (proxy: own return)
@@ -133,6 +139,19 @@ class BilateralUtilityExperiment(CheckpointExperiment):
             for name, profile in self._utility_profiles.items()
         }
 
+        # Direct h-state → utility probing
+        results['hstate_utility_probing'] = self._fit_utility_from_hstates()
+
+        # Feature importance ranking
+        results['feature_importance'] = {
+            name: {
+                feat: abs(coef)
+                for feat, coef in profile.feature_coefficients.items()
+                if feat not in ('intercept', 'selected_alpha')
+            }
+            for name, profile in self._utility_profiles.items()
+        }
+
         return results
 
     def _fit_utility(
@@ -141,27 +160,46 @@ class BilateralUtilityExperiment(CheckpointExperiment):
         targets: np.ndarray,
         agent_name: str,
     ) -> AgentUtilityProfile:
-        """Fit utility function using Ridge regression."""
-        from sklearn.linear_model import Ridge
+        """Fit utility function using cross-validated Ridge regression.
+
+        Uses all available features and selects regularization strength
+        via cross-validation rather than a hardcoded alpha.
+        """
+        from sklearn.linear_model import RidgeCV
+        from sklearn.preprocessing import StandardScaler
         from sklearn.metrics import r2_score
 
-        model = Ridge(alpha=1.0)
-        model.fit(features, targets)
+        # Standardize features for comparable coefficients
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
 
-        predictions = model.predict(features)
+        # Cross-validated Ridge with multiple alpha candidates
+        alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
+        model = RidgeCV(alphas=alphas, cv=5)
+        model.fit(features_scaled, targets)
+
+        predictions = model.predict(features_scaled)
         r2 = r2_score(targets, predictions)
 
-        coefficients = {
-            'wall_density': float(model.coef_[0]),
-            'goal_distance': float(model.coef_[1]),
-            'intercept': float(model.intercept_),
-        }
+        # Map coefficients back to feature names
+        feature_names = list(self._data[0]['features'].keys()) if self._data else []
+        coefficients = {}
+        for j, name in enumerate(feature_names):
+            if j < len(model.coef_):
+                coefficients[name] = float(model.coef_[j])
+        coefficients['intercept'] = float(model.intercept_)
+        coefficients['selected_alpha'] = float(model.alpha_)
 
-        expression = (
-            f"{coefficients['intercept']:.3f} + "
-            f"{coefficients['wall_density']:.3f}*wall_density + "
-            f"{coefficients['goal_distance']:.3f}*goal_distance"
+        # Build expression from top features (by absolute coefficient)
+        sorted_feats = sorted(
+            [(name, coef) for name, coef in coefficients.items()
+             if name not in ('intercept', 'selected_alpha')],
+            key=lambda x: abs(x[1]), reverse=True
         )
+        expr_parts = [f"{coefficients['intercept']:.3f}"]
+        for name, coef in sorted_feats[:5]:  # Top 5 features
+            expr_parts.append(f"{coef:+.3f}*{name}")
+        expression = " ".join(expr_parts)
 
         return AgentUtilityProfile(
             agent_name=agent_name,
@@ -213,6 +251,35 @@ class BilateralUtilityExperiment(CheckpointExperiment):
                             u_pro.feature_coefficients['goal_distance']])
 
         return float(np.linalg.norm(coef_adv - coef_pro))
+
+    def _fit_utility_from_hstates(self) -> Dict[str, Any]:
+        """Fit utility directly from full h-state vectors using Ridge regression."""
+        from sklearn.linear_model import RidgeCV
+
+        hstates = [d.get('pro_hstate') for d in self._data]
+        if not hstates or hstates[0] is None:
+            return {'error': 'No h-state vectors available'}
+
+        X_h = np.array([h for h in hstates if h is not None])
+        if len(X_h) < 20:
+            return {'error': 'Insufficient h-state samples'}
+
+        valid_data = [d for d in self._data if d.get('pro_hstate') is not None]
+        regrets = np.array([d['regret'] for d in valid_data])
+        pro_returns = np.array([d['pro_return'] for d in valid_data])
+        ant_returns = np.array([d['ant_return'] for d in valid_data])
+
+        results = {}
+        for target_name, y in [('regret', regrets), ('pro_return', pro_returns), ('ant_return', ant_returns)]:
+            try:
+                ridge = RidgeCV(cv=5)
+                ridge.fit(X_h, y)
+                r2 = float(ridge.score(X_h, y))
+                results[f'{target_name}_r2'] = r2
+            except Exception:
+                results[f'{target_name}_r2'] = 0.0
+
+        return results
 
     def visualize(self) -> Dict[str, np.ndarray]:
         """Visualize utility comparisons."""

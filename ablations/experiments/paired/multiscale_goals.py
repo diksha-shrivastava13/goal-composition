@@ -52,17 +52,11 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "multiscale_goals"
 
-    def __init__(
-        self,
-        n_episodes: int = 100,
-        max_steps_per_episode: int = 50,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_episodes = n_episodes
-        self.max_steps_per_episode = max_steps_per_episode
-        self.hidden_dim = hidden_dim
+        self.n_episodes = self.exp_config("n_episodes")
+        self.max_steps_per_episode = self.exp_config("max_steps_per_episode")
+        self.hidden_dim = self.exp_config("hidden_dim")
         self._episode_data: List[Dict[str, Any]] = []
         self._scale_goals: Dict[TemporalScale, List[ScaleGoal]] = {}
         self._require_paired()
@@ -73,16 +67,21 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> List[Dict[str, Any]]:
         """Collect multi-scale trajectory data."""
+        import logging
+        logger = logging.getLogger(__name__)
         for ep in range(self.n_episodes):
             rng, ep_rng = jax.random.split(rng)
             episode = self._collect_episode(ep_rng, ep)
-            self._episode_data.append(episode)
+            if episode is not None:
+                self._episode_data.append(episode)
+            else:
+                logger.warning(f"Skipping episode {ep}: terminal hstate extraction failed")
 
         return self._episode_data
 
     def _collect_episode(self, rng: chex.PRNGKey, episode_idx: int) -> Dict[str, Any]:
         """Collect data for a single episode using real network evaluations."""
-        rng, level_rng, hstate_rng, val_rng, action_rng, ret_rng = jax.random.split(rng, 6)
+        rng, level_rng, hstate_rng, val_rng, action_rng, ret_rng, diff_rng = jax.random.split(rng, 7)
 
         # Generate a single real level for this episode
         levels = generate_levels(self.agent, level_rng, 1)
@@ -111,14 +110,40 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
 
         # Extract level features
         features_batch = extract_level_features_batch(levels)
+
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties_arr = compute_difficulty(levels, self, diff_rng)
+
         wall_density = float(features_batch['wall_density'][0])
         goal_distance = float(features_batch['goal_distance'][0])
-        episode_difficulty = wall_density * 0.5 + goal_distance * 0.05
+        episode_difficulty = float(difficulties_arr[0])
 
-        # Build per-step hstates by tiling the terminal hstate
-        # (the real hstate captures the episode-level representation)
+        # Collect per-step hstates via batched_rollout with all collection steps
         n_steps = min(self.max_steps_per_episode, len(values_ep))
-        hstates = np.tile(hstate_single[0], (n_steps, 1))  # (max_steps, hidden_dim)
+        try:
+            from ..utils.batched_rollout import batched_rollout
+            rng, hstep_rng = jax.random.split(rng)
+            pro_ts = getattr(self.train_state, 'pro_train_state', self.train_state)
+            step_result = batched_rollout(
+                hstep_rng, levels, n_steps,
+                pro_ts.apply_fn, pro_ts.params,
+                self.agent.env, self.agent.env_params,
+                self.agent.initialize_hidden_state(1),
+                collection_steps=list(range(1, n_steps + 1)),
+                return_final_hstate=True,
+            )
+            # hstates_by_step is a dict: {step_key -> (1, hidden_dim)}
+            if step_result.hstates_by_step:
+                hstates = np.array([
+                    step_result.hstates_by_step[k][0]
+                    for k in sorted(step_result.hstates_by_step.keys())
+                ])  # (n_steps, hidden_dim)
+            else:
+                # No per-step hstates available — skip this episode
+                return None
+        except Exception:
+            # hstate extraction failed entirely — skip this episode
+            return None
 
         # Build per-step level features
         level_features = [
@@ -249,6 +274,9 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         # Conflict resolution pattern
         results['conflict_resolution_pattern'] = self._analyze_resolutions()
 
+        # Spatial scale analysis (layer-wise decomposition)
+        results['spatial_goals'] = self._analyze_spatial_goals()
+
         # Per-scale details
         results['per_scale'] = {}
         for scale, goals in self._scale_goals.items():
@@ -350,25 +378,36 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         return float(abs(corr)) if not np.isnan(corr) else 0.0
 
     def _detect_conflicts(self) -> float:
-        """Detect cross-scale conflicts."""
-        # Conflict = when goals at different scales suggest different actions
+        """Detect cross-scale conflicts using PCA-based decomposition."""
+        from sklearn.decomposition import PCA
+
+        # Collect all hstates across episodes
+        all_hstates = []
+        for episode in self._episode_data:
+            all_hstates.extend(episode['hstates'])
+
+        if len(all_hstates) < 4:
+            return 0.0
+
+        all_hstates = np.array(all_hstates)
+        # Fit PCA on collected hstates, use top 3 components as scale signals
+        n_components = min(3, all_hstates.shape[1], len(all_hstates))
+        pca = PCA(n_components=n_components)
+        pca.fit(all_hstates)
+
         conflict_count = 0
         total_comparisons = 0
 
         for episode in self._episode_data:
-            hstates = episode['hstates']
-            actions = episode['actions']
+            hstates = np.array(episode['hstates'])
+            if len(hstates) == 0:
+                continue
 
-            for t in range(len(hstates)):
-                h = hstates[t]
+            # Project hstates into PCA space — each component is a scale signal
+            projected = pca.transform(hstates)  # (T, n_components)
 
-                # Check if different scale regions suggest different actions
-                immediate_signal = h[:30].mean()
-                short_signal = h[30:80].mean()
-                medium_signal = h[80:150].mean()
-
-                # Conflict if signals disagree significantly
-                signals = [immediate_signal, short_signal, medium_signal]
+            for t in range(len(projected)):
+                signals = projected[t].tolist()
                 signal_range = max(signals) - min(signals)
 
                 if signal_range > 1.0:  # Threshold for conflict
@@ -378,12 +417,182 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         return float(conflict_count / max(total_comparisons, 1))
 
     def _analyze_resolutions(self) -> Dict[str, float]:
-        """Analyze how conflicts are resolved."""
+        """Analyze how conflicts are resolved using PCA-based scale decomposition.
+
+        Projects h-states into PCA space to identify scale-separated signals,
+        then categorizes each conflict by which principal component (scale)
+        best aligns with the value estimate at that timestep.
+        """
+        from sklearn.decomposition import PCA
+
+        # Collect all hstates across episodes for PCA fitting
+        all_hstates = []
+        for episode in self._episode_data:
+            all_hstates.extend(episode['hstates'])
+
+        if len(all_hstates) < 4:
+            return {
+                'immediate_dominates': 0.0,
+                'longer_scale_dominates': 0.0,
+                'compromise': 0.0,
+                'total_conflicts': 0,
+            }
+
+        all_hstates = np.array(all_hstates)
+        n_components = min(3, all_hstates.shape[1], len(all_hstates))
+        pca = PCA(n_components=n_components)
+        pca.fit(all_hstates)
+
+        immediate_count = 0
+        longer_count = 0
+        compromise_count = 0
+        total = 0
+
+        for episode in self._episode_data:
+            hstates = np.array(episode['hstates'])
+            values = episode['values']
+
+            if len(hstates) == 0:
+                continue
+
+            projected = pca.transform(hstates)  # (T, n_components)
+
+            for t in range(min(len(projected), len(values))):
+                signals = projected[t].tolist()
+                signal_range = max(signals) - min(signals)
+
+                if signal_range > 1.0:  # Same conflict threshold as _detect_conflicts
+                    total += 1
+                    # Determine which scale dominates based on value alignment
+                    v = values[t] if t < len(values) else 0.0
+                    dists = [abs(v - s) for s in signals]
+                    closest = np.argmin(dists)
+                    if closest == 0:
+                        immediate_count += 1
+                    elif closest == n_components - 1:
+                        longer_count += 1
+                    else:
+                        compromise_count += 1
+
+        if total == 0:
+            return {
+                'immediate_dominates': 0.0,
+                'longer_scale_dominates': 0.0,
+                'compromise': 0.0,
+                'total_conflicts': 0,
+            }
+
         return {
-            'immediate_dominates': 0.4,  # Placeholder
-            'longer_scale_dominates': 0.3,
-            'compromise': 0.3,
+            'immediate_dominates': float(immediate_count / total),
+            'longer_scale_dominates': float(longer_count / total),
+            'compromise': float(compromise_count / total),
+            'total_conflicts': total,
         }
+
+    def _analyze_spatial_goals(self) -> Dict[str, Any]:
+        """PCA-informed decomposition of hidden state for spatial goal encoding.
+
+        Instead of arbitrary geometric splits (e.g. 1/3 each), we use PCA to
+        identify the principal components of hidden state variation, then group
+        them by cumulative variance explained (high/medium/low variance) to
+        probe which variance scales encode reward vs goal information.
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.linear_model import RidgeCV
+
+        if not self._episode_data:
+            return {'error': 'No episode data available'}
+
+        # Collect hidden states and targets
+        hstates = []
+        cumulative_rewards = []
+        goal_distances = []
+        for ep in self._episode_data:
+            steps = ep.get('steps', [])
+            for step_data in steps:
+                h = step_data.get('hstate', None)
+                if h is not None:
+                    hstates.append(np.array(h).ravel())
+                    cumulative_rewards.append(step_data.get('cumulative_reward', 0.0))
+                    goal_distances.append(step_data.get('goal_distance', 0.0))
+
+        if len(hstates) < 30:
+            return {'error': 'Insufficient step-level data for spatial analysis'}
+
+        H = np.array(hstates)
+        y_reward = np.array(cumulative_rewards)
+        y_goal = np.array(goal_distances)
+
+        # NaN guard
+        valid_mask = np.isfinite(H).all(axis=1) & np.isfinite(y_reward) & np.isfinite(y_goal)
+        if valid_mask.sum() < 30:
+            return {'error': f'Insufficient valid samples ({valid_mask.sum()}) after NaN filtering'}
+        H = H[valid_mask]
+        y_reward = y_reward[valid_mask]
+        y_goal = y_goal[valid_mask]
+
+        # PCA decomposition
+        n_components = min(H.shape[0], H.shape[1])
+        pca = PCA(n_components=n_components)
+        H_pca = pca.fit_transform(H)
+        cumvar = np.cumsum(pca.explained_variance_ratio_)
+
+        # Split PCs into 3 groups by cumulative variance explained:
+        #   high_var: PCs explaining up to 50% of variance (dominant structure)
+        #   mid_var:  PCs explaining 50%-90% (secondary patterns)
+        #   low_var:  PCs explaining 90%-100% (fine-grained/noise)
+        cut_50 = int(np.searchsorted(cumvar, 0.50) + 1)
+        cut_90 = int(np.searchsorted(cumvar, 0.90) + 1)
+
+        scale_groups = {
+            'high_variance': slice(0, cut_50),
+            'mid_variance': slice(cut_50, cut_90),
+            'low_variance': slice(cut_90, n_components),
+        }
+
+        results = {
+            'decomposition_method': 'PCA_variance_groups',
+            'total_pcs': n_components,
+            'pcs_to_50pct_variance': cut_50,
+            'pcs_to_90pct_variance': cut_90,
+        }
+
+        for name, sl in scale_groups.items():
+            H_group = H_pca[:, sl]
+            n_dims = H_group.shape[1]
+
+            if n_dims == 0:
+                results[name] = {
+                    'reward_predictive_r2': 0.0,
+                    'goal_encoding_r2': 0.0,
+                    'n_dims': 0,
+                }
+                continue
+
+            # Predictive power: Ridge probe R² from PC group → cumulative reward
+            try:
+                ridge = RidgeCV(cv=5)
+                ridge.fit(H_group, y_reward)
+                reward_r2 = float(ridge.score(H_group, y_reward))
+            except Exception:
+                reward_r2 = 0.0
+
+            # Goal-encoding strength: Ridge probe R² from PC group → goal_distance
+            try:
+                ridge = RidgeCV(cv=5)
+                ridge.fit(H_group, y_goal)
+                goal_r2 = float(ridge.score(H_group, y_goal))
+            except Exception:
+                goal_r2 = 0.0
+
+            results[name] = {
+                'reward_predictive_r2': reward_r2,
+                'goal_encoding_r2': goal_r2,
+                'n_dims': n_dims,
+                'variance_explained': float(cumvar[sl.stop - 1] - (cumvar[sl.start - 1] if sl.start > 0 else 0.0)),
+            }
+
+        return results
 
     def visualize(self) -> Dict[str, np.ndarray]:
         """Visualize multi-scale goals."""

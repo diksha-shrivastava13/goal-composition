@@ -1,201 +1,261 @@
 """
-N-STEP Prediction Experiment.
+N-STEP Prediction Experiment — Within-Episode N-Step Prediction.
 
-Evaluates probe prediction accuracy sequentially through curriculum steps.
-Tests how long predicted losses continue to be correct as the agent steps
-through the curriculum without further training.
+Tests how far ahead within an episode the agent's hidden state can predict
+future observations. Trains probes from h-state[t] → obs-features[t+n]
+for varying n-step horizons.
 
 Different from N-ENV:
-- N-ENV: predict N independent random environments (aggregate robustness)
-- N-STEP: predict step 1->2->3->...->N sequentially through curriculum
-  (sequential prediction decay / theory-of-mind of environment generator)
+- N-ENV: predicts features of future *levels* (across-episode, curriculum horizon)
+- N-STEP: predicts features of future *timesteps* within a single episode
 
-This wraps evaluate_n_step_prediction() from training.py as a proper experiment.
+Key outputs:
+- Per-horizon R² within episode
+- Within-episode prediction decay curve
 """
 
 import jax
 import numpy as np
 from typing import Dict, Any, Optional
+from scipy.optimize import curve_fit
 
 from .base import CheckpointExperiment
+from .utils.paired_helpers import generate_levels
+from .utils.batched_rollout import batched_rollout
+from .probes.property_probe import train_probe
 
 
 class NStepPredictionExperiment(CheckpointExperiment):
-    """Sequential N-step prediction through curriculum.
+    """Within-episode n-step prediction.
 
-    Tests curriculum prediction (theory-of-mind of environment generator).
-    Follows the actual ACCEL training loop: DR -> Replay -> Mutate cycle.
-    Measures how prediction accuracy changes over sequential curriculum steps
-    when the agent is NOT being trained.
+    Protocol:
+    1. Generate M levels, run full rollouts collecting h-states at all timesteps
+    2. Collect per-step observation features (rewards, done flags)
+    3. For each n in {1, 5, 10, 25}: pair h-state[t] with obs-features[t+n]
+    4. Train probes and measure within-episode prediction decay
     """
 
-    def __init__(
-        self,
-        agent,
-        train_state,
-        config: dict,
-        output_dir: Optional[str] = None,
-        training_method: str = "accel",
-        n_steps: int = 20,
-        num_envs: int = 32,
-    ):
-        super().__init__(agent, train_state, config, output_dir, training_method)
-        self.n_steps = config.get("n_steps", n_steps)
-        self.num_envs = config.get("num_envs", num_envs)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.n_levels = self.exp_config("n_levels")
+        self.max_steps = self.exp_config("max_steps")
+        self.horizons = self.exp_config("horizons")
 
     @property
     def name(self) -> str:
         return "n_step_prediction"
 
     def collect_data(self, rng) -> Dict[str, Any]:
-        """Run N-step sequential prediction evaluation."""
-        from ..common.training import evaluate_n_step_prediction
+        """Run full rollouts collecting h-states and rewards at all timesteps."""
+        n = self.n_levels
+        max_steps = self.max_steps
 
-        # N-STEP requires level_sampler and mutate_level
-        level_sampler = getattr(self.agent, 'level_sampler', None)
-        mutate_level = getattr(self.agent, 'mutate_level', None)
-        probe_runner = getattr(self.agent, 'probe_runner', None)
+        # Generate levels
+        rng, gen_rng = jax.random.split(rng)
+        levels = generate_levels(self.agent, gen_rng, n)
 
-        results = evaluate_n_step_prediction(
-            rng=rng,
-            env=self.agent.env,
-            env_params=self.agent.env_params,
-            train_state=self.train_state,
-            level_sampler=level_sampler,
-            sample_random_level=self.agent.sample_random_level,
-            mutate_level=mutate_level if mutate_level is not None else self._default_mutate,
-            probe_runner=probe_runner,
-            n_steps=self.n_steps,
-            num_envs=self.num_envs,
-            env_height=self.config.get("env_height", 13),
-            env_width=self.config.get("env_width", 13),
+        # Run rollout collecting h-states at every timestep + rewards
+        rng, rollout_rng = jax.random.split(rng)
+        pro_ts = getattr(self.train_state, 'pro_train_state', self.train_state)
+
+        collection_steps = list(range(1, max_steps + 1))
+        result = batched_rollout(
+            rollout_rng, levels, max_steps,
+            pro_ts.apply_fn, pro_ts.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n),
+            collect_values=True,
+            collect_rewards=True,
+            collection_steps=collection_steps,
         )
 
-        self.data = results
-        return results
+        # Build h-states matrix: (n_levels, max_steps, hidden_dim)
+        # hstates_by_step has keys "1", "2", ..., "max_steps"
+        hstates_list = []
+        for t in range(1, max_steps + 1):
+            key = str(t)
+            if key in result.hstates_by_step:
+                hstates_list.append(result.hstates_by_step[key])
+            else:
+                break
+        T = len(hstates_list)
 
-    def _default_mutate(self, rng, level, num_edits):
-        """Fallback mutation: return level unchanged if no mutator available."""
-        return level
+        if T == 0:
+            # Fallback: use terminal only
+            self.data = {
+                'error': 'No per-step h-states collected',
+                'horizons': self.horizons,
+            }
+            return self.data
+
+        hstates_matrix = np.stack(hstates_list, axis=1)  # (n_levels, T, hidden_dim)
+
+        # Obs features at each timestep: values and rewards
+        # values shape: (n_levels, max_steps), rewards shape: (n_levels, max_steps)
+        values = result.values if result.values is not None else np.zeros((n, max_steps))
+        rewards = result.rewards if result.rewards is not None else np.zeros((n, max_steps))
+
+        self.data = {
+            'hstates_matrix': hstates_matrix,
+            'values': values[:, :T],
+            'rewards': rewards[:, :T],
+            'episode_lengths': np.array(result.episode_lengths),
+            'episode_returns': np.array(result.episode_returns),
+            'n_levels': n,
+            'T': T,
+            'horizons': self.horizons,
+        }
+        return self.data
 
     def analyze(self) -> Dict[str, Any]:
-        """Analyze N-step prediction results."""
-        results = self.data
+        """Train per-horizon probes for within-episode prediction."""
+        if 'error' in self.data:
+            self.results = self.data
+            return self.results
 
-        analysis = {
-            "mean_wall_accuracy": results.get("mean_wall_accuracy", float('nan')),
-            "mean_goal_accuracy": results.get("mean_goal_accuracy", float('nan')),
-            "prediction_improvement": results.get("prediction_improvement", 0.0),
-            "n_steps": self.n_steps,
-            "per_step_wall_accuracy": results.get("per_step_wall_accuracy", []),
-            "per_step_goal_accuracy": results.get("per_step_goal_accuracy", []),
-            "per_step_branch": results.get("per_step_branch", []),
-            "per_step_returns": results.get("per_step_returns", []),
-            "per_branch_wall_accuracy": results.get("per_branch_wall_accuracy", {}),
-            "per_branch_returns": results.get("per_branch_returns", {}),
+        hstates = self.data['hstates_matrix']  # (n_levels, T, hidden_dim)
+        values = self.data['values']            # (n_levels, T)
+        rewards = self.data['rewards']          # (n_levels, T)
+        ep_lengths = self.data['episode_lengths']
+        n_levels, T, hidden_dim = hstates.shape
+
+        feature_targets = {
+            'value': values,
+            'reward': rewards,
         }
 
-        # Compute prediction decay: how fast does accuracy drop over steps?
-        wall_accs = results.get("per_step_wall_accuracy", [])
-        valid_accs = [a for a in wall_accs if not np.isnan(a)]
-        if len(valid_accs) >= 4:
-            quarter = len(valid_accs) // 4
-            analysis["first_quarter_accuracy"] = float(np.mean(valid_accs[:quarter]))
-            analysis["last_quarter_accuracy"] = float(np.mean(valid_accs[-quarter:]))
-            analysis["accuracy_decay"] = analysis["first_quarter_accuracy"] - analysis["last_quarter_accuracy"]
+        per_horizon_r2 = {feat: {} for feat in feature_targets}
 
-            # Steps until accuracy drops below threshold
-            initial_acc = valid_accs[0] if valid_accs else 0
-            threshold = initial_acc * 0.8  # 80% of initial
-            steps_above = sum(1 for a in valid_accs if a >= threshold)
-            analysis["steps_above_80pct"] = steps_above
+        for n_step in self.horizons:
+            if n_step >= T:
+                continue
+
+            # Collect valid (h[t], target[t+n]) pairs across all levels
+            h_all = []
+            targets_all = {feat: [] for feat in feature_targets}
+
+            for i in range(n_levels):
+                ep_len = min(int(ep_lengths[i]), T)
+                valid_t = ep_len - n_step
+                if valid_t <= 0:
+                    continue
+
+                h_all.append(hstates[i, :valid_t, :])
+                for feat, feat_matrix in feature_targets.items():
+                    targets_all[feat].append(feat_matrix[i, n_step:n_step + valid_t])
+
+            if not h_all:
+                continue
+
+            h_concat = np.concatenate(h_all, axis=0)
+            for feat in feature_targets:
+                t_concat = np.concatenate(targets_all[feat], axis=0)
+
+                # Filter out NaN targets
+                valid_mask = np.isfinite(t_concat)
+                if valid_mask.sum() < 20:
+                    continue
+
+                probe, metrics = train_probe(
+                    h_concat[valid_mask],
+                    t_concat[valid_mask],
+                    probe_type="linear",
+                    task="regression",
+                )
+                per_horizon_r2[feat][n_step] = float(metrics.get('mean_score', 0.0))
+
+        # Fit exponential decay for each feature
+        decay_params = {}
+        for feat in feature_targets:
+            horizons_used = sorted(per_horizon_r2[feat].keys())
+            if len(horizons_used) < 3:
+                decay_params[feat] = {'b': 0.0, 'fit_success': False}
+                continue
+
+            x = np.array(horizons_used, dtype=float)
+            y = np.array([per_horizon_r2[feat][h] for h in horizons_used])
+
+            def exp_decay(n, a, b, c):
+                return a * np.exp(-b * n) + c
+
+            try:
+                popt, _ = curve_fit(
+                    exp_decay, x, y,
+                    p0=[max(y), 0.1, min(y)],
+                    bounds=([0, 0, -1], [2, 10, 1]),
+                    maxfev=5000,
+                )
+                decay_params[feat] = {
+                    'a': float(popt[0]),
+                    'b': float(popt[1]),
+                    'c': float(popt[2]),
+                    'fit_success': True,
+                }
+            except (RuntimeError, ValueError):
+                decay_params[feat] = {'b': 0.0, 'fit_success': False}
+
+        analysis = {
+            'per_horizon_r2': per_horizon_r2,
+            'decay_params': decay_params,
+            'horizons': self.horizons,
+            'n_levels': self.data['n_levels'],
+            'T': self.data['T'],
+            'training_method': self.training_method,
+        }
+
+        # Summary
+        for feat in feature_targets:
+            if 1 in per_horizon_r2[feat]:
+                analysis[f'{feat}_r2_horizon_1'] = per_horizon_r2[feat][1]
+            if decay_params[feat].get('fit_success'):
+                analysis[f'{feat}_decay_rate'] = decay_params[feat]['b']
 
         self.results = analysis
         return analysis
 
     def visualize(self) -> Dict[str, Any]:
-        """Create N-step prediction visualizations."""
+        """Create within-episode prediction decay plot."""
         import matplotlib.pyplot as plt
 
         viz = {}
-        results = self.data
 
-        # Per-step accuracy plot
         try:
-            wall_accs = results.get("per_step_wall_accuracy", [])
-            goal_accs = results.get("per_step_goal_accuracy", [])
-            branches = results.get("per_step_branch", [])
-            returns = results.get("per_step_returns", [])
+            per_horizon_r2 = self.results['per_horizon_r2']
+            decay_params = self.results['decay_params']
 
-            if wall_accs:
-                fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+            colors = {'value': 'blue', 'reward': 'green'}
+            markers = {'value': 'o', 'reward': 's'}
 
-                steps = range(len(wall_accs))
+            for feat in per_horizon_r2:
+                horizons_used = sorted(per_horizon_r2[feat].keys())
+                if not horizons_used:
+                    continue
+                x = np.array(horizons_used)
+                y = np.array([per_horizon_r2[feat][h] for h in horizons_used])
 
-                # Accuracy over steps
-                ax = axes[0]
-                ax.plot(steps, wall_accs, 'b-o', label="Wall Accuracy", markersize=4)
-                ax.plot(steps, goal_accs, 'r-s', label="Goal Accuracy", markersize=4)
-                ax.set_ylabel("Accuracy")
-                ax.set_title("N-STEP: Prediction Accuracy Over Sequential Curriculum Steps")
-                ax.legend()
-                ax.grid(True, alpha=0.3)
+                ax.plot(x, y, f'-{markers.get(feat, "o")}',
+                        color=colors.get(feat, 'gray'),
+                        label=feat, markersize=6)
 
-                # Color by branch
-                branch_colors = {0: 'green', 1: 'blue', 2: 'orange'}
-                branch_labels = {0: 'DR', 1: 'Replay', 2: 'Mutate'}
-                ax = axes[1]
-                for s, b in zip(steps, branches):
-                    ax.axvspan(s - 0.4, s + 0.4, alpha=0.3,
-                               color=branch_colors.get(b, 'gray'))
-                ax.plot(steps, wall_accs, 'k-o', markersize=4)
-                ax.set_ylabel("Wall Accuracy")
-                ax.set_title("Accuracy by Branch (green=DR, blue=Replay, orange=Mutate)")
-                ax.grid(True, alpha=0.3)
+                dp = decay_params.get(feat, {})
+                if dp.get('fit_success'):
+                    x_fit = np.linspace(min(x), max(x), 50)
+                    y_fit = dp['a'] * np.exp(-dp['b'] * x_fit) + dp['c']
+                    ax.plot(x_fit, y_fit, '--',
+                            color=colors.get(feat, 'gray'), alpha=0.5,
+                            label=f"{feat} fit (b={dp['b']:.3f})")
 
-                # Returns over steps
-                ax = axes[2]
-                ax.plot(steps, returns, 'g-^', label="Mean Returns", markersize=4)
-                ax.set_xlabel("Curriculum Step")
-                ax.set_ylabel("Returns")
-                ax.set_title("Agent Returns Over Sequential Steps")
-                ax.legend()
-                ax.grid(True, alpha=0.3)
+            ax.set_xlabel("N-step lookahead (timesteps)")
+            ax.set_ylabel("Probe R²")
+            ax.set_title("N-STEP: Within-Episode Prediction Decay")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=-0.05)
 
-                plt.tight_layout()
-                viz["n_step_trajectory"] = fig
-                plt.close(fig)
-        except Exception:
-            pass
-
-        # Per-branch comparison
-        try:
-            per_branch_wall = results.get("per_branch_wall_accuracy", {})
-            per_branch_ret = results.get("per_branch_returns", {})
-
-            if per_branch_wall:
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-                branch_names = {0: "DR", 1: "Replay", 2: "Mutate"}
-
-                branches_present = sorted(per_branch_wall.keys())
-                names = [branch_names.get(b, f"Branch {b}") for b in branches_present]
-
-                ax = axes[0]
-                vals = [per_branch_wall[b] for b in branches_present]
-                ax.bar(names, vals, color=['green', 'blue', 'orange'][:len(branches_present)])
-                ax.set_ylabel("Wall Accuracy")
-                ax.set_title("Prediction Accuracy by Branch")
-
-                ax = axes[1]
-                if per_branch_ret:
-                    vals = [per_branch_ret.get(b, 0) for b in branches_present]
-                    ax.bar(names, vals, color=['green', 'blue', 'orange'][:len(branches_present)])
-                    ax.set_ylabel("Mean Returns")
-                    ax.set_title("Agent Returns by Branch")
-
-                plt.tight_layout()
-                viz["per_branch_comparison"] = fig
-                plt.close(fig)
+            plt.tight_layout()
+            viz["within_episode_decay"] = fig
+            plt.close(fig)
         except Exception:
             pass
 

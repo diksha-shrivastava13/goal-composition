@@ -6,6 +6,7 @@ and value gradient analysis.
 """
 
 from typing import Dict, List, Optional, Tuple
+import logging
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -132,39 +133,90 @@ def compute_branch_conditioned_ece(
 
 def compute_value_gradient(
     train_state,
-    obs: chex.ArrayTree,
+    observations: List,
     hstate: chex.ArrayTree,
     goal_positions: np.ndarray,
+    agent_positions: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """
-    Compute gradient of value w.r.t. goal distance: ∂V/∂(goal_distance).
+    Compute value and gradient norm per observation, then correlate with goal distance.
 
-    This tests whether the value function encodes goal-directed behavior:
-    V should increase as goal distance decreases (i.e., negative gradient).
+    Tests whether the value function encodes goal-directed behavior:
+    V should increase as goal distance decreases (negative correlation).
 
     Args:
-        train_state: Agent train state with apply_fn
-        obs: Observations
-        hstate: Hidden state
-        goal_positions: Goal positions for each sample, shape (n, 2)
+        train_state: Agent train state with params and apply_fn.
+        observations: List of Obs objects, one per goal position.
+        hstate: Initial hidden state for forward pass.
+        goal_positions: (n, 2) or (n,) array of goal coordinates.
+        agent_positions: (n, 2) or (n,) array of agent start positions.
+            If None, extracted from observations when possible.
 
     Returns:
-        Dict with gradient statistics
+        Dict with correlation metrics and summary stats.
     """
-    # This requires JAX differentiation through the value function
-    # We approximate by computing correlation between V and goal distance
+    params = train_state.params
+    apply_fn = train_state.apply_fn
 
-    def get_value(params, obs_single, hstate_single, done):
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs_single)
-        done_batch = jnp.array([[done]])
-        _, _, value = train_state.apply_fn(params, (obs_batch, done_batch), hstate_single)
-        return value[0, 0]
+    values = []
+    gradients = []
 
-    # For actual gradient, we'd need to make goal_distance differentiable
-    # Here we provide a proxy: correlation analysis
+    for obs in observations:
+        try:
+            def value_fn(image):
+                obs_batch = type(obs)(image[None, None, ...], obs.agent_dir[None, None, ...])
+                done_batch = jnp.zeros((1, 1), dtype=bool)
+                _, _, value = apply_fn(params, (obs_batch, done_batch), hstate)
+                return value[0, 0]
+
+            grad = jax.grad(value_fn)(obs.image)
+            gradients.append(float(jnp.linalg.norm(grad)))
+            values.append(float(value_fn(obs.image)))
+        except Exception:
+            gradients.append(0.0)
+            values.append(0.0)
+
+    values = np.array(values)
+    gradients = np.array(gradients)
+
+    # Compute goal distances from actual agent positions
+    agent_pos_fallback_used = False
+    if goal_positions.ndim == 1:
+        if agent_positions is not None:
+            goal_distances = np.abs(goal_positions - np.asarray(agent_positions))
+        else:
+            goal_distances = np.abs(goal_positions)
+    else:
+        if agent_positions is not None:
+            agent_pos = np.asarray(agent_positions)
+        else:
+            # Try to extract from observations; fall back to origin with warning
+            logging.getLogger(__name__).warning(
+                "Agent positions unavailable in calibration; falling back to origin (0,0)"
+            )
+            agent_pos = np.zeros_like(goal_positions)
+            agent_pos_fallback_used = True
+        goal_distances = np.sqrt(np.sum((goal_positions - agent_pos) ** 2, axis=-1))
+
+    # Correlation between value and goal distance
+    if len(values) > 2 and np.std(values) > 1e-10 and np.std(goal_distances) > 1e-10:
+        value_goal_corr = float(np.corrcoef(values, goal_distances)[0, 1])
+    else:
+        value_goal_corr = 0.0
+
+    # Correlation between gradient norm and goal distance
+    if len(gradients) > 2 and np.std(gradients) > 1e-10 and np.std(goal_distances) > 1e-10:
+        grad_goal_corr = float(np.corrcoef(gradients, goal_distances)[0, 1])
+    else:
+        grad_goal_corr = 0.0
+
     return {
-        "note": "Full gradient computation requires differentiable goal_distance",
-        "use_correlation_as_proxy": True,
+        "value_goal_distance_correlation": value_goal_corr,
+        "gradient_goal_distance_correlation": grad_goal_corr,
+        "mean_gradient_norm": float(np.mean(gradients)),
+        "mean_value": float(np.mean(values)),
+        "negative_gradient": value_goal_corr < -0.1,
+        "agent_pos_fallback_used": agent_pos_fallback_used,
     }
 
 

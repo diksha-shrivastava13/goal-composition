@@ -58,25 +58,14 @@ class DRCoverageExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "dr_coverage"
 
-    def __init__(
-        self,
-        n_levels: int = 1000,
-        n_grid_bins: int = 10,
-        feature_names: List[str] = None,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize DR coverage experiment.
-
-        Args:
-            n_levels: Number of levels to sample for analysis
-            n_grid_bins: Bins per dimension for coverage grid
-            feature_names: Features to analyze (default: wall_density, goal_distance)
         """
         super().__init__(**kwargs)
-        self.n_levels = n_levels
-        self.n_grid_bins = n_grid_bins
-        self.feature_names = feature_names or ['wall_density', 'goal_distance']
+        self.n_levels = self.exp_config("n_levels")
+        self.n_grid_bins = self.exp_config("n_grid_bins")
+        self.feature_names = self.exp_config("feature_names")
 
         self._data: Optional[CoverageData] = None
         self._results: Dict[str, Any] = {}
@@ -151,7 +140,7 @@ class DRCoverageExperiment(CheckpointExperiment):
         t0 = time.time()
         rng, rng_rollout = jax.random.split(rng)
         n_levels = self.n_levels
-        max_steps = 256
+        max_steps = self.config.get("max_steps", 256)
         result = batched_rollout(
             rng_rollout, levels, max_steps,
             self.train_state.apply_fn, self.train_state.params,
@@ -186,7 +175,11 @@ class DRCoverageExperiment(CheckpointExperiment):
 
         # Feature vectors for coverage analysis (normalized)
         norm_density = wall_density
-        norm_distance = np.minimum(goal_distance / 18.0, 1.0)
+        env_inner = getattr(self.agent.env, '_env', self.agent.env)
+        env_h = getattr(env_inner, 'max_height', 13)
+        env_w = getattr(env_inner, 'max_width', 13)
+        max_diagonal = float(np.sqrt(env_h**2 + env_w**2))
+        norm_distance = np.minimum(goal_distance / max_diagonal, 1.0)
         self._data.feature_vectors = [
             np.array([norm_density[i], norm_distance[i]])
             for i in range(self.n_levels)
@@ -240,6 +233,7 @@ class DRCoverageExperiment(CheckpointExperiment):
         - Difficulty distribution: Histogram analysis
         - Blind spots: Undersampled regions
         - Performance by region: How agent performs in different areas
+        - Chance baseline: Permutation-based baseline for prediction losses
         """
         if self._data is None or len(self._data.wall_densities) == 0:
             return {'error': 'No data collected'}
@@ -263,7 +257,10 @@ class DRCoverageExperiment(CheckpointExperiment):
         # 5. Comparison metrics (for comparing with curriculum)
         results['comparison_metrics'] = self._compute_comparison_metrics()
 
-        # 6. Summary
+        # 6. Chance baseline for prediction losses
+        results['chance_baseline'] = self._compute_chance_baseline()
+
+        # 7. Summary
         results['summary'] = self._compute_summary()
 
         self._results = results
@@ -461,6 +458,90 @@ class DRCoverageExperiment(CheckpointExperiment):
             'prediction_loss_std': float(np.std(pred_losses)),
             'solvable_rate': float(np.mean(self._data.is_solvable)),
             'n_levels_sampled': len(self._data.wall_densities),
+        }
+
+    def _compute_chance_baseline(self, n_permutations: int = 100) -> Dict[str, Any]:
+        """Compute chance baseline for prediction losses via permutation.
+
+        Shuffles level-to-prediction-loss mappings to estimate what loss
+        would look like if the agent's representations had no information
+        about level features. Compares actual losses to this baseline to
+        determine which prediction tiers are above chance.
+        """
+        pred_losses = np.array(self._data.prediction_losses)
+        wall_densities = np.array(self._data.wall_densities)
+        goal_distances = np.array(self._data.goal_distances)
+        returns = np.array(self._data.episode_returns)
+
+        actual_mean_loss = float(np.mean(pred_losses))
+
+        # Permutation baseline: shuffle feature-loss correspondence
+        rng_perm = np.random.default_rng(seed=42)
+        permuted_correlations = []
+        for _ in range(n_permutations):
+            shuffled_losses = rng_perm.permutation(pred_losses)
+            # Correlation between loss and features under permutation
+            corr_density = float(np.corrcoef(wall_densities, shuffled_losses)[0, 1])
+            corr_distance = float(np.corrcoef(goal_distances, shuffled_losses)[0, 1])
+            corr_return = float(np.corrcoef(returns, shuffled_losses)[0, 1])
+            permuted_correlations.append({
+                'density': corr_density,
+                'distance': corr_distance,
+                'return': corr_return,
+            })
+
+        # Actual correlations
+        actual_corr_density = float(np.corrcoef(wall_densities, pred_losses)[0, 1])
+        actual_corr_distance = float(np.corrcoef(goal_distances, pred_losses)[0, 1])
+        actual_corr_return = float(np.corrcoef(returns, pred_losses)[0, 1])
+
+        # Compute p-values: fraction of permuted correlations >= actual
+        perm_density = np.array([p['density'] for p in permuted_correlations])
+        perm_distance = np.array([p['distance'] for p in permuted_correlations])
+        perm_return = np.array([p['return'] for p in permuted_correlations])
+
+        p_density = float(np.mean(np.abs(perm_density) >= np.abs(actual_corr_density)))
+        p_distance = float(np.mean(np.abs(perm_distance) >= np.abs(actual_corr_distance)))
+        p_return = float(np.mean(np.abs(perm_return) >= np.abs(actual_corr_return)))
+
+        # Determine which tiers are above chance (p < 0.05)
+        tier_results = {
+            'tier0_env_vars': {
+                'feature': 'wall_density',
+                'actual_correlation': actual_corr_density,
+                'permutation_mean': float(np.mean(np.abs(perm_density))),
+                'permutation_std': float(np.std(np.abs(perm_density))),
+                'p_value': p_density,
+                'above_chance': p_density < 0.05,
+            },
+            'tier1_curriculum': {
+                'feature': 'goal_distance',
+                'actual_correlation': actual_corr_distance,
+                'permutation_mean': float(np.mean(np.abs(perm_distance))),
+                'permutation_std': float(np.std(np.abs(perm_distance))),
+                'p_value': p_distance,
+                'above_chance': p_distance < 0.05,
+            },
+            'tier2_agent_curriculum': {
+                'feature': 'episode_return',
+                'actual_correlation': actual_corr_return,
+                'permutation_mean': float(np.mean(np.abs(perm_return))),
+                'permutation_std': float(np.std(np.abs(perm_return))),
+                'p_value': p_return,
+                'above_chance': p_return < 0.05,
+            },
+        }
+
+        return {
+            'actual_mean_loss': actual_mean_loss,
+            'n_permutations': n_permutations,
+            'tier_results': tier_results,
+            'interpretation': (
+                f"Tiers above chance: "
+                f"{'T0' if tier_results['tier0_env_vars']['above_chance'] else ''} "
+                f"{'T1' if tier_results['tier1_curriculum']['above_chance'] else ''} "
+                f"{'T2' if tier_results['tier2_agent_curriculum']['above_chance'] else ''}"
+            ).strip(),
         }
 
     def _compute_summary(self) -> Dict[str, Any]:

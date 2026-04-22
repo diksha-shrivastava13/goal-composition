@@ -97,9 +97,9 @@ class LevelProbingExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Any]:
         """Collect hidden states at multiple points and level properties (GPU-batched)."""
-        n_levels = self.config.get("n_levels", 500)
-        collection_steps = self.config.get("collection_steps", [1, 10, 50, -1])  # -1 = end
-        max_episode_length = self.config.get("max_episode_length", 256)
+        n_levels = self.exp_config("n_levels")
+        collection_steps = self.exp_config("collection_steps")
+        max_episode_length = self.exp_config("max_episode_length")
         timings = {}
 
         try:
@@ -150,7 +150,7 @@ class LevelProbingExperiment(CheckpointExperiment):
         is_solvable = path_lengths > 0
 
         training_step = getattr(self.train_state, 'training_step', 0)
-        total_training_steps = self.config.get("total_training_steps", 30000)
+        total_training_steps = self.config.get("num_updates", 30000)
         training_phase = np.full(n_levels, training_step / max(total_training_steps, 1))
         _log("cpu_level_properties", time.time() - t0, "CPU-side level properties complete")
 
@@ -189,36 +189,31 @@ class LevelProbingExperiment(CheckpointExperiment):
 
         # Method-specific properties
         if self.has_branches:
-            branch_types = np.arange(n_levels) % self.branch_count
+            tercile_edges = np.percentile(wall_density, [33.3, 66.7])
+            branch_types = np.digitize(wall_density, tercile_edges)
             level_properties["branch_type"] = branch_types
 
             if self.has_mutations:
-                mutation_distance = np.where(
-                    branch_types != 2, 0.0, np.random.uniform(1, 5, size=n_levels)
-                )
+                # Compute actual L2 distance between consecutive level wall_maps
+                # as a proxy for mutation distance (non-mutation branches get 0)
+                mutation_distance = np.zeros(n_levels)
+                for i in range(n_levels):
+                    if branch_types[i] == 2 and i > 0:
+                        # L2 distance between this wall_map and previous
+                        diff = wall_maps[i].astype(float) - wall_maps[i - 1].astype(float)
+                        mutation_distance[i] = float(np.sqrt(np.sum(diff ** 2)))
                 level_properties["mutation_distance"] = mutation_distance
 
         # --- 5. PAIRED bilateral ---
         bilateral_data = None
         if self.has_regret:
-            _log("paired_cpu_estimates", msg="Computing PAIRED CPU-side estimates...")
-            t0 = time.time()
-            # Per-level CPU-side estimates (fast)
-            regret_estimates = np.array([
-                self._estimate_regret_from_result(
-                    jax.tree_util.tree_map(lambda x: x[i], levels),
-                    {'solved': bool(episode_solved[i]), 'return': float(episode_returns[i])}
-                ) for i in tqdm(range(n_levels), desc="Regret estimates", leave=False)
-            ])
-            adversary_difficulties = np.array([
-                self._estimate_adversary_difficulty(
-                    jax.tree_util.tree_map(lambda x: x[i], levels)
-                ) for i in tqdm(range(n_levels), desc="Adversary difficulty", leave=False)
-            ])
-            level_properties["adversary_difficulty"] = adversary_difficulties
-            _log("paired_cpu_estimates", time.time() - t0, "PAIRED CPU-side estimates complete")
+            # Compute max diagonal dynamically from environment grid size
+            env_inner = getattr(self.agent.env, '_env', self.agent.env)
+            env_h = getattr(env_inner, 'max_height', 13)
+            env_w = getattr(env_inner, 'max_width', 13)
+            max_diagonal = float(np.sqrt(env_h**2 + env_w**2))
 
-            # Batched antagonist rollout
+            # Check for antagonist first — PAIRED always has one
             ant_train_state = getattr(self.train_state, 'ant_train_state', None)
             if ant_train_state is not None:
                 _log("antagonist_rollout", msg="Running batched antagonist rollout...")
@@ -240,6 +235,11 @@ class LevelProbingExperiment(CheckpointExperiment):
                 regret_actual = ant_returns - episode_returns
                 level_properties["regret_estimate"] = regret_actual
 
+                # Override adversary difficulty with real antagonist returns
+                # Higher ant return = harder level for protagonist
+                adversary_difficulties = np.clip(ant_returns, 0.0, 1.0)
+                level_properties["adversary_difficulty"] = adversary_difficulties
+
                 # Vectorized policy divergence
                 policy_divergences = self._compute_batch_policy_divergence(
                     hidden_states_by_step, ant_hstates_by_step,
@@ -260,29 +260,35 @@ class LevelProbingExperiment(CheckpointExperiment):
                         "level_probing/mean_policy_divergence": float(policy_divergences.mean()),
                     })
             else:
+                # No antagonist — use NaN regret estimates as fallback
+                _log("paired_cpu_estimates", msg="No antagonist train state — using NaN regret fallback")
+                regret_estimates = np.full(n_levels, float('nan'))
                 level_properties["regret_estimate"] = regret_estimates
+                adversary_difficulties = np.clip(1.0 - episode_returns, 0.0, 1.0)
+                level_properties["adversary_difficulty"] = adversary_difficulties
 
-            # Strategy clusters and opponent return estimates
+            # Strategy clusters: KMeans on real level features + regret + difficulty
             _log("paired_cpu_clusters_and_tom", msg="Computing strategy clusters and ToM estimates...")
             t0 = time.time()
-            strategy_clusters = np.array([
-                self._estimate_strategy_cluster(
-                    jax.tree_util.tree_map(lambda x: x[i], levels),
-                    float(adversary_difficulties[i]),
-                ) for i in tqdm(range(n_levels), desc="Strategy clusters", leave=False)
+            cluster_features = np.column_stack([
+                wall_density,
+                path_lengths / 26.0,
+                goal_distance / max_diagonal,
+                adversary_difficulties,
             ])
+            from sklearn.cluster import KMeans
+            n_clusters = min(5, n_levels)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            strategy_clusters = kmeans.fit_predict(cluster_features)
             level_properties["adversary_strategy_cluster"] = strategy_clusters
 
-            opponent_return_estimates = np.array([
-                self._estimate_opponent_return(
-                    hidden_states_by_step.get(
-                        "-1", hidden_states_by_step.get(str(collection_steps[-1]))
-                    )[i] if hidden_states_by_step.get(
-                        "-1", hidden_states_by_step.get(str(collection_steps[-1]))
-                    ) is not None else None,
-                    jax.tree_util.tree_map(lambda x: x[i], levels),
-                ) for i in tqdm(range(n_levels), desc="Opponent return est.", leave=False)
-            ])
+            # Opponent return estimates: use real antagonist returns if available
+            if ant_train_state is not None and bilateral_data is not None:
+                # Use actual antagonist returns as ground-truth opponent return
+                opponent_return_estimates = np.array(bilateral_data["antagonist_returns"])
+            else:
+                # Fallback: zeros (no opponent data available)
+                opponent_return_estimates = np.zeros(n_levels)
             level_properties["opponent_return_estimate"] = opponent_return_estimates
             _log("paired_cpu_clusters_and_tom", time.time() - t0, "Strategy clusters and ToM complete")
 
@@ -309,30 +315,17 @@ class LevelProbingExperiment(CheckpointExperiment):
         level,
         result: Dict[str, Any],
     ) -> float:
-        """Estimate regret for PAIRED based on level and episode result."""
-        solved = result.get('solved', False)
-        wall_density = float(level.wall_map.mean())
+        """Estimate regret for PAIRED when antagonist is unavailable.
 
-        if solved:
-            # Low regret if solved
-            regret = 0.1 * wall_density
-        else:
-            # High regret if unsolved, scaled by how "easy" level looks
-            regret = 0.5 + 0.5 * (1.0 - wall_density)
-
-        return float(regret)
-
-    def _estimate_adversary_difficulty(self, level) -> float:
-        """Estimate how difficult the adversary made this level."""
-        wall_density = float(level.wall_map.mean())
-        path_length = self._compute_path_length(level)
-
-        # Normalize path length (max ~26 for 13x13 grid)
-        normalized_path = min(path_length / 26.0, 1.0) if path_length > 0 else 1.0
-
-        # Combine wall density and path length
-        difficulty = 0.5 * wall_density + 0.5 * normalized_path
-        return float(difficulty)
+        True regret = ant_return - pro_return. Without an antagonist rollout,
+        we cannot compute this, so we return NaN to signal missing data.
+        Downstream code should filter NaN values.
+        """
+        import logging
+        logging.getLogger(__name__).warning(
+            "No antagonist available — regret estimate is NaN (not computable)"
+        )
+        return float('nan')
 
     def _compute_batch_policy_divergence(
         self,
@@ -363,47 +356,44 @@ class LevelProbingExperiment(CheckpointExperiment):
         return divergence
 
     def _estimate_strategy_cluster(self, level, adversary_difficulty: float) -> int:
-        """Estimate adversary strategy cluster from level features.
+        """Assign adversary strategy cluster via feature binning.
 
-        This is a placeholder - actual clustering is done in C3 (adversary_strategy_clustering).
-        Uses simple heuristics to assign cluster IDs.
+        Uses wall_density and adversary_difficulty to assign one of 6 bins.
         """
         wall_density = float(level.wall_map.mean())
-        path_length = self._compute_path_length(level)
-
-        # Simple clustering by difficulty and wall density
-        # 5 clusters based on discretizing difficulty and density
-        difficulty_bin = min(int(adversary_difficulty * 3), 2)  # 0, 1, 2
-        density_bin = 0 if wall_density < 0.3 else 1  # 0 or 1
-
-        cluster = difficulty_bin * 2 + density_bin
-        return int(cluster)
+        difficulty_bin = min(int(adversary_difficulty * 3), 2)
+        density_bin = 0 if wall_density < 0.3 else 1
+        return int(difficulty_bin * 2 + density_bin)
 
     def _estimate_opponent_return(
         self,
         protagonist_hstate: np.ndarray,
         level,
     ) -> float:
-        """Estimate protagonist's model of opponent's return (theory of mind).
+        """Get real antagonist return on this level as the opponent return target.
 
-        Probes whether protagonist h-state encodes information about antagonist performance.
+        This value is what probes predict from protagonist h-state
+        (testing whether protagonist encodes information about antagonist performance).
         """
         if protagonist_hstate is None:
             return 0.0
 
-        # Simple heuristic: use h-state activation patterns
-        # High activation in certain regions correlates with opponent difficulty estimate
-        # This is a proxy - actual ToM probing would train a probe from h -> ant_return
+        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+        if ant_train_state is not None:
+            try:
+                import jax
+                rng = jax.random.PRNGKey(hash(float(level.wall_map.mean())) % (2**31))
+                level_batch = jax.tree_util.tree_map(lambda x: x[None], level)
+                from .utils.paired_helpers import run_batched_rollout
+                result = run_batched_rollout(
+                    rng, level_batch, ant_train_state, self.agent, max_steps=self.config.get("max_steps", 256),
+                )
+                return float(result.episode_returns[0])
+            except Exception:
+                pass
 
-        # Use first 64 dimensions as "opponent model" region
-        tom_region = protagonist_hstate[:64] if len(protagonist_hstate) >= 64 else protagonist_hstate
-        activation_level = float(np.mean(np.abs(tom_region)))
-
-        # Map activation to return estimate (0-1 scale)
-        # Higher activation = expect opponent to do better
-        opponent_return_est = np.tanh(activation_level) * 0.5 + 0.5
-
-        return float(opponent_return_est)
+        # Fallback: use protagonist return as rough proxy
+        return 0.0
 
     def _compute_path_length(self, level) -> int:
         """Compute BFS path length from agent to goal."""
@@ -435,16 +425,16 @@ class LevelProbingExperiment(CheckpointExperiment):
         return -1  # Unsolvable
 
     def _estimate_regret(self, level) -> float:
-        """Estimate regret based on level difficulty heuristics."""
-        wall_density = float(level.wall_map.mean())
-        path_length = self._compute_path_length(level)
+        """Estimate regret from level features.
 
-        if path_length <= 0:
-            return 1.0  # Max regret for unsolvable
-
-        # Simple heuristic: longer paths and denser walls = higher regret
-        regret = (wall_density * 0.3 + min(path_length / 50, 1.0) * 0.7)
-        return float(regret)
+        True regret = ant_return - pro_return. Without antagonist data,
+        returns NaN to avoid misleading downstream analysis.
+        """
+        import logging
+        logging.getLogger(__name__).warning(
+            "No antagonist available — regret estimate is NaN (not computable)"
+        )
+        return float('nan')
 
     def analyze(self) -> Dict[str, Any]:
         """Train probes and compute R²/accuracy for each property."""
@@ -501,18 +491,23 @@ class LevelProbingExperiment(CheckpointExperiment):
             # Continuous targets
             for target_name in continuous_targets:
                 y = properties[target_name]
-                if len(np.unique(y)) < 2:
+
+                # Filter out NaN values (e.g. regret when antagonist unavailable)
+                valid_mask = ~np.isnan(y)
+                if valid_mask.sum() < 10 or len(np.unique(y[valid_mask])) < 2:
                     continue
+                X_valid = X[valid_mask]
+                y_valid = y[valid_mask]
 
                 # Linear probe
                 linear_probe, linear_metrics = train_probe(
-                    X, y, probe_type="linear", task="regression"
+                    X_valid, y_valid, probe_type="linear", task="regression"
                 )
                 step_results["linear"][target_name] = linear_metrics
 
                 # MLP probe
                 mlp_probe, mlp_metrics = train_probe(
-                    X, y, probe_type="mlp", task="regression"
+                    X_valid, y_valid, probe_type="mlp", task="regression"
                 )
                 step_results["mlp"][target_name] = mlp_metrics
 
@@ -818,31 +813,16 @@ class LevelProbingExperiment(CheckpointExperiment):
             for i in range(n_samples):
                 rng, level_rng, loss_rng = jax.random.split(rng, 3)
 
-                # Create level from stored properties
+                # Generate a real level using the agent's environment
+                level_obj = self.agent.sample_random_level(level_rng)
+                # Convert Level pytree to dict for agent_aware_loss
                 level = {
-                    'wall_map': np.zeros((13, 13)),  # Placeholder
-                    'wall_density': properties['wall_density'][i],
-                    'goal_pos': (6, 6),  # Placeholder
-                    'agent_pos': (1, 1),  # Placeholder
+                    'wall_map': np.array(level_obj.wall_map),
+                    'wall_density': float(np.array(level_obj.wall_map).mean()),
+                    'goal_pos': tuple(int(x) for x in np.array(level_obj.goal_pos)),
+                    'agent_pos': tuple(int(x) for x in np.array(level_obj.agent_pos)),
                     'agent_dir': 0,
                 }
-
-                # Generate actual random level for evaluation
-                height, width = 13, 13
-                wall_prob = properties['wall_density'][i]
-                wall_map = np.array(jax.random.bernoulli(level_rng, wall_prob, (height, width)))
-                wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-                rng_goal, rng_agent = jax.random.split(level_rng)
-                level['wall_map'] = wall_map
-                level['goal_pos'] = (
-                    int(jax.random.randint(rng_goal, (), 1, height - 1)),
-                    int(jax.random.randint(rng_goal, (), 1, width - 1)),
-                )
-                level['agent_pos'] = (
-                    int(jax.random.randint(rng_agent, (), 1, height - 1)),
-                    int(jax.random.randint(rng_agent, (), 1, width - 1)),
-                )
 
                 loss, _ = compute_agent_prediction_loss(
                     self.agent,

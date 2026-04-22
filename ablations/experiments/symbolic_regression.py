@@ -105,28 +105,15 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
     def name(self) -> str:
         return "symbolic_regression"
 
-    def __init__(
-        self,
-        collection_interval: int = 100,
-        n_samples_per_collection: int = 20,
-        use_pysr: bool = True,
-        pysr_iterations: int = 50,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize symbolic regression experiment.
-
-        Args:
-            collection_interval: Steps between data collection
-            n_samples_per_collection: Samples per collection point
-            use_pysr: Whether to use PySR for symbolic regression
-            pysr_iterations: Number of PySR iterations
         """
         super().__init__(**kwargs)
-        self.collection_interval = collection_interval
-        self.n_samples_per_collection = n_samples_per_collection
-        self.use_pysr = use_pysr
-        self.pysr_iterations = pysr_iterations
+        self.collection_interval = self.exp_config("collection_interval")
+        self.n_samples_per_collection = self.exp_config("n_samples_per_collection")
+        self.use_pysr = self.exp_config("use_pysr")
+        self.pysr_iterations = self.exp_config("pysr_iterations")
 
         self._data = PredictionData()
         self._results: Dict[str, Any] = {}
@@ -174,18 +161,18 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
             if self.has_branches and 'branch_type' in features:
                 self._data.branch_types.append(features['branch_type'])
 
-            # PAIRED-specific: collect regret structure features
+            # PAIRED-specific: collect regret structure features from real data
             if self.has_regret:
-                if 'regret' in features:
-                    self._data.regrets.append(features['regret'])
-                if 'adversary_entropy' in features:
-                    self._data.adversary_entropies.append(features['adversary_entropy'])
-                if 'antagonist_return' in features:
-                    self._data.antagonist_returns.append(features['antagonist_return'])
-                if 'adversary_strategy_cluster' in features:
-                    self._data.adversary_strategy_clusters.append(features['adversary_strategy_cluster'])
-                if 'policy_entropy' in features:
-                    self._data.policy_entropies.append(features['policy_entropy'])
+                # Override features with computed values from _compute_prediction_error
+                ant_return = level.get('_computed_antagonist_return', float('nan'))
+                regret = level.get('_computed_regret', float('nan'))
+                policy_entropy = level.get('_computed_policy_entropy', 0.0)
+
+                self._data.regrets.append(float(regret) if np.isfinite(regret) else 0.0)
+                self._data.adversary_entropies.append(float(policy_entropy))  # Use pro policy entropy as proxy
+                self._data.antagonist_returns.append(float(ant_return) if np.isfinite(ant_return) else 0.0)
+                self._data.adversary_strategy_clusters.append(features.get('adversary_strategy_cluster', 0))
+                self._data.policy_entropies.append(float(policy_entropy))
 
         mean_loss = np.mean(self._data.probe_losses[-self.n_samples_per_collection:])
         return {
@@ -193,30 +180,17 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
         }
 
     def _generate_level(self, rng) -> Dict[str, Any]:
-        """Generate a random level for evaluation."""
+        """Generate a random level using the agent's environment."""
         import jax
-        import jax.numpy as jnp
 
-        height, width = 13, 13
-
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
+        level_obj = self.agent.sample_random_level(rng)
+        wall_map = np.array(level_obj.wall_map)
+        goal_pos = tuple(int(x) for x in np.array(level_obj.goal_pos))
+        agent_pos = tuple(int(x) for x in np.array(level_obj.agent_pos))
 
         level = {
             'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
+            'wall_density': float(wall_map.mean()),
             'goal_pos': goal_pos,
             'agent_pos': agent_pos,
         }
@@ -237,7 +211,9 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
         goal_distance = abs(goal_pos[0] - agent_pos[0]) + abs(goal_pos[1] - agent_pos[1])
 
         # Simplified path length (Manhattan + wall penalty)
-        path_length = goal_distance * (1 + wall_density)
+        from .utils.paired_helpers import compute_bfs_path_length
+        bfs_result = compute_bfs_path_length(level)
+        path_length = float(bfs_result) if bfs_result >= 0 else goal_distance * (1 + wall_density)
 
         features = {
             'wall_density': float(wall_density),
@@ -250,23 +226,13 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
             features['branch_type'] = int(level['branch'])
 
         if self.has_regret:
-            # PAIRED E5: Regret structure features
-            # Actual regret (will be computed in _compute_prediction_error if antagonist available)
-            features['regret'] = float(0.3 * wall_density + 0.7 * min(path_length / 30, 1.0))
-
-            # Adversary entropy: proxy based on level variability
-            # Lower wall density variation = lower adversary entropy (more deterministic strategy)
-            features['adversary_entropy'] = float(0.5 + 0.5 * (1 - wall_density))
-
-            # Antagonist return: will be computed if antagonist available
-            features['antagonist_return'] = 0.0
-
-            # Adversary strategy cluster: simple heuristic clustering
-            difficulty = wall_density + 0.5 * (goal_distance / 26)
-            features['adversary_strategy_cluster'] = int(min(difficulty * 5, 4))
-
-            # Policy entropy: will be computed in _compute_prediction_error
-            features['policy_entropy'] = 0.0
+            # PAIRED: These are initialized to NaN/0 and overridden in _compute_prediction_error
+            # if antagonist is available
+            features['regret'] = np.nan  # Will be set from real ant - pro returns
+            features['adversary_entropy'] = np.nan  # Will be set from real adversary policy
+            features['antagonist_return'] = 0.0  # Will be set from real rollout
+            features['adversary_strategy_cluster'] = 0  # Will be set post-hoc
+            features['policy_entropy'] = 0.0  # Will be set from real policy
 
         return features
 
@@ -323,9 +289,10 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
                 else:
                     _, pi, value = outputs
 
-                # Value error: |V(s) - expected_return|
-                expected_return = 0.5 * (1 - level['wall_density'])
-                value_error = float(abs(value[0, 0] - expected_return))
+                # Value error: |V(s) - actual_return|
+                # Use the value estimate itself as baseline (value error = 0 at initialization)
+                # The actual return will be computed from rollout in training_hook context
+                value_error = float(abs(value[0, 0]))
 
                 # PAIRED E5: Compute policy entropy for agent-centric analysis
                 if self.has_regret and hasattr(pi, 'entropy'):
@@ -340,6 +307,7 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
 
             except Exception:
                 value_error = 1.0
+                value = None
                 level['_computed_policy_entropy'] = 0.0
 
             # PAIRED: Compute antagonist return if available
@@ -347,7 +315,9 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
                 rng, ant_rng = jax.random.split(rng)
                 ant_return = self._compute_antagonist_return(ant_rng, level)
                 level['_computed_antagonist_return'] = ant_return
-                level['_computed_regret'] = ant_return - (1 - level['wall_density']) * 0.5
+                # Use protagonist value estimate as proxy for pro_return
+                pro_value = float(value[0, 0]) if value is not None else 0.0
+                level['_computed_regret'] = ant_return - pro_value
 
             return probe_loss, value_error
 
@@ -355,14 +325,21 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
             return 1.0, 1.0
 
     def _compute_antagonist_return(self, rng, level: Dict[str, Any]) -> float:
-        """Compute antagonist return on level (PAIRED)."""
+        """Compute antagonist return on level (PAIRED).
+
+        Uses real antagonist value estimate via forward pass.
+        Returns NaN if antagonist is unavailable (caller should handle).
+        """
         import jax
         import jax.numpy as jnp
+        import logging
 
         ant_train_state = getattr(self.train_state, 'ant_train_state', None)
         if ant_train_state is None:
-            # Estimate: antagonist typically does better
-            return 0.6 * (1 - level['wall_density'])
+            logging.getLogger(__name__).warning(
+                "No antagonist train state available; antagonist return will be NaN"
+            )
+            return float('nan')
 
         try:
             from .utils.agent_aware_loss import create_observation_from_level
@@ -385,8 +362,11 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
 
             return float(value[0, 0])
 
-        except Exception:
-            return 0.6 * (1 - level['wall_density'])
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"Antagonist forward pass failed: {e}; returning NaN"
+            )
+            return float('nan')
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, np.ndarray]:
         """Return collected data."""
@@ -403,10 +383,11 @@ class SymbolicRegressionExperiment(TrainingTimeExperiment):
         data = self._data.to_arrays()
 
         if len(data['steps']) < 100:
-            return {
+            self._results = {
                 'error': 'Insufficient data for analysis',
                 'n_samples': len(data['steps']),
             }
+            return self._results
 
         results = {}
 

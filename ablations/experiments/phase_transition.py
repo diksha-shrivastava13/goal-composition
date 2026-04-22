@@ -84,25 +84,14 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
     def name(self) -> str:
         return "phase_transition"
 
-    def __init__(
-        self,
-        collection_interval: int = 100,
-        n_gradient_samples: int = 10,
-        n_representation_samples: int = 50,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize phase transition experiment.
-
-        Args:
-            collection_interval: Steps between data collection
-            n_gradient_samples: Samples for Fisher estimation
-            n_representation_samples: Samples for dimensionality estimation
         """
         super().__init__(**kwargs)
-        self.collection_interval = collection_interval
-        self.n_gradient_samples = n_gradient_samples
-        self.n_representation_samples = n_representation_samples
+        self.collection_interval = self.exp_config("collection_interval")
+        self.n_gradient_samples = self.exp_config("n_gradient_samples")
+        self.n_representation_samples = self.exp_config("n_representation_samples")
 
         self._data = DynamicsData()
         self._results: Dict[str, Any] = {}
@@ -162,11 +151,21 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
         self._data.hidden_state_norms.append(float(hidden_norm))
         self._data.prediction_losses.append(float(prediction_loss))
 
-        # Store gradient norm as a 1-element sample for Fisher estimation
+        # Store per-parameter gradient vectors for Fisher estimation
         if grad_norm > 0:
             if not hasattr(self, '_last_gradient_samples'):
                 self._last_gradient_samples = []
-            self._last_gradient_samples.append([float(grad_norm)])
+            # Extract flattened gradient vector from train_state if available
+            grad_vector = metrics.get('gradient_vector', None)
+            if grad_vector is not None:
+                flat_grad = np.concatenate([np.ravel(np.array(g)) for g in jax.tree_util.tree_leaves(grad_vector)])
+                # Subsample params if too many (keep first 1000 dims)
+                if len(flat_grad) > 1000:
+                    flat_grad = flat_grad[:1000]
+                self._last_gradient_samples.append(flat_grad.tolist())
+            else:
+                # Fallback: use gradient norm as single-element vector
+                self._last_gradient_samples.append([float(grad_norm)])
             # Keep last N samples
             self._last_gradient_samples = self._last_gradient_samples[-self.n_gradient_samples:]
 
@@ -187,52 +186,23 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
             return 0.0, 0.0
 
         try:
+            import jax
+            import jax.numpy as jnp
+            from .utils.paired_helpers import generate_levels, get_real_hstates
+
             rng = jax.random.PRNGKey(0)
-            hidden_states = []
+            n = min(self.n_representation_samples, 50)
 
-            for i in range(self.n_representation_samples):
-                rng, sample_rng = jax.random.split(rng)
-
-                # Create random observation
-                obs_image = jax.random.uniform(sample_rng, (13, 13, 3))
-
-                class Obs:
-                    def __init__(self, img, direction):
-                        self.image = img
-                        self.agent_dir = direction
-
-                obs = Obs(obs_image, jnp.array([0]))
-
-                # Get hidden state
-                rng, h_rng = jax.random.split(rng)
-                hstate = self.agent.initialize_hidden_state(1)
-
-                # Forward pass
-                obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
-                done_batch = jnp.zeros((1, 1), dtype=bool)
-
-                new_hstate, _, _ = self.train_state.apply_fn(
-                    self.train_state.params,
-                    (obs_batch, done_batch),
-                    hstate
-                )
-
-                # Flatten hidden state
-                h_c, h_h = new_hstate
-                h_flat = np.concatenate([
-                    np.array(h_c).flatten(),
-                    np.array(h_h).flatten()
-                ])
-                hidden_states.append(h_flat)
-
-            hidden_states = np.stack(hidden_states)
+            rng, level_rng, h_rng = jax.random.split(rng, 3)
+            levels = generate_levels(self.agent, level_rng, n)
+            hstates = get_real_hstates(h_rng, levels, self.train_state, self.agent)
 
             # Compute effective dimensionality
-            dim_result = compute_effective_dimensionality(hidden_states)
+            dim_result = compute_effective_dimensionality(hstates)
             effective_dim = dim_result.get('effective_dimensionality', 0.0)
 
             # Compute mean hidden state norm
-            hidden_norm = float(np.linalg.norm(hidden_states, axis=1).mean())
+            hidden_norm = float(np.linalg.norm(hstates, axis=1).mean())
 
             return effective_dim, hidden_norm
 
@@ -281,32 +251,15 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
             return 1.0
 
     def _generate_random_level(self, rng) -> Dict[str, Any]:
-        """Generate a random level for prediction loss evaluation."""
+        """Generate a random level using the agent's environment."""
         import jax
+        from .utils.paired_helpers import levels_to_dicts
 
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'agent_dir': 0,
-        }
+        level = self.agent.sample_random_level(rng)
+        level_dict = levels_to_dicts(jax.tree_util.tree_map(lambda x: x[None], level), 1)[0]
+        level_dict['wall_density'] = float(np.array(level.wall_map).sum() / np.array(level.wall_map).size)
+        level_dict['agent_dir'] = 0
+        return level_dict
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, np.ndarray]:
         """Return collected data."""
@@ -322,10 +275,11 @@ class PhaseTransitionExperiment(TrainingTimeExperiment):
         data = self._data.to_arrays()
 
         if len(data['steps']) < 10:
-            return {
+            self._results = {
                 'error': 'Insufficient data points',
                 'n_points': len(data['steps']),
             }
+            return self._results
 
         results = {}
 

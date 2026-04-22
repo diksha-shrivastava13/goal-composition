@@ -23,7 +23,6 @@ from ..utils.paired_helpers import (
 
 class PatchTarget(Enum):
     """Target for activation patching."""
-    CELL_STATE = "cell_state"
     HIDDEN_STATE = "hidden_state"
     FIRST_HALF_DIMS = "first_half_dims"
     SECOND_HALF_DIMS = "second_half_dims"
@@ -61,22 +60,24 @@ class ActivationPatchingExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "activation_patching"
 
-    def __init__(
-        self,
-        n_pairs: int = 200,
-        hidden_dim: int = 256,
-        top_k_variance: int = 50,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
+        """
+        Args:
+            n_pairs: Number of source/target pairs for patching.
+            hidden_dim: Initial hidden dimension estimate (updated from data).
+            top_k_variance: Max number of top-variance dimensions to patch.
+                Capped at hidden_dim // 4 to avoid patching too large a fraction.
+        """
         super().__init__(**kwargs)
-        self.n_pairs = n_pairs
-        self.hidden_dim = hidden_dim
-        self.top_k_variance = top_k_variance
+        self.n_pairs = self.exp_config("n_pairs")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.top_k_variance = self.exp_config("top_k_variance")
         self._levels: List[Dict[str, Any]] = []
         self._hstates: np.ndarray = None
         self._patch_results: Dict[PatchTarget, List[PatchResult]] = {}
         self._regret_dims: Optional[np.ndarray] = None
         self._variance_dims: Optional[np.ndarray] = None
+        self._n_pairs_skipped: Dict[PatchTarget, int] = {}
         self._require_paired()
 
     def _require_paired(self):
@@ -118,9 +119,12 @@ class ActivationPatchingExperiment(CheckpointExperiment):
 
     def _identify_important_dims(self):
         """Identify top variance and regret-encoding dimensions."""
+        # Adaptive top_k: cap at hidden_dim // 4
+        effective_top_k = min(self.top_k_variance, self.hidden_dim // 4)
+
         # Top variance dimensions
         variances = self._hstates.var(axis=0)
-        self._variance_dims = np.argsort(variances)[-self.top_k_variance:]
+        self._variance_dims = np.argsort(variances)[-effective_top_k:]
 
         # Regret-encoding dimensions (simplified: dimensions correlated with wall density)
         features = np.array([
@@ -131,12 +135,11 @@ class ActivationPatchingExperiment(CheckpointExperiment):
             abs(np.corrcoef(self._hstates[:, d], features)[0, 1])
             for d in range(self.hidden_dim)
         ])
-        self._regret_dims = np.argsort(correlations)[-self.top_k_variance:]
+        self._regret_dims = np.argsort(correlations)[-effective_top_k:]
 
     def _run_patches(self, rng: chex.PRNGKey):
         """Run all patch experiments."""
         patch_targets = [
-            PatchTarget.CELL_STATE,
             PatchTarget.HIDDEN_STATE,
             PatchTarget.FIRST_HALF_DIMS,
             PatchTarget.SECOND_HALF_DIMS,
@@ -155,6 +158,7 @@ class ActivationPatchingExperiment(CheckpointExperiment):
     ) -> List[PatchResult]:
         """Run patches for a specific target."""
         results = []
+        n_skipped = 0
 
         for i in range(self.n_pairs):
             source_idx = i * 2
@@ -178,8 +182,14 @@ class ActivationPatchingExperiment(CheckpointExperiment):
                 eval_rng, patched_h, self._levels[target_idx]
             )
 
-            # Compute KL divergence (simplified)
-            policy_kl = abs(patched_policy_entropy - original_policy_entropy) * 0.5
+            # Skip if forward pass failed (NaN sentinel from _evaluate_with_hstate)
+            if (np.isnan(original_policy_entropy) or np.isnan(original_value)
+                    or np.isnan(patched_policy_entropy) or np.isnan(patched_value)):
+                n_skipped += 1
+                continue
+
+            # Entropy difference as KL proxy (exact KL needs full distributions)
+            policy_kl = abs(patched_policy_entropy - original_policy_entropy)
 
             results.append(PatchResult(
                 target=target,
@@ -193,6 +203,15 @@ class ActivationPatchingExperiment(CheckpointExperiment):
                 value_change=patched_value - original_value,
             ))
 
+        self._n_pairs_skipped[target] = n_skipped
+        skip_rate = n_skipped / self.n_pairs if self.n_pairs > 0 else 0
+        if skip_rate > 0.2:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Activation patching {target.value}: {n_skipped}/{self.n_pairs} "
+                f"pairs skipped due to NaN ({skip_rate:.0%})"
+            )
+
         return results
 
     def _apply_patch(
@@ -204,12 +223,8 @@ class ActivationPatchingExperiment(CheckpointExperiment):
         """Apply patch from source to target."""
         patched = target_h.copy()
 
-        if patch_target == PatchTarget.CELL_STATE:
-            # Simulate cell state as first half
-            patched[:self.hidden_dim // 2] = source_h[:self.hidden_dim // 2]
-        elif patch_target == PatchTarget.HIDDEN_STATE:
-            # Simulate hidden state as second half
-            patched[self.hidden_dim // 2:] = source_h[self.hidden_dim // 2:]
+        if patch_target == PatchTarget.HIDDEN_STATE:
+            patched[:] = source_h[:]
         elif patch_target == PatchTarget.FIRST_HALF_DIMS:
             patched[:self.hidden_dim // 2] = source_h[:self.hidden_dim // 2]
         elif patch_target == PatchTarget.SECOND_HALF_DIMS:
@@ -227,20 +242,55 @@ class ActivationPatchingExperiment(CheckpointExperiment):
         hstate: np.ndarray,
         level: Dict[str, Any],
     ) -> Tuple[float, float]:
-        """Evaluate policy and value with given hidden state."""
-        # Simplified evaluation
-        features = self._compute_level_features(level)
+        """Evaluate policy entropy and value using real network forward pass."""
+        try:
+            # Generate a proper level from agent and reset to get correct obs format
+            rng, level_rng, obs_rng = jax.random.split(rng, 3)
+            level_obj = self.agent.sample_random_level(level_rng)
 
-        # Value depends on hstate and features
-        value = 0.5 + np.tanh(hstate[:50].mean()) * 0.3 - features['wall_density'] * 0.2
-        value += float(jax.random.uniform(rng)) * 0.05
+            # Override wall_map from the level dict
+            if 'wall_map' in level:
+                wall_map = jnp.array(level['wall_map'])
+                level_obj = level_obj.replace(wall_map=wall_map)
+            if 'goal_pos' in level:
+                level_obj = level_obj.replace(goal_pos=jnp.array(level['goal_pos']))
+            if 'agent_pos' in level:
+                level_obj = level_obj.replace(agent_pos=jnp.array(level['agent_pos']))
 
-        # Policy entropy depends on hstate uncertainty
-        hstate_var = hstate.var()
-        entropy = 1.0 + hstate_var * 0.5 + features['wall_density'] * 0.3
-        entropy += float(jax.random.uniform(rng)) * 0.1
+            # Use the env to get proper observation format
+            obs, _ = self.agent.env.reset_env_to_level(obs_rng, level_obj, self.agent.env_params)
 
-        return float(entropy), float(value)
+            # Add batch and sequence dims: (H, W, C) -> (1, 1, H, W, C)
+            obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs)
+            done_batch = jnp.zeros((1, 1), dtype=bool)
+
+            # Reshape flat hstate vector into LSTM carry format
+            half = len(hstate) // 2
+            h_c = jnp.array(hstate[:half]).reshape(1, -1)
+            h_h = jnp.array(hstate[half:]).reshape(1, -1)
+            hstate_tree = (h_c, h_h)
+
+            outputs = self.train_state.apply_fn(
+                self.train_state.params,
+                (obs_batch, done_batch),
+                hstate_tree,
+            )
+
+            if len(outputs) == 4:
+                _, pi, value, _ = outputs
+            else:
+                _, pi, value = outputs
+
+            entropy = float(pi.entropy()[0, 0]) if hasattr(pi, 'entropy') else float('nan')
+            val = float(value[0, 0])
+            return entropy, val
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Forward pass failed in _evaluate_with_hstate: {e}. Returning NaN."
+            )
+            return float('nan'), float('nan')
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze activation patching results."""
@@ -270,6 +320,15 @@ class ActivationPatchingExperiment(CheckpointExperiment):
 
         # Summary statistics
         results['summary'] = self._compute_summary_stats()
+
+        # NaN skip statistics
+        results['nan_skip_stats'] = {
+            target.value: {
+                'n_pairs_skipped': n_skipped,
+                'skip_rate': n_skipped / self.n_pairs if self.n_pairs > 0 else 0,
+            }
+            for target, n_skipped in self._n_pairs_skipped.items()
+        }
 
         return results
 

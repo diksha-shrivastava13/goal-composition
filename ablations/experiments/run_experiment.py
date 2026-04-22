@@ -199,6 +199,7 @@ def run_experiment(
     seed: int = 0,
     training_method: str = "accel",
     experiment_kwargs: Optional[Dict[str, Any]] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a single experiment.
@@ -211,6 +212,7 @@ def run_experiment(
         seed: Random seed
         training_method: Training method used (accel, plr, robust_plr, paired, dr)
         experiment_kwargs: Additional experiment parameters
+        config_overrides: Runtime config overrides (e.g. from CLI --n_levels, --max_steps)
 
     Returns:
         Dict with experiment results
@@ -231,6 +233,10 @@ def run_experiment(
         config = {}
     config['training_method'] = training_method
 
+    # Apply runtime config overrides (e.g. CLI experiment params)
+    if config_overrides:
+        config.update(config_overrides)
+
     # Load agent with checkpoint config (needed for checkpoint template)
     agent = load_agent(agent_type, config)
 
@@ -241,6 +247,10 @@ def run_experiment(
     if checkpoint_config:
         config.update(checkpoint_config)
 
+    # Re-apply runtime overrides after checkpoint config merge (CLI takes precedence)
+    if config_overrides:
+        config.update(config_overrides)
+
     # For PAIRED agents, wrap the train_state so experiments can access
     # apply_fn/params (protagonist) while still accessing ant_train_state etc.
     from ..common.types import PAIREDTrainState
@@ -250,6 +260,17 @@ def run_experiment(
     # Create experiment with required config arg
     kwargs = experiment_kwargs or {}
     kwargs['training_method'] = training_method
+
+    # Handle secondary checkpoint for cross-adversary experiments (e.g., regret_transfer)
+    sec_path = kwargs.pop('secondary_checkpoint_path', None)
+    if sec_path:
+        sec_agent = load_agent(agent_type, config)
+        sec_ts, _ = load_checkpoint(sec_path, agent=sec_agent, seed=seed)
+        if isinstance(sec_ts, PAIREDTrainState):
+            sec_ts = _wrap_paired_train_state(sec_ts)
+        kwargs['secondary_train_state'] = sec_ts
+        kwargs['secondary_agent'] = sec_agent
+
     experiment = ExperimentClass(
         agent=agent,
         train_state=train_state,
@@ -322,28 +343,30 @@ def run_experiment(
 
 
 def main():
+    from ..configs.cli import add_common_args, add_experiment_param_args, EXPERIMENT_PARAM_KEYS
+
     parser = argparse.ArgumentParser(description="Run a single experiment")
+
+    # Shared args
+    add_common_args(parser)
+    add_experiment_param_args(parser)
+
+    # Entry-point-specific
     parser.add_argument('--experiment', type=str, required=True,
                         help='Experiment name (e.g., level_probing)')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint')
-    parser.add_argument('--agent_type', type=str, required=True,
-                        help='Agent type (e.g., persistent_lstm)')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='Output directory')
-    parser.add_argument('--seed', type=int, default=0,
-                        help='Random seed')
-    parser.add_argument('--training_method', type=str, default='accel',
-                        choices=['accel', 'plr', 'robust_plr', 'paired', 'dr'],
-                        help='Training method used (default: accel)')
-    parser.add_argument('--dry_run', action='store_true',
-                        help='Check compatibility without running')
+    parser.add_argument('--secondary_checkpoint', type=str, default=None,
+                        help='Secondary checkpoint path for cross-adversary experiments '
+                             '(e.g., regret_transfer). Can be a different seed (cross-seed) '
+                             'or a different step from the same run (cross-stage).')
 
     args = parser.parse_args()
 
     if args.dry_run:
         # Validate that experiment is compatible with training method
         from . import TRAINING_METHODS
+        from ..configs import PAIRED_EXPERIMENTS
         if args.training_method not in TRAINING_METHODS:
             print(f"Unknown training method: {args.training_method}")
             return
@@ -352,36 +375,33 @@ def main():
         print(f"Training method: {args.training_method}")
         print(f"Method properties: {TRAINING_METHODS[args.training_method]}")
 
-        # Check for method-specific experiments
-        paired_only = {
-            'adversary_dynamics', 'regret_transfer',
-            # PAIRED A-series
-            'utility_extraction', 'adversary_policy_extraction', 'bilateral_utility',
-            # PAIRED B-series
-            'adversary_ablation', 'regret_decomposition', 'teaching_signal_intervention',
-            'counterfactual_curriculum', 'activation_patching',
-            # PAIRED C-series
-            'representation_divergence', 'antagonist_audit', 'adversary_strategy_clustering',
-            'coalition_dynamics',
-            # PAIRED D-series
-            'representation_trajectory', 'belief_revision_detection', 'goal_evolution',
-            # PAIRED F-series
-            'causal_model_extraction', 'multiscale_goals', 'shard_dynamics',
-            'belief_behaviour_divergence', 'teaching_opacity',
-        }
+        paired_only = set(PAIRED_EXPERIMENTS)
         if args.experiment in paired_only and args.training_method != 'paired':
             print(f"WARNING: {args.experiment} is PAIRED-specific, will return error for {args.training_method}")
         else:
             print("Compatibility check passed")
         return
 
+    experiment_kwargs = {}
+    if args.secondary_checkpoint:
+        experiment_kwargs['secondary_checkpoint_path'] = args.secondary_checkpoint
+
+    # Collect CLI experiment param overrides (only if explicitly set)
+    config_overrides = {}
+    for key in EXPERIMENT_PARAM_KEYS:
+        val = getattr(args, key, None)
+        if val is not None:
+            config_overrides[key] = val
+
     run_experiment(
         experiment_name=args.experiment,
         checkpoint_path=args.checkpoint,
         agent_type=args.agent_type,
-        output_dir=args.output_dir,
+        output_dir=args.output_dir or ".",
         seed=args.seed,
         training_method=args.training_method,
+        experiment_kwargs=experiment_kwargs or None,
+        config_overrides=config_overrides or None,
     )
 
 

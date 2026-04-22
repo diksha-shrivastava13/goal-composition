@@ -31,7 +31,6 @@ from .base import CheckpointExperiment
 from .utils.batched_rollout import batched_rollout
 from .utils.calibration_utils import (
     compute_multi_point_calibration,
-    compute_branch_conditioned_ece,
     compute_temporal_consistency,
     compute_calibration_by_difficulty,
 )
@@ -80,11 +79,18 @@ class ValueCalibrationExperiment(CheckpointExperiment):
         return "value_calibration"
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Collect value predictions and actual returns at multiple timesteps (GPU-batched)."""
-        n_episodes = self.config.get("n_episodes", 500)
-        timesteps = self.config.get("calibration_timesteps", [1, 10, 50, 100, 200])
-        max_episode_length = self.config.get("max_episode_length", 256)
-        gamma = self.config.get("gamma", 0.995)
+        """Collect value predictions and actual returns at multiple timesteps (GPU-batched).
+
+        Config keys:
+            calibration_timesteps: Timesteps at which to measure V(s_t) vs G_t.
+                Defaults to [1, 10, 50, 100, 200] — chosen to sample early (1),
+                warm-up (10), mid-game (50), late-game (100), near-terminal (200)
+                within max 256 steps.
+        """
+        n_episodes = self.exp_config("n_episodes")
+        timesteps = self.exp_config("calibration_timesteps")
+        max_episode_length = self.exp_config("max_episode_length")
+        gamma = self.exp_config("gamma")
         timings = {}
 
         try:
@@ -124,7 +130,12 @@ class ValueCalibrationExperiment(CheckpointExperiment):
         agent_positions = np.array(levels.agent_pos)
         wall_density = wall_maps.mean(axis=(1, 2))
         goal_distance = np.sqrt(np.sum((goal_positions - agent_positions) ** 2, axis=-1))
-        branches = np.arange(n_episodes) % 3
+        # Assign difficulty-based branches via wall_density terciles
+        # (easy=0, medium=1, hard=2) instead of synthetic cycling
+        wd_33 = np.percentile(wall_density, 33)
+        wd_67 = np.percentile(wall_density, 67)
+        branches = np.where(wall_density < wd_33, 0,
+                            np.where(wall_density < wd_67, 1, 2))
         _log("cpu_level_properties", time.time() - t0)
 
         # --- 3. Batched protagonist rollout ---
@@ -317,21 +328,14 @@ class ValueCalibrationExperiment(CheckpointExperiment):
                 "n_samples": len(v),
             }
 
-        # 2. Branch-conditioned calibration
-        results["by_branch"] = compute_branch_conditioned_ece(
-            episode_data["initial_values"],
-            episode_data["final_returns"],
-            episode_data["branches"],
-        )
-
-        # 3. Calibration by difficulty
+        # 2. Calibration by difficulty
         results["by_difficulty"] = compute_calibration_by_difficulty(
             episode_data["initial_values"],
             episode_data["final_returns"],
             episode_data["difficulties"],
         )
 
-        # 4. Temporal consistency
+        # 3. Temporal consistency
         results["temporal_consistency"] = compute_temporal_consistency(
             episode_data["values_over_time"],
             gamma,
@@ -558,11 +562,13 @@ class ValueCalibrationExperiment(CheckpointExperiment):
             summary["initial_correlation"] = t1["correlation"]
             summary["initial_ece"] = t1["ece"]
 
-        # Branch calibration comparison
-        by_branch = results.get("by_branch", {})
-        if "Replay" in by_branch and "DR" in by_branch:
-            summary["replay_better_calibrated"] = by_branch.get("replay_better_calibrated", False)
-            summary["replay_vs_dr_ece_diff"] = by_branch.get("replay_vs_dr_ece_diff", 0)
+        # Difficulty calibration comparison
+        by_diff = results.get("by_difficulty", {})
+        if by_diff:
+            diff_eces = {k: v.get("ece", 0) for k, v in by_diff.items() if isinstance(v, dict)}
+            if diff_eces:
+                summary["best_difficulty_bin"] = min(diff_eces, key=diff_eces.get)
+                summary["worst_difficulty_bin"] = max(diff_eces, key=diff_eces.get)
 
         # Goal-directedness
         vg = results.get("value_goal_correlation", {})
@@ -605,15 +611,16 @@ class ValueCalibrationExperiment(CheckpointExperiment):
             ax.set_ylabel('ECE')
             ax.set_title('Calibration Error by Timestep')
 
-        # Calibration by branch
+        # Calibration by difficulty
         ax = axes[0, 2]
-        by_branch = self.results.get("by_branch", {})
-        branch_names = ["DR", "Replay", "Mutate"]
-        branch_eces = [by_branch.get(b, {}).get("ece", 0) for b in branch_names]
-        colors = ['blue', 'green', 'orange']
-        ax.bar(branch_names, branch_eces, color=colors, alpha=0.8)
+        by_diff = self.results.get("by_difficulty", {})
+        if by_diff:
+            diff_bins = [k for k in by_diff.keys() if isinstance(by_diff[k], dict)]
+            diff_eces = [by_diff[b].get("ece", 0) for b in diff_bins]
+            colors = ['blue', 'green', 'orange'][:len(diff_bins)]
+            ax.bar(diff_bins, diff_eces, color=colors, alpha=0.8)
         ax.set_ylabel('ECE')
-        ax.set_title('Calibration by Branch')
+        ax.set_title('Calibration by Difficulty')
 
         # Calibration curve
         ax = axes[1, 0]

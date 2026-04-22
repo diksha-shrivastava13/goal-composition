@@ -38,6 +38,7 @@ class GoalExtractionData:
     goal_positions: List[Tuple[int, int]] = field(default_factory=list)
     agent_positions: List[Tuple[int, int]] = field(default_factory=list)
     wall_densities: List[float] = field(default_factory=list)
+    wall_maps: List[np.ndarray] = field(default_factory=list)
 
 
 class GoalExtractionExperiment(CheckpointExperiment):
@@ -58,25 +59,14 @@ class GoalExtractionExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "goal_extraction"
 
-    def __init__(
-        self,
-        n_samples: int = 100,
-        n_patching_pairs: int = 50,
-        n_attribution_steps: int = 50,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize goal extraction experiment.
-
-        Args:
-            n_samples: Number of samples for saliency analysis
-            n_patching_pairs: Number of level pairs for patching
-            n_attribution_steps: Steps for integrated gradients
         """
         super().__init__(**kwargs)
-        self.n_samples = n_samples
-        self.n_patching_pairs = n_patching_pairs
-        self.n_attribution_steps = n_attribution_steps
+        self.n_samples = self.exp_config("n_samples")
+        self.n_patching_pairs = self.exp_config("n_patching_pairs")
+        self.n_attribution_steps = self.exp_config("n_attribution_steps")
 
         self._data: Optional[GoalExtractionData] = None
         self._results: Dict[str, Any] = {}
@@ -98,6 +88,7 @@ class GoalExtractionExperiment(CheckpointExperiment):
             self._data.goal_positions.append(level['goal_pos'])
             self._data.agent_positions.append(level['agent_pos'])
             self._data.wall_densities.append(level['wall_density'])
+            self._data.wall_maps.append(level['wall_map'])
 
         # 2. Collect patching results
         for i in range(self.n_patching_pairs):
@@ -112,26 +103,15 @@ class GoalExtractionExperiment(CheckpointExperiment):
         return self._data
 
     def _generate_level(self, rng: chex.PRNGKey) -> Dict[str, Any]:
-        """Generate a test level."""
-        height, width = 13, 13
-
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
+        """Generate a real level using the agent's environment."""
+        level_obj = self.agent.sample_random_level(rng)
+        wall_map = np.array(level_obj.wall_map)
+        goal_pos = tuple(int(x) for x in np.array(level_obj.goal_pos))
+        agent_pos = tuple(int(x) for x in np.array(level_obj.agent_pos))
 
         return {
             'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
+            'wall_density': float(wall_map.mean()),
             'goal_pos': goal_pos,
             'agent_pos': agent_pos,
         }
@@ -224,11 +204,17 @@ class GoalExtractionExperiment(CheckpointExperiment):
         # 3. Goal-distance correlation
         results['goal_distance_correlation'] = self._analyze_goal_correlation()
 
-        # 4. Prediction context for saliency interpretation
+        # 4. Task-controlling subspace via PCA on saliency-weighted activations
+        results['task_controlling_subspace'] = self._compute_saliency_weighted_pca()
+
+        # 5. Prediction context for saliency interpretation
         results['prediction_context'] = self._compute_prediction_context()
 
-        # 5. Caveats
+        # 6. Caveats
         results['caveats'] = self._get_caveats()
+
+        # 7. Goal probes from hidden states
+        results['goal_probes'] = self._analyze_goal_probes()
 
         self._results = results
         return results
@@ -325,6 +311,75 @@ class GoalExtractionExperiment(CheckpointExperiment):
             ),
         }
 
+    def _compute_saliency_weighted_pca(self) -> Dict[str, Any]:
+        """
+        PCA on saliency-weighted activation vectors to identify
+        task-controlling subspace.
+        """
+        try:
+            from sklearn.decomposition import PCA
+
+            valid_indices = [
+                i for i, s in enumerate(self._data.saliency_maps)
+                if 'error' not in s
+            ]
+            if len(valid_indices) < 10:
+                return {'error': 'Insufficient valid samples for PCA'}
+
+            # Collect hidden states and weight by saliency
+            activation_vectors = []
+            hstate = self.agent.initialize_hidden_state(1)
+
+            for idx in valid_indices:
+                level = {
+                    'wall_map': self._data.wall_maps[idx],
+                    'wall_density': self._data.wall_densities[idx],
+                    'goal_pos': self._data.goal_positions[idx],
+                    'agent_pos': self._data.agent_positions[idx],
+                }
+                obs = self._create_observation(level)
+
+                # Forward pass to get hidden state activations
+                obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
+                done_batch = jnp.zeros((1, 1), dtype=bool)
+                _result = self.train_state.apply_fn(
+                    self.train_state.params,
+                    (obs_batch, done_batch),
+                    hstate,
+                )
+                hstate_out = _result[0]
+
+                # Flatten hidden state to vector
+                h_c, h_h = hstate_out
+                h_flat = np.concatenate([
+                    np.array(h_c).flatten(),
+                    np.array(h_h).flatten(),
+                ])
+
+                # Weight by saliency magnitude (higher saliency = more task-relevant)
+                saliency_weight = self._data.saliency_maps[idx]['image_saliency_spatial'].max()
+                activation_vectors.append(h_flat * saliency_weight)
+
+            activation_matrix = np.stack(activation_vectors)
+
+            n_components = min(10, len(activation_vectors), activation_matrix.shape[1])
+            pca = PCA(n_components=n_components)
+            pca.fit(activation_matrix)
+
+            return {
+                'explained_variance_ratio': pca.explained_variance_ratio_.tolist(),
+                'cumulative_variance': float(np.cumsum(pca.explained_variance_ratio_)[-1]),
+                'n_components': int(pca.n_components_),
+                'n_samples': len(activation_vectors),
+                'top_3_variance': float(sum(pca.explained_variance_ratio_[:3])),
+                'interpretation': (
+                    "High cumulative variance in few components suggests "
+                    "task-controlling behavior is concentrated in a low-dimensional subspace."
+                ),
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
     def _compute_prediction_context(self) -> Dict[str, Any]:
         """
         Compute prediction loss for saliency samples to connect
@@ -350,20 +405,14 @@ class GoalExtractionExperiment(CheckpointExperiment):
             for i in range(n_samples):
                 rng, loss_rng = jax.random.split(rng)
 
-                # Reconstruct level from stored data
+                # Use real wall_map stored during collect_data
                 level = {
-                    'wall_map': np.zeros((13, 13)),  # Placeholder
+                    'wall_map': self._data.wall_maps[i],
                     'wall_density': self._data.wall_densities[i],
                     'goal_pos': self._data.goal_positions[i],
                     'agent_pos': self._data.agent_positions[i],
                     'agent_dir': 0,
                 }
-
-                # Generate wall map from density
-                wall_prob = self._data.wall_densities[i]
-                wall_map = np.array(jax.random.bernoulli(loss_rng, wall_prob, (13, 13)))
-                wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-                level['wall_map'] = wall_map
 
                 loss, _ = compute_agent_prediction_loss(
                     self.agent,
@@ -408,6 +457,102 @@ class GoalExtractionExperiment(CheckpointExperiment):
             "Better framing: 'task-controlling activation subspaces'",
             "These are correlational findings, not mechanistic explanations",
         ]
+
+    def _analyze_goal_probes(self) -> Dict[str, Any]:
+        """Ridge probes from hidden states to goal properties."""
+        from sklearn.linear_model import RidgeCV
+        from sklearn.model_selection import cross_val_score
+
+        if not self._data.saliency_maps or len(self._data.goal_positions) < 20:
+            return {'error': 'Insufficient data for goal probes'}
+
+        # Collect hidden states by running levels through the network
+        hstates = []
+        goal_positions = []
+        goal_distances = []
+        wall_densities = []
+
+        for i in range(len(self._data.goal_positions)):
+            goal_pos = self._data.goal_positions[i]
+            agent_pos = self._data.agent_positions[i]
+            goal_positions.append(goal_pos)
+            goal_dist = np.sqrt((goal_pos[0] - agent_pos[0])**2 + (goal_pos[1] - agent_pos[1])**2)
+            goal_distances.append(goal_dist)
+            wall_densities.append(self._data.wall_densities[i])
+
+        goal_distances = np.array(goal_distances)
+        wall_densities_arr = np.array(wall_densities)
+
+        # Use saliency maps as proxy for hidden state representations.
+        # Each saliency map is a Dict[str, np.ndarray] with keys like
+        # 'image_saliency', 'image_saliency_spatial', 'direction_saliency',
+        # and optionally 'error' (if saliency computation failed).
+        # We use 'image_saliency' (the full 3-channel array) as it contains
+        # the richest representation for probing.
+        valid_saliency_indices = []
+        saliency_arrays = []
+        for i, smap in enumerate(self._data.saliency_maps):
+            if 'error' in smap:
+                continue
+            arr = smap.get('image_saliency')
+            if arr is None:
+                continue
+            saliency_arrays.append(np.ravel(arr))
+            valid_saliency_indices.append(i)
+
+        if len(saliency_arrays) < 20:
+            return {'error': 'Insufficient saliency data'}
+
+        saliency_flat = np.array(saliency_arrays)
+        # Align goal_distances and wall_densities to only include entries
+        # that had valid (non-error) saliency maps
+        goal_distances = goal_distances[valid_saliency_indices]
+        wall_densities_arr = wall_densities_arr[valid_saliency_indices]
+
+        # Filter NaN values before sklearn operations
+        valid_mask = (np.isfinite(saliency_flat).all(axis=1)
+                      & np.isfinite(goal_distances)
+                      & np.isfinite(wall_densities_arr))
+        if valid_mask.sum() < 20:
+            return {'error': f'Insufficient valid samples ({valid_mask.sum()}) after NaN filtering'}
+        saliency_flat = saliency_flat[valid_mask]
+        goal_distances = goal_distances[valid_mask]
+        wall_densities_arr = wall_densities_arr[valid_mask]
+
+        results = {}
+
+        # Probe: h-states → goal_distance (R²)
+        try:
+            ridge = RidgeCV(cv=5)
+            scores = cross_val_score(ridge, saliency_flat, goal_distances, cv=5, scoring='r2')
+            results['goal_distance_r2'] = float(np.mean(scores))
+        except Exception:
+            results['goal_distance_r2'] = 0.0
+
+        # Probe: h-states → wall_density (R²)
+        try:
+            ridge = RidgeCV(cv=5)
+            scores = cross_val_score(ridge, saliency_flat, wall_densities_arr, cv=5, scoring='r2')
+            results['wall_density_r2'] = float(np.mean(scores))
+        except Exception:
+            results['wall_density_r2'] = 0.0
+
+        # Probe: h-states → reachability (classification accuracy)
+        reachable = (goal_distances < np.median(goal_distances)).astype(int)
+        if len(np.unique(reachable)) > 1:
+            try:
+                from sklearn.linear_model import LogisticRegression
+                scores = cross_val_score(
+                    LogisticRegression(max_iter=1000),
+                    saliency_flat, reachable, cv=5, scoring='accuracy',
+                )
+                results['reachability_accuracy'] = float(np.mean(scores))
+            except Exception:
+                results['reachability_accuracy'] = 0.5
+        else:
+            results['reachability_accuracy'] = 0.5
+
+        return results
 
     def visualize(self) -> Dict[str, Any]:
         """Generate visualization data."""

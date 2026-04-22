@@ -67,22 +67,13 @@ class OutputProbingExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "output_probing"
 
-    def __init__(
-        self,
-        n_episodes: int = 200,
-        n_steps_per_episode: int = 50,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize output probing experiment.
-
-        Args:
-            n_episodes: Number of episodes to collect
-            n_steps_per_episode: Steps per episode to analyze
         """
         super().__init__(**kwargs)
-        self.n_episodes = n_episodes
-        self.n_steps_per_episode = n_steps_per_episode
+        self.n_episodes = self.exp_config("n_episodes")
+        self.n_steps_per_episode = self.exp_config("n_steps_per_episode")
 
         self._data: Optional[OutputData] = None
         self._results: Dict[str, Any] = {}
@@ -139,7 +130,9 @@ class OutputProbingExperiment(CheckpointExperiment):
         goal_positions = np.array(levels.goal_pos)
         agent_positions = np.array(levels.agent_pos)
         wall_density = wall_maps.mean(axis=(1, 2))
-        branches = np.arange(n_episodes) % 3
+        # Assign difficulty terciles based on wall density instead of synthetic cycling
+        tercile_edges = np.percentile(wall_density, [33.3, 66.7])
+        branches = np.digitize(wall_density, tercile_edges)  # 0=easy, 1=medium, 2=hard
         _log("cpu_level_properties", time.time() - t0)
 
         # --- 3. Batched protagonist rollout with per-step values, entropies, and logits ---
@@ -212,7 +205,7 @@ class OutputProbingExperiment(CheckpointExperiment):
                     regret = max(0, float(ant_result.episode_returns[i] - pro_result.episode_returns[i]))
                     goal_dist = abs(float(goal_positions[i][0] - agent_positions[i][0])) + \
                                 abs(float(goal_positions[i][1] - agent_positions[i][1]))
-                    adv_difficulty = float(wall_density[i]) * 0.5 + (goal_dist / 26) * 0.5
+                    adv_difficulty = float(1.0 - pro_result.episode_returns[i])  # Real difficulty from protagonist return
 
                     self._data.regrets.extend([regret] * ep_len)
                     self._data.adversary_difficulty.extend([adv_difficulty] * ep_len)

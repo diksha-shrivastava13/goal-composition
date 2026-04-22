@@ -34,9 +34,9 @@ def create_distinctive_level_pattern(
 
     if pattern_type == "unique_walls":
         # Create a unique wall pattern based on pattern_id
-        np.random.seed(pattern_id * 12345)
+        rng_np = np.random.default_rng(seed=pattern_id * 12345)
         n_walls = 5 + (pattern_id % 10)
-        positions = np.random.choice(env_height * env_width, n_walls, replace=False)
+        positions = rng_np.choice(env_height * env_width, n_walls, replace=False)
         for pos in positions:
             i, j = pos // env_width, pos % env_width
             if 1 <= i < env_height - 1 and 1 <= j < env_width - 1:
@@ -79,59 +79,152 @@ def inject_distinctive_pattern(
     rng: chex.PRNGKey,
 ) -> Tuple[chex.ArrayTree, Dict[str, float]]:
     """
-    Run agent on a distinctive level and return hidden state.
+    Run agent on a distinctive level and return hidden state + episode metrics.
 
-    Args:
-        agent: Agent instance
-        train_state: Current train state
-        pattern: Pattern dict from create_distinctive_level_pattern
-        rng: Random key
-
-    Returns:
-        (final_hidden_state, episode_metrics)
+    Uses run_batched_rollout on the patterned level to get real hidden states.
     """
-    # This would run a full episode on the patterned level
-    # For now, return placeholder
-    return {
-        "note": "Full implementation requires agent episode execution",
+    from .paired_helpers import run_batched_rollout
+
+    # Create a level from the pattern
+    rng, level_rng = jax.random.split(rng)
+    level_obj = agent.sample_random_level(level_rng)
+
+    # Override the wall_map with the distinctive pattern
+    level_obj = level_obj.replace(wall_map=jnp.array(pattern["wall_map"]))
+    level_batch = jax.tree_util.tree_map(lambda x: x[None], level_obj)
+
+    rng, roll_rng = jax.random.split(rng)
+    result = run_batched_rollout(
+        roll_rng, level_batch, train_state, agent,
+        max_steps=50,
+        return_final_hstate=True,
+    )
+
+    # Extract final hidden state
+    final_hstate = result.final_hstate
+    episode_metrics = {
         "pattern_id": pattern["pattern_id"],
+        "episode_return": float(result.episode_returns[0]),
+        "episode_solved": bool(result.episode_solved[0]),
+        "episode_length": int(result.episode_lengths[0]),
     }
+
+    return final_hstate, episode_metrics
 
 
 def test_memory_capacity(
-    probe_hidden_state: Callable,
+    agent,
+    train_state,
+    rng: chex.PRNGKey,
     n_episodes: int = 20,
+    n_sequences: int = 5,
+    max_steps: int = 50,
     probe_property: str = "pattern_id",
 ) -> Dict[str, any]:
     """
     Test how many past episodes can be decoded from hidden state.
 
+    Runs the agent through sequences of distinctive levels, then trains
+    a linear probe to decode which pattern was seen N episodes ago from
+    the current hidden state. Reports accuracy by lag.
+
     Args:
-        probe_hidden_state: Function that probes hidden state for a property
-        n_episodes: Number of episodes to test
-        probe_property: Property to probe for
+        agent: Agent instance (provides env, env_params, sample_random_level, etc.)
+        train_state: Agent's train state with apply_fn and params
+        rng: JAX PRNGKey
+        n_episodes: Number of episodes per sequence
+        n_sequences: Number of independent sequences to run
+        max_steps: Max steps per episode
+        probe_property: Property to probe for (currently only "pattern_id")
 
     Returns:
-        Dict with memory capacity results
+        Dict with memory capacity results including accuracy_by_lag
     """
-    # Track accuracy vs episode lag
+    from sklearn.linear_model import LogisticRegression
+    from .batched_rollout import batched_rollout
+
+    # Collect hidden states across sequences
+    # For each sequence: run n_episodes, record hidden state + pattern at each step
+    all_hstates = []  # (n_sequences, n_episodes, hidden_dim)
+    all_pattern_ids = []  # (n_sequences, n_episodes)
+
+    for seq_idx in range(n_sequences):
+        rng, seq_rng = jax.random.split(rng)
+        hstate = agent.initialize_hidden_state(1)
+        seq_hstates = []
+        seq_patterns = []
+
+        for ep_idx in range(n_episodes):
+            rng, level_rng, roll_rng = jax.random.split(rng, 3)
+
+            # Create a distinctive level pattern
+            pattern = create_distinctive_level_pattern(
+                pattern_type="unique_walls",
+                pattern_id=(seq_idx * n_episodes + ep_idx) % n_episodes,
+                env_height=13, env_width=13,
+            )
+
+            # Generate a base level and override its wall map
+            level_obj = agent.sample_random_level(level_rng)
+            level_obj = level_obj.replace(wall_map=jnp.array(pattern["wall_map"]))
+            level_batch = jax.tree_util.tree_map(lambda x: x[None], level_obj)
+
+            # Run rollout, carrying hidden state from previous episode
+            result = batched_rollout(
+                roll_rng, level_batch, max_steps,
+                train_state.apply_fn, train_state.params,
+                agent.env, agent.env_params,
+                hstate,
+                return_final_hstate=True,
+            )
+
+            # Update hstate for next episode
+            hstate = result.final_hstate
+
+            # Record terminal hidden state
+            h_flat = np.concatenate([
+                np.array(hstate[0]).flatten(),
+                np.array(hstate[1]).flatten(),
+            ])
+            seq_hstates.append(h_flat)
+            seq_patterns.append(pattern["pattern_id"])
+
+        all_hstates.append(seq_hstates)
+        all_pattern_ids.append(seq_patterns)
+
+    # Probe accuracy at each lag
     accuracy_by_lag = {}
+    for lag in range(1, min(n_episodes, 11)):  # Test up to lag 10
+        X_probe = []
+        y_probe = []
 
-    for lag in range(1, n_episodes + 1):
-        # Accuracy of probing episode (current - lag)
-        # This would be computed by running probe on hidden state
-        # and comparing to ground truth from lag episodes ago
+        for seq_idx in range(n_sequences):
+            for ep_idx in range(lag, n_episodes):
+                X_probe.append(all_hstates[seq_idx][ep_idx])
+                y_probe.append(all_pattern_ids[seq_idx][ep_idx - lag])
 
-        # Placeholder accuracy decay
-        accuracy = 1.0 / (1.0 + 0.1 * lag)
-        accuracy_by_lag[lag] = accuracy
+        X_probe = np.array(X_probe)
+        y_probe = np.array(y_probe)
 
-    # Find memory horizon: lag at which accuracy drops below chance
+        n_classes = len(np.unique(y_probe))
+        if n_classes < 2 or len(X_probe) < 4:
+            accuracy_by_lag[lag] = float('nan')
+            continue
+
+        try:
+            clf = LogisticRegression(max_iter=500, C=1.0)
+            clf.fit(X_probe, y_probe)
+            accuracy_by_lag[lag] = float(clf.score(X_probe, y_probe))
+        except Exception:
+            accuracy_by_lag[lag] = float('nan')
+
+    # Find memory horizon: lag at which accuracy drops below chance + margin
     chance_level = 1.0 / n_episodes
-    memory_horizon = n_episodes
-    for lag, acc in sorted(accuracy_by_lag.items()):
-        if acc < chance_level + 0.05:  # Slightly above chance
-            memory_horizon = lag - 1
+    memory_horizon = 0
+    for lag in sorted(accuracy_by_lag.keys()):
+        if not np.isnan(accuracy_by_lag[lag]) and accuracy_by_lag[lag] > chance_level + 0.05:
+            memory_horizon = lag
+        else:
             break
 
     return {
@@ -139,6 +232,7 @@ def test_memory_capacity(
         "memory_horizon": memory_horizon,
         "chance_level": chance_level,
         "n_episodes_tested": n_episodes,
+        "n_sequences": n_sequences,
     }
 
 
@@ -179,7 +273,7 @@ def analyze_selective_memory(
 
     # Success bias
     if "solved" in episode_features[0]:
-        solved = np.array([e["solved"] for e in episode_features])
+        solved = np.array([e["solved"] for e in episode_features]).astype(bool)
         retained_solved = retained[solved].mean() if solved.sum() > 0 else 0.0
         retained_unsolved = retained[~solved].mean() if (~solved).sum() > 0 else 0.0
         results["success_bias"] = float(retained_solved - retained_unsolved)

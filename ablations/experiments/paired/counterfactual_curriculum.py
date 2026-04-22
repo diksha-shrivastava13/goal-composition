@@ -1,11 +1,21 @@
 """
-B4: Counterfactual Curriculum Comparison.
+B4: Counterfactual Curriculum via History Injection.
 
-Compare same architecture under different curriculum regimes.
+Tests whether injecting synthetic episode histories into the protagonist's
+hidden state changes its behavior on the SAME levels with the SAME policy
+parameters. All conditions share pro_ts; only the initial h-state differs.
+This tests h-state sensitivity, not policy retraining.
+
+Protocol:
+1. Generate evaluation levels, run protagonist for baseline h-states + returns
+2. For each condition {baseline, success_injection, failure_injection}:
+   a. Create history via create_success_history() / create_failure_history()
+   b. Inject into h-state via inject_hidden_state()
+   c. Run protagonist with injected h-state, collect returns + policy logits
+3. Measure behavioral change (return diff, action KL) and probe accuracy change
 """
 
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
+from typing import Dict, Any, Optional
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -14,350 +24,303 @@ import chex
 from ..base import CheckpointExperiment
 from ..utils.paired_helpers import (
     generate_levels,
-    generate_constrained_levels,
     extract_level_features_batch,
     get_pro_hstates,
-    get_pro_ant_returns,
-    get_values_from_rollout,
-    get_action_distribution,
-    levels_to_dicts,
+    run_batched_rollout,
 )
-
-
-@dataclass
-class CurriculumProfile:
-    """Profile of an agent trained under a specific curriculum."""
-    curriculum_name: str
-    hstates: np.ndarray
-    values: np.ndarray
-    policy_entropies: np.ndarray
-    returns: np.ndarray
-    level_features: List[Dict[str, float]]
+from ..utils.history_injection import (
+    create_success_history,
+    create_failure_history,
+    inject_hidden_state,
+    measure_injection_effect,
+)
+from ..probes.property_probe import train_probe
 
 
 class CounterfactualCurriculumExperiment(CheckpointExperiment):
     """
-    Compare same architecture under different curriculum regimes.
+    Counterfactual curriculum test via history injection.
 
-    Protocol:
-    1. Evaluate agents trained under different curricula on same levels
-    2. Compare representations via CKA
-    3. Compare extracted utilities
-    4. Measure generalization gaps
+    Evaluates whether injecting synthetic success/failure histories into
+    the agent's hidden state causally affects behavior and representations.
     """
 
     @property
     def name(self) -> str:
         return "counterfactual_curriculum"
 
-    REGIMES = [
-        'paired',
-        'dr',  # Domain randomization
-        'paired_no_antagonist',
-        'paired_frozen_adversary',
-        'replay_of_paired',
-    ]
+    CONDITIONS = ['baseline', 'success_injection', 'failure_injection']
 
-    def __init__(
-        self,
-        n_eval_levels: int = 500,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_eval_levels = n_eval_levels
-        self.hidden_dim = hidden_dim
-        self._profiles: Dict[str, CurriculumProfile] = {}
-        self._shared_levels: List[Dict[str, Any]] = []
+        self.n_eval_levels = self.exp_config("n_eval_levels")
+        self.max_steps = self.exp_config("max_steps")
         self._require_paired()
 
     def _require_paired(self):
         if self.training_method != "paired":
-            raise ValueError(f"CounterfactualCurriculumExperiment requires PAIRED baseline")
+            raise ValueError(f"CounterfactualCurriculumExperiment requires PAIRED")
 
-    def collect_data(self, rng: chex.PRNGKey) -> Dict[str, CurriculumProfile]:
-        """Collect data for all curriculum regimes."""
-        # Generate shared evaluation levels using real environment
-        rng, levels_rng = jax.random.split(rng)
-        self._shared_levels_pytree = generate_levels(
-            self.agent, levels_rng, self.n_eval_levels
+    def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Any]:
+        """Collect data for all injection conditions."""
+        n = self.n_eval_levels
+        pro_ts = getattr(self.train_state, 'pro_train_state', self.train_state)
+
+        # Generate evaluation levels
+        rng, gen_rng = jax.random.split(rng)
+        levels = generate_levels(self.agent, gen_rng, n)
+        level_features = extract_level_features_batch(levels)
+
+        # --- Baseline: run protagonist with fresh h-state ---
+        rng, bl_rng = jax.random.split(rng)
+        baseline_result = run_batched_rollout(
+            bl_rng, levels, pro_ts, self.agent,
+            max_steps=self.max_steps,
+            collect_logits=True,
+            return_final_hstate=True,
         )
 
-        # Evaluate each curriculum regime on the shared levels
-        # All regimes use the same trained protagonist (different constraint sets
-        # simulate different curriculum biases via level selection)
-        regime_constraints = {
-            'paired': None,  # No constraints, full distribution
-            'dr': None,  # Same levels, same agent (baseline comparison)
-            'paired_no_antagonist': {'wall_density': (0.0, 0.2)},
-            'paired_frozen_adversary': {'wall_density': (0.1, 0.3)},
-            'replay_of_paired': {'wall_density': (0.05, 0.35)},
+        # Get baseline h-states
+        rng, h_rng = jax.random.split(rng)
+        baseline_hstates = get_pro_hstates(h_rng, levels, self, self.max_steps)
+
+        condition_data = {
+            'baseline': {
+                'returns': np.array(baseline_result.episode_returns),
+                'logits': baseline_result.logits,
+                'hstates': baseline_hstates,
+            }
         }
 
-        for regime in self.REGIMES:
-            rng, eval_rng = jax.random.split(rng)
-            constraints = regime_constraints.get(regime)
-            self._profiles[regime] = self._evaluate_curriculum(
-                eval_rng, regime, constraints
+        # --- Success injection ---
+        rng, succ_rng = jax.random.split(rng)
+        success_history = create_success_history(
+            self.agent, pro_ts, succ_rng,
+            n_episodes=5,
+        )
+        init_hstate_succ = self.agent.initialize_hidden_state(n)
+        injected_hstate_succ = inject_hidden_state(
+            init_hstate_succ, success_history
+        )
+
+        rng, succ_roll_rng = jax.random.split(rng)
+        from ..utils.batched_rollout import batched_rollout
+        succ_result = batched_rollout(
+            succ_roll_rng, levels, self.max_steps,
+            pro_ts.apply_fn, pro_ts.params,
+            self.agent.env, self.agent.env_params,
+            injected_hstate_succ,
+            collect_logits=True,
+            collection_steps=[-1],
+        )
+
+        succ_hstates = succ_result.hstates_by_step.get("-1") if succ_result.hstates_by_step else baseline_hstates
+
+        condition_data['success_injection'] = {
+            'returns': np.array(succ_result.episode_returns),
+            'logits': succ_result.logits,
+            'hstates': succ_hstates,
+        }
+
+        # --- Failure injection ---
+        rng, fail_rng = jax.random.split(rng)
+        failure_history = create_failure_history(
+            self.agent, pro_ts, fail_rng,
+            n_episodes=5,
+        )
+        init_hstate_fail = self.agent.initialize_hidden_state(n)
+        injected_hstate_fail = inject_hidden_state(
+            init_hstate_fail, failure_history
+        )
+
+        rng, fail_roll_rng = jax.random.split(rng)
+        fail_result = batched_rollout(
+            fail_roll_rng, levels, self.max_steps,
+            pro_ts.apply_fn, pro_ts.params,
+            self.agent.env, self.agent.env_params,
+            injected_hstate_fail,
+            collect_logits=True,
+            collection_steps=[-1],
+        )
+
+        fail_hstates = fail_result.hstates_by_step.get("-1") if fail_result.hstates_by_step else baseline_hstates
+
+        condition_data['failure_injection'] = {
+            'returns': np.array(fail_result.episode_returns),
+            'logits': fail_result.logits,
+            'hstates': fail_hstates,
+        }
+
+        # --- Measure injection effects ---
+        injection_effects = {}
+        for condition in ['success_injection', 'failure_injection']:
+            cond = condition_data[condition]
+            baseline = condition_data['baseline']
+            effect = measure_injection_effect(
+                baseline_predictions={"hstates": baseline_hstates},
+                injected_predictions={"hstates": cond['hstates']},
+                baseline_behavior={"values": baseline['returns']},
+                injected_behavior={"values": cond['returns']},
             )
+            injection_effects[condition] = effect
 
-        return self._profiles
-
-    def _evaluate_curriculum(
-        self,
-        rng: chex.PRNGKey,
-        regime: str,
-        constraints: Optional[Dict[str, Any]],
-    ) -> CurriculumProfile:
-        """Evaluate agent on levels for a specific curriculum regime."""
-        rng, level_rng, h_rng, val_rng, act_rng, ret_rng = jax.random.split(rng, 6)
-
-        # Generate regime-specific levels or use shared levels
-        if constraints is not None:
-            levels = generate_constrained_levels(
-                self.agent, level_rng, self.n_eval_levels, constraints
-            )
-        else:
-            levels = self._shared_levels_pytree
-
-        # Extract level features
-        batch_features = extract_level_features_batch(levels)
-        level_features = [
-            {k: float(v[i]) for k, v in batch_features.items()}
-            for i in range(self.n_eval_levels)
-        ]
-
-        # Get real protagonist hidden states
-        hstates = get_pro_hstates(h_rng, levels, self)
-
-        # Get real value estimates
-        value_matrix = get_values_from_rollout(
-            self.train_state, self.agent, levels, val_rng
-        )
-        values = value_matrix.mean(axis=1)
-
-        # Get real policy entropies
-        _logits, entropy_matrix = get_action_distribution(
-            self.train_state, self.agent, levels, act_rng
-        )
-        policy_entropies = entropy_matrix.mean(axis=1)
-
-        # Get real returns
-        pro_returns, _ant_returns, _regrets = get_pro_ant_returns(
-            ret_rng, levels, self
-        )
-
-        return CurriculumProfile(
-            curriculum_name=regime,
-            hstates=np.array(hstates),
-            values=np.array(values),
-            policy_entropies=np.array(policy_entropies),
-            returns=np.array(pro_returns),
-            level_features=level_features,
-        )
+        self.data = {
+            'condition_data': condition_data,
+            'injection_effects': injection_effects,
+            'level_features': level_features,
+            'n_levels': n,
+        }
+        return self.data
 
     def analyze(self) -> Dict[str, Any]:
-        """Analyze curriculum comparisons."""
-        if not self._profiles:
+        """Analyze behavioral and representational changes per condition."""
+        if not hasattr(self, 'data') or self.data is None:
             raise ValueError("Must call collect_data first")
 
+        condition_data = self.data['condition_data']
+        level_features = self.data['level_features']
         results = {}
 
-        # CKA matrix between all curricula
-        results['representation_divergence_CKA'] = self._compute_cka_matrix()
+        # --- Per-condition behavioral change ---
+        baseline_returns = condition_data['baseline']['returns']
+        behavioral = {}
+        for condition in ['success_injection', 'failure_injection']:
+            cond_returns = condition_data[condition]['returns']
+            return_diff = float(np.mean(cond_returns) - np.mean(baseline_returns))
 
-        # Utility divergence
-        results['utility_divergence'] = self._compare_extracted_utilities()
+            # Action distribution KL divergence
+            bl_logits = condition_data['baseline']['logits']
+            cond_logits = condition_data[condition]['logits']
+            kl = 0.0
+            if bl_logits is not None and cond_logits is not None:
+                # Mean KL across levels and timesteps
+                bl_probs = _softmax(bl_logits)
+                cond_probs = _softmax(cond_logits)
+                eps = 1e-10
+                kl_per = np.sum(cond_probs * np.log((cond_probs + eps) / (bl_probs + eps)), axis=-1)
+                kl = float(np.nanmean(kl_per))
 
-        # Goal structure comparison
-        results['goal_structure_comparison'] = self._compare_goal_structures()
+            behavioral[condition] = {
+                'mean_return_diff': return_diff,
+                'mean_return_baseline': float(np.mean(baseline_returns)),
+                'mean_return_injected': float(np.mean(cond_returns)),
+                'action_kl_divergence': kl,
+            }
+        results['behavioral_change'] = behavioral
 
-        # Generalization gap
-        results['generalisation_gap'] = self._compare_transfer_performance()
+        # --- Probe accuracy change ---
+        # Train probes on baseline h-states, evaluate on injected
+        baseline_hstates = condition_data['baseline']['hstates']
+        probe_transfer = {}
 
-        # Per-curriculum statistics
-        results['curriculum_statistics'] = self._compute_curriculum_stats()
+        for feat_name in ['wall_density', 'goal_distance']:
+            if feat_name not in level_features:
+                continue
+            targets = level_features[feat_name]
 
+            # Train on baseline
+            probe, bl_metrics = train_probe(
+                baseline_hstates, targets,
+                probe_type="linear", task="regression",
+            )
+            bl_r2 = bl_metrics.get('mean_score', 0.0)
+
+            per_cond = {'baseline_r2': float(bl_r2)}
+            for condition in ['success_injection', 'failure_injection']:
+                cond_hstates = condition_data[condition]['hstates']
+                preds = probe.predict(cond_hstates)
+                from sklearn.metrics import r2_score
+                try:
+                    cond_r2 = float(r2_score(targets, preds))
+                except ValueError:
+                    cond_r2 = 0.0
+                per_cond[f'{condition}_r2'] = cond_r2
+                per_cond[f'{condition}_r2_drop'] = float(bl_r2 - cond_r2)
+            probe_transfer[feat_name] = per_cond
+
+        results['probe_accuracy_change'] = probe_transfer
+
+        # --- Injection effects (from collect_data) ---
+        results['injection_effects'] = self.data['injection_effects']
+
+        # --- Correlation: injection magnitude vs behavioral change ---
+        for condition in ['success_injection', 'failure_injection']:
+            effect = self.data['injection_effects'].get(condition, {})
+            beh = behavioral.get(condition, {})
+            results[f'{condition}_magnitude_vs_behavior'] = {
+                'hstate_change': effect.get('mean_hstate_change', 0.0),
+                'return_change': beh.get('mean_return_diff', 0.0),
+            }
+
+        self.results = results
         return results
 
-    def _compute_cka_matrix(self) -> Dict[str, Dict[str, float]]:
-        """Compute pairwise CKA between all curricula."""
-        cka_matrix = {}
-
-        for regime1 in self.REGIMES:
-            cka_matrix[regime1] = {}
-            for regime2 in self.REGIMES:
-                cka = self._compute_cka(
-                    self._profiles[regime1].hstates,
-                    self._profiles[regime2].hstates,
-                )
-                cka_matrix[regime1][regime2] = cka
-
-        return cka_matrix
-
-    def _compute_cka(self, X: np.ndarray, Y: np.ndarray) -> float:
-        """Compute linear CKA."""
-        X = X - X.mean(axis=0)
-        Y = Y - Y.mean(axis=0)
-
-        K = X @ X.T
-        L = Y @ Y.T
-
-        hsic = np.trace(K @ L)
-        norm_k = np.sqrt(np.trace(K @ K))
-        norm_l = np.sqrt(np.trace(L @ L))
-
-        if norm_k < 1e-10 or norm_l < 1e-10:
-            return 0.0
-
-        return float(hsic / (norm_k * norm_l))
-
-    def _compare_extracted_utilities(self) -> Dict[str, Dict[str, float]]:
-        """Compare extracted utility functions."""
-        from sklearn.linear_model import Ridge
-
-        utilities = {}
-
-        for regime, profile in self._profiles.items():
-            features = np.array([
-                [f['wall_density'], f['goal_distance']]
-                for f in profile.level_features
-            ])
-
-            # Fit utility: features -> returns (what agent optimizes)
-            model = Ridge(alpha=1.0)
-            model.fit(features, profile.returns)
-
-            utilities[regime] = {
-                'wall_density_coef': float(model.coef_[0]),
-                'goal_distance_coef': float(model.coef_[1]),
-                'intercept': float(model.intercept_),
-            }
-
-        # Compute divergence from PAIRED baseline
-        divergences = {}
-        paired_coefs = np.array([
-            utilities['paired']['wall_density_coef'],
-            utilities['paired']['goal_distance_coef'],
-        ])
-
-        for regime in self.REGIMES:
-            if regime == 'paired':
-                divergences[regime] = 0.0
-            else:
-                regime_coefs = np.array([
-                    utilities[regime]['wall_density_coef'],
-                    utilities[regime]['goal_distance_coef'],
-                ])
-                divergences[regime] = float(np.linalg.norm(regime_coefs - paired_coefs))
-
-        return {
-            'utilities': utilities,
-            'divergence_from_paired': divergences,
-        }
-
-    def _compare_goal_structures(self) -> Dict[str, float]:
-        """Compare goal structure complexity across curricula."""
-        goal_structures = {}
-
-        for regime, profile in self._profiles.items():
-            # Goal structure complexity = variance explained by features
-            features = np.array([
-                [f['wall_density'], f['goal_distance']]
-                for f in profile.level_features
-            ])
-
-            from sklearn.linear_model import Ridge
-            from sklearn.metrics import r2_score
-
-            model = Ridge(alpha=1.0)
-            model.fit(features, profile.values)
-            r2 = r2_score(profile.values, model.predict(features))
-
-            # Higher R2 = simpler goal structure (more predictable by features)
-            goal_structures[regime] = float(1.0 - r2)  # Complexity = 1 - R2
-
-        return goal_structures
-
-    def _compare_transfer_performance(self) -> Dict[str, float]:
-        """Compare transfer performance to held-out level types."""
-        transfer_gaps = {}
-
-        for regime, profile in self._profiles.items():
-            # Measure performance variance across level types
-            features = np.array([f['wall_density'] for f in profile.level_features])
-            returns = profile.returns
-
-            # Bin by wall density
-            low_density_mask = features < 0.15
-            high_density_mask = features > 0.25
-
-            low_density_returns = returns[low_density_mask] if low_density_mask.any() else np.array([0.0])
-            high_density_returns = returns[high_density_mask] if high_density_mask.any() else np.array([0.0])
-
-            # Gap = performance drop on harder levels
-            transfer_gaps[regime] = float(
-                low_density_returns.mean() - high_density_returns.mean()
-            )
-
-        return transfer_gaps
-
-    def _compute_curriculum_stats(self) -> Dict[str, Dict[str, float]]:
-        """Compute per-curriculum statistics."""
-        stats = {}
-
-        for regime, profile in self._profiles.items():
-            stats[regime] = {
-                'mean_return': float(profile.returns.mean()),
-                'std_return': float(profile.returns.std()),
-                'mean_value': float(profile.values.mean()),
-                'mean_entropy': float(profile.policy_entropies.mean()),
-                'hstate_norm': float(np.linalg.norm(profile.hstates, axis=1).mean()),
-            }
-
-        return stats
-
     def visualize(self) -> Dict[str, np.ndarray]:
-        """Visualize curriculum comparisons."""
+        """Visualize injection effects."""
         import matplotlib.pyplot as plt
         import matplotlib
         matplotlib.use('Agg')
 
         figures = {}
 
-        if not self._profiles:
+        if not hasattr(self, 'results') or not self.results:
             return figures
 
-        # CKA heatmap
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        try:
+            behavioral = self.results.get('behavioral_change', {})
 
-        # CKA matrix
-        ax = axes[0]
-        cka_matrix = self._compute_cka_matrix()
-        matrix = np.array([[cka_matrix[r1][r2] for r2 in self.REGIMES] for r1 in self.REGIMES])
-        im = ax.imshow(matrix, cmap='viridis', vmin=0, vmax=1)
-        ax.set_xticks(range(len(self.REGIMES)))
-        ax.set_xticklabels(self.REGIMES, rotation=45, ha='right')
-        ax.set_yticks(range(len(self.REGIMES)))
-        ax.set_yticklabels(self.REGIMES)
-        ax.set_title('Representation Similarity (CKA)')
-        plt.colorbar(im, ax=ax)
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-        # Return comparison
-        ax = axes[1]
-        means = [self._profiles[r].returns.mean() for r in self.REGIMES]
-        stds = [self._profiles[r].returns.std() for r in self.REGIMES]
-        x = np.arange(len(self.REGIMES))
-        ax.bar(x, means, yerr=stds, capsize=3, alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels(self.REGIMES, rotation=45, ha='right')
-        ax.set_ylabel('Mean Return')
-        ax.set_title('Performance by Curriculum')
+            # Return comparison across conditions
+            ax = axes[0]
+            conditions = ['baseline', 'success_injection', 'failure_injection']
+            means = []
+            for c in conditions:
+                if c == 'baseline':
+                    means.append(behavioral.get('success_injection', {}).get(
+                        'mean_return_baseline', 0.0))
+                else:
+                    means.append(behavioral.get(c, {}).get(
+                        'mean_return_injected', 0.0))
+            colors = ['gray', 'green', 'red']
+            ax.bar(range(len(conditions)), means, color=colors, alpha=0.8)
+            ax.set_xticks(range(len(conditions)))
+            ax.set_xticklabels(conditions, rotation=30, ha='right')
+            ax.set_ylabel("Mean Return")
+            ax.set_title("Returns by Injection Condition")
 
-        plt.tight_layout()
-        fig.canvas.draw()
-        buf = fig.canvas.buffer_rgba()
-        figures["curriculum_comparison"] = np.asarray(buf)[:, :, :3]
-        plt.close(fig)
+            # Probe R² comparison
+            ax = axes[1]
+            probe_data = self.results.get('probe_accuracy_change', {})
+            feat_names = list(probe_data.keys())
+            x = np.arange(len(feat_names))
+            width = 0.25
+            for i, condition in enumerate(['baseline', 'success_injection', 'failure_injection']):
+                key = f'{condition}_r2' if condition != 'baseline' else 'baseline_r2'
+                vals = [probe_data[f].get(key, 0.0) for f in feat_names]
+                ax.bar(x + i * width, vals, width, label=condition,
+                       color=colors[i], alpha=0.8)
+            ax.set_xticks(x + width)
+            ax.set_xticklabels(feat_names, rotation=30, ha='right')
+            ax.set_ylabel("Probe R²")
+            ax.set_title("Probe Accuracy by Condition")
+            ax.legend()
+
+            plt.tight_layout()
+            fig.canvas.draw()
+            buf = fig.canvas.buffer_rgba()
+            figures["counterfactual_curriculum"] = np.asarray(buf)[:, :, :3]
+            plt.close(fig)
+        except Exception:
+            pass
 
         return figures
+
+
+def _softmax(logits):
+    """Numerically stable softmax."""
+    if logits is None:
+        return None
+    x = logits - np.max(logits, axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / (e.sum(axis=-1, keepdims=True) + 1e-10)

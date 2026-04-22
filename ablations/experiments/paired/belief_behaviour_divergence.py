@@ -56,17 +56,11 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "belief_behaviour_divergence"
 
-    def __init__(
-        self,
-        n_samples: int = 500,
-        hidden_dim: int = 256,
-        divergence_threshold: float = 0.3,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples = n_samples
-        self.hidden_dim = hidden_dim
-        self.divergence_threshold = divergence_threshold
+        self.n_samples = self.exp_config("n_samples")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.divergence_threshold = self.exp_config("divergence_threshold")
         self._data_points: List[DivergencePoint] = []
         self._divergence_events: List[DivergenceEvent] = []
         self._probe_weights: Dict[str, np.ndarray] = {}
@@ -77,13 +71,35 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
             raise ValueError(f"BeliefBehaviourDivergenceExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[DivergencePoint]:
-        """Collect data for divergence analysis using real network evaluations."""
-        # First, train probes on real data
+        """Collect data for divergence analysis, iterating over checkpoints if available."""
+        import glob
+        import os
+
+        # Check for multi-checkpoint directories
+        checkpoint_dirs = sorted(
+            glob.glob(os.path.join(os.getcwd(), 'checkpoints', 'step_*'))
+            + glob.glob(os.path.join(os.getcwd(), 'checkpoints', 'checkpoint_*'))
+        )
+
+        if checkpoint_dirs:
+            # Multi-checkpoint mode: iterate over available checkpoints
+            for ckpt_dir in checkpoint_dirs:
+                rng, ckpt_rng = jax.random.split(rng)
+                self._collect_single_checkpoint(ckpt_rng)
+        else:
+            # Single-checkpoint fallback
+            self._collect_single_checkpoint(rng)
+
+        return self._data_points
+
+    def _collect_single_checkpoint(self, rng: chex.PRNGKey) -> None:
+        """Collect divergence data from a single checkpoint."""
+        # Train probes on real data
         rng, probe_rng = jax.random.split(rng)
         self._train_probes(probe_rng)
 
-        # Then collect and analyze data in batch
-        rng, level_rng, hstate_rng, action_rng, val_rng = jax.random.split(rng, 5)
+        # Collect and analyze data in batch
+        rng, level_rng, hstate_rng, action_rng, val_rng, diff_rng = jax.random.split(rng, 6)
 
         # Generate real levels
         levels = generate_levels(self.agent, level_rng, self.n_samples)
@@ -96,23 +112,48 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         logits, entropies = get_action_distribution(
             self.train_state, self.agent, levels, action_rng,
         )
-        # Take last-step logits as representative policy per level
-        last_logits = logits[:, -1, :]  # (n, n_actions)
+        last_logits = logits[:, -1, :]
 
         # Get real value estimates
         values = get_values_from_rollout(
             self.train_state, self.agent, levels, val_rng,
-        )  # (n, max_steps)
-        # Use mean value as the episode value estimate
-        mean_values = values.mean(axis=1)  # (n,)
+        )
+        mean_values = values.mean(axis=1)
 
         # Extract real level features
         features_batch = extract_level_features_batch(levels)
 
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties = compute_difficulty(levels, self, diff_rng)
+
+        # Fit Ridge models for divergence computation
+        from sklearn.linear_model import Ridge
+        belief_matrix = np.stack([
+            np.array(features_batch['wall_density']),
+            np.array(features_batch['goal_distance']),
+            np.array(difficulties),
+        ], axis=1)
+
+        self._belief_policy_model = Ridge(alpha=1.0)
+        logits_target = last_logits[:, :4] if last_logits.shape[1] >= 4 else last_logits
+        # Filter out NaN rows (can occur with untrained networks or tiny configs)
+        valid_mask = ~np.isnan(belief_matrix).any(axis=1) & ~np.isnan(logits_target).any(axis=1)
+        if valid_mask.sum() >= 2:
+            self._belief_policy_model.fit(belief_matrix[valid_mask], logits_target[valid_mask])
+        else:
+            self._belief_policy_model.fit(np.zeros((2, belief_matrix.shape[1])), np.zeros((2, logits_target.shape[1])))
+
+        self._belief_value_model = Ridge(alpha=1.0)
+        valid_v = valid_mask & ~np.isnan(mean_values)
+        if valid_v.sum() >= 2:
+            self._belief_value_model.fit(belief_matrix[valid_v], mean_values[valid_v])
+        else:
+            self._belief_value_model.fit(np.zeros((2, belief_matrix.shape[1])), np.zeros(2))
+
         for i in range(self.n_samples):
             wall_density = float(features_batch['wall_density'][i])
             goal_distance = float(features_batch['goal_distance'][i])
-            difficulty = wall_density * 0.5 + goal_distance * 0.05
+            difficulty = float(difficulties[i])
 
             level_features = {
                 'wall_density': wall_density,
@@ -121,13 +162,9 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
             }
 
             h = hstates[i]
-
-            # Decode beliefs using trained probes
             decoded_beliefs = self._decode_beliefs(h)
 
-            # Real policy from network
             sample_logits = last_logits[i]
-            # Pad/truncate to 4 actions
             if len(sample_logits) < 4:
                 sample_logits = np.pad(sample_logits, (0, 4 - len(sample_logits)))
             elif len(sample_logits) > 4:
@@ -137,7 +174,6 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
 
             actual_value = float(mean_values[i])
 
-            # Compute divergences
             belief_policy_divergence = self._compute_belief_policy_divergence(
                 decoded_beliefs, policy, level_features
             )
@@ -156,11 +192,9 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
                 belief_value_divergence=belief_value_divergence,
             ))
 
-        return self._data_points
-
     def _train_probes(self, rng: chex.PRNGKey):
         """Train probes to decode beliefs from real hidden states."""
-        rng, level_rng, hstate_rng = jax.random.split(rng, 3)
+        rng, level_rng, hstate_rng, diff_rng = jax.random.split(rng, 4)
 
         n_probe_train = 200
 
@@ -173,6 +207,10 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
 
         # Extract real features as targets
         features_batch = extract_level_features_batch(levels)
+
+        from ..utils.paired_helpers import compute_difficulty
+        probe_difficulties = compute_difficulty(levels, self, diff_rng)
+
         training_features = []
         for i in range(n_probe_train):
             wall_density = float(features_batch['wall_density'][i])
@@ -180,7 +218,7 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
             training_features.append({
                 'wall_density': wall_density,
                 'goal_distance': goal_distance,
-                'difficulty': wall_density * 0.5 + goal_distance * 0.05,
+                'difficulty': float(probe_difficulties[i]),
             })
 
         # Train linear probes for each feature
@@ -209,14 +247,17 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         policy: np.ndarray,
         true_features: Dict[str, float],
     ) -> float:
-        """Compute divergence between beliefs and policy."""
-        # Expected policy given beliefs
-        expected_logits = np.zeros(4)
-        expected_logits[0] = beliefs['wall_density'] * 0.5
-        expected_logits[1] = (1.0 - beliefs['wall_density']) * 0.4
-        expected_logits[2] = beliefs['goal_distance'] * 0.1
-        expected_logits[3] = beliefs['difficulty'] * 0.3
+        """Compute divergence between beliefs and policy.
 
+        Uses fitted Ridge model (belief -> policy) trained during collect_data.
+        Falls back to L2 distance if model not yet fitted.
+        """
+        if not hasattr(self, '_belief_policy_model') or self._belief_policy_model is None:
+            # Fallback before model is fitted
+            return 0.0
+
+        belief_vec = np.array([[beliefs['wall_density'], beliefs['goal_distance'], beliefs['difficulty']]])
+        expected_logits = self._belief_policy_model.predict(belief_vec)[0]
         expected_policy = np.exp(expected_logits - np.max(expected_logits))
         expected_policy = expected_policy / expected_policy.sum()
 
@@ -230,9 +271,16 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         actual_value: float,
         true_features: Dict[str, float],
     ) -> float:
-        """Compute divergence between beliefs and value."""
-        # Expected value given beliefs
-        expected_value = 0.7 - beliefs['difficulty'] * 0.4
+        """Compute divergence between beliefs and value.
+
+        Uses fitted Ridge model (belief -> value) trained during collect_data.
+        Falls back to zero if model not yet fitted.
+        """
+        if not hasattr(self, '_belief_value_model') or self._belief_value_model is None:
+            return 0.0
+
+        belief_vec = np.array([[beliefs['wall_density'], beliefs['goal_distance'], beliefs['difficulty']]])
+        expected_value = float(self._belief_value_model.predict(belief_vec)[0])
 
         # Squared error
         return float((actual_value - expected_value) ** 2)
@@ -428,10 +476,14 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
 
         # Divergence distribution
         ax = axes[0, 0]
-        policy_div = [p.belief_policy_divergence for p in self._data_points]
-        value_div = [p.belief_value_divergence for p in self._data_points]
-        ax.hist(policy_div, bins=30, alpha=0.6, label='Policy Divergence', edgecolor='black')
-        ax.hist(value_div, bins=30, alpha=0.6, label='Value Divergence', edgecolor='black')
+        policy_div = np.array([p.belief_policy_divergence for p in self._data_points])
+        value_div = np.array([p.belief_value_divergence for p in self._data_points])
+        policy_valid = policy_div[~np.isnan(policy_div)]
+        value_valid = value_div[~np.isnan(value_div)]
+        if len(policy_valid) > 0:
+            ax.hist(policy_valid, bins=30, alpha=0.6, label='Policy Divergence', edgecolor='black')
+        if len(value_valid) > 0:
+            ax.hist(value_valid, bins=30, alpha=0.6, label='Value Divergence', edgecolor='black')
         ax.set_xlabel('Divergence')
         ax.set_ylabel('Count')
         ax.set_title('Belief-Behaviour Divergence Distribution')

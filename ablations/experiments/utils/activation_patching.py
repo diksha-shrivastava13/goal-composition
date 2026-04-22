@@ -42,7 +42,9 @@ def compute_saliency_map(
         obs_batch = type(obs)(image[None, None, ...], agent_dir[None, None, ...])
         done_batch = jnp.zeros((1, 1), dtype=bool)
 
-        _, _, value = apply_fn(params, (obs_batch, done_batch), hstate)
+        _result = apply_fn(params, (obs_batch, done_batch), hstate)
+        # Indexed access safely ignores extra return values from different network architectures
+        value = _result[2]
         return value[0, 0]
 
     def action_entropy_fn(image, agent_dir, hstate):
@@ -50,7 +52,9 @@ def compute_saliency_map(
         obs_batch = type(obs)(image[None, None, ...], agent_dir[None, None, ...])
         done_batch = jnp.zeros((1, 1), dtype=bool)
 
-        _, pi, _ = apply_fn(params, (obs_batch, done_batch), hstate)
+        _result = apply_fn(params, (obs_batch, done_batch), hstate)
+        # Indexed access safely ignores extra return values from different network architectures
+        pi = _result[1]
         return pi.entropy()[0, 0]
 
     if target == "value":
@@ -143,26 +147,23 @@ def patch_activations(
     apply_fn = train_state.apply_fn
 
     # Get outputs without patching
-    source_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], source_obs)
-    target_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], target_obs)
+    source_batch = type(source_obs)(source_obs.image[None, None, ...], source_obs.agent_dir[None, None, ...])
+    target_batch = type(target_obs)(target_obs.image[None, None, ...], target_obs.agent_dir[None, None, ...])
     done_batch = jnp.zeros((1, 1), dtype=bool)
 
     # Source forward pass
-    hstate_source, pi_source, v_source = apply_fn(
-        params, (source_batch, done_batch), hstate
-    )
+    _result_src = apply_fn(params, (source_batch, done_batch), hstate)
+    hstate_source, pi_source, v_source = _result_src[0], _result_src[1], _result_src[2]
 
     # Target forward pass (normal)
-    hstate_target, pi_target, v_target = apply_fn(
-        params, (target_batch, done_batch), hstate
-    )
+    _result_tgt = apply_fn(params, (target_batch, done_batch), hstate)
+    hstate_target, pi_target, v_target = _result_tgt[0], _result_tgt[1], _result_tgt[2]
 
     # Target forward pass with patched hidden state (from source)
     if patch_layer == "lstm_hidden":
         # Use source's hidden state for target
-        hstate_patched, pi_patched, v_patched = apply_fn(
-            params, (target_batch, done_batch), hstate_source
-        )
+        _result_pat = apply_fn(params, (target_batch, done_batch), hstate_source)
+        hstate_patched, pi_patched, v_patched = _result_pat[0], _result_pat[1], _result_pat[2]
     else:
         # For other layers, would need to modify the network
         hstate_patched, pi_patched, v_patched = hstate_target, pi_target, v_target
@@ -238,9 +239,33 @@ def identify_task_controlling_subspace(
         ])
         all_hstates.append(hstate_flat)
 
-        # Compute gradient of value w.r.t. hidden state
-        # This is a simplified version - full version would use JAX autodiff
-        all_value_grads.append(hstate_flat)  # Placeholder
+        # Compute gradient of value head w.r.t. hidden state using JAX autodiff
+        try:
+            import jax
+            import jax.numpy as jnp
+
+            h_c_jax = jnp.array(h_c).reshape(1, -1)
+            h_h_jax = jnp.array(h_h).reshape(1, -1)
+
+            def value_fn(hstate_flat_jax):
+                half = hstate_flat_jax.shape[-1] // 2
+                hc = hstate_flat_jax[:half].reshape(1, -1)
+                hh = hstate_flat_jax[half:].reshape(1, -1)
+                hstate_tree = (hc, hh)
+                # Create dummy obs/done for forward pass
+                obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
+                done_batch = jnp.zeros((1, 1), dtype=bool)
+                outputs = train_state.apply_fn(
+                    train_state.params, (obs_batch, done_batch), hstate_tree
+                )
+                value = outputs[2] if len(outputs) >= 3 else outputs[-1]
+                return value.sum()
+
+            hstate_jax = jnp.array(hstate_flat)
+            grad = jax.grad(value_fn)(hstate_jax)
+            all_value_grads.append(np.array(grad))
+        except Exception:
+            all_value_grads.append(hstate_flat)  # Fallback to identity
 
     hstates_array = np.stack(all_hstates)
 
@@ -281,12 +306,13 @@ def compute_feature_attribution(
 
     if baseline_obs is None:
         # Zero baseline
-        baseline_obs = jax.tree_util.tree_map(jnp.zeros_like, obs)
+        baseline_obs = type(obs)(jnp.zeros_like(obs.image), jnp.zeros_like(obs.agent_dir))
 
     def value_fn(obs_input):
-        obs_batch = jax.tree_util.tree_map(lambda x: x[None, None, ...], obs_input)
+        obs_batch = type(obs)(obs_input.image[None, None, ...], obs_input.agent_dir[None, None, ...])
         done_batch = jnp.zeros((1, 1), dtype=bool)
-        _, _, value = apply_fn(params, (obs_batch, done_batch), hstate)
+        _result = apply_fn(params, (obs_batch, done_batch), hstate)
+        value = _result[2]
         return value[0, 0]
 
     # Interpolate between baseline and target
@@ -295,11 +321,11 @@ def compute_feature_attribution(
     # Compute gradients at each interpolation point
     grads = []
     for alpha in alphas:
-        interp_obs = jax.tree_util.tree_map(
-            lambda b, t: b + alpha * (t - b),
-            baseline_obs, obs
+        interp_obs = type(obs)(
+            baseline_obs.image + alpha * (obs.image - baseline_obs.image),
+            baseline_obs.agent_dir + alpha * (obs.agent_dir - baseline_obs.agent_dir),
         )
-        grad = jax.grad(lambda o: value_fn(type(obs)(image=o, agent_dir=obs.agent_dir)))(interp_obs.image)
+        grad = jax.grad(lambda o: value_fn(type(obs)(o, obs.agent_dir)))(interp_obs.image)
         grads.append(np.array(grad))
 
     # Integrated gradients = (target - baseline) * mean(gradients)

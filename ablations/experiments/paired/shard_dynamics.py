@@ -14,8 +14,8 @@ import chex
 
 from ..base import CheckpointExperiment
 from ..utils.paired_helpers import (
-    generate_levels, extract_level_features_batch, get_pro_hstates,
-    get_action_distribution,
+    generate_levels, generate_adversary_levels, extract_level_features_batch,
+    get_pro_hstates, get_action_distribution,
 )
 
 
@@ -69,21 +69,13 @@ class ShardDynamicsExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "shard_dynamics"
 
-    def __init__(
-        self,
-        n_samples_per_step: int = 100,
-        trajectory_length: int = 50,
-        hidden_dim: int = 256,
-        n_shard_components: int = 15,
-        competition_threshold: float = 0.3,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples_per_step = n_samples_per_step
-        self.trajectory_length = trajectory_length
-        self.hidden_dim = hidden_dim
-        self.n_shard_components = n_shard_components
-        self.competition_threshold = competition_threshold
+        self.n_samples_per_step = self.exp_config("n_samples_per_step")
+        self.trajectory_length = self.exp_config("trajectory_length")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.n_shard_components = self.exp_config("n_shard_components")
+        self.competition_threshold = self.exp_config("competition_threshold")
         self._trajectory_data: List[Dict[str, Any]] = []
         self._shards: Dict[int, ShardClusterInfo] = {}
         self._competition_events: List[CompetitionEvent] = []
@@ -105,13 +97,18 @@ class ShardDynamicsExperiment(CheckpointExperiment):
 
     def _collect_step_data(self, rng: chex.PRNGKey, step: int) -> Dict[str, Any]:
         """Collect data for a single step using real network evaluations."""
-        rng, level_rng, hstate_rng, action_rng = jax.random.split(rng, 4)
+        rng, level_rng, hstate_rng, action_rng, diff_rng = jax.random.split(rng, 5)
 
         # Adversary curriculum phase
-        curriculum_phase = 'early' if step < 15 else ('mid' if step < 35 else 'late')
+        frac = step / self.trajectory_length
+        curriculum_phase = 'early' if frac < 0.33 else ('mid' if frac < 0.66 else 'late')
 
-        # Generate real levels
-        levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
+        # Generate levels using adversary policy if available, else random
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is not None:
+            levels = generate_adversary_levels(self.agent, adv_ts, level_rng, self.n_samples_per_step)
+        else:
+            levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
 
         # Get real hidden states from protagonist network
         hstates = get_pro_hstates(hstate_rng, levels, self)
@@ -143,9 +140,9 @@ class ShardDynamicsExperiment(CheckpointExperiment):
         ]
 
         # Compute adversary difficulty from real level statistics
-        mean_wall = float(np.mean(features_batch['wall_density']))
-        mean_dist = float(np.mean(features_batch['goal_distance']))
-        adversary_difficulty = mean_wall * 0.5 + mean_dist * 0.05
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties = compute_difficulty(levels, self, diff_rng)
+        adversary_difficulty = float(np.mean(difficulties))
 
         return {
             'step': step,
@@ -252,9 +249,11 @@ class ShardDynamicsExperiment(CheckpointExperiment):
     ) -> float:
         """Measure how much a shard influences policy."""
         # Correlation between activation and action distribution
+        from scipy.special import softmax
+        action_probs = softmax(policy_logits, axis=1)
         influences = []
         for a in range(4):
-            action_prob = np.exp(policy_logits[:, a]) / np.exp(policy_logits).sum(axis=1)
+            action_prob = action_probs[:, a]
             corr = np.corrcoef(activations, action_prob)[0, 1]
             if not np.isnan(corr):
                 influences.append(abs(corr))

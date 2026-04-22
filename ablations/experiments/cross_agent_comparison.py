@@ -74,25 +74,14 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "cross_agent_comparison"
 
-    def __init__(
-        self,
-        n_test_levels: int = 200,
-        wall_density_range: Tuple[float, float] = (0.05, 0.35),
-        seed: int = 42,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize cross-agent comparison experiment.
-
-        Args:
-            n_test_levels: Number of test levels for evaluation
-            wall_density_range: Range of wall densities to sample
-            seed: Random seed for reproducible test levels
         """
         super().__init__(**kwargs)
-        self.n_test_levels = n_test_levels
-        self.wall_density_range = wall_density_range
-        self.seed = seed
+        self.n_test_levels = self.exp_config("n_test_levels")
+        self.wall_density_range = self.exp_config("wall_density_range")
+        self.seed = self.exp_config("seed")
 
         self._data: Optional[ComparisonData] = None
         self._results: Dict[str, Any] = {}
@@ -177,43 +166,27 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
         """
         Generate fixed set of test levels for standardized evaluation.
 
-        Uses deterministic generation to ensure same levels across agents.
+        Uses generate_constrained_levels with varying wall_density to create
+        a difficulty sweep for cross-agent comparison.
         """
-        levels = []
-        height, width = 13, 13
+        from .utils.paired_helpers import generate_constrained_levels, levels_to_dicts
 
-        for i in range(n_levels):
-            rng, level_rng = jax.random.split(rng)
+        density_min, density_max = self.wall_density_range
+        n_bins = min(5, n_levels)
+        levels_per_bin = n_levels // n_bins
 
-            # Stratified wall density sampling
-            density_min, density_max = self.wall_density_range
-            wall_prob = density_min + (i / n_levels) * (density_max - density_min)
-
-            # Generate walls
-            rng_walls, rng_goal, rng_agent, rng_dir = jax.random.split(level_rng, 4)
-            wall_map = np.array(jax.random.bernoulli(rng_walls, wall_prob, (height, width)))
-            wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-            # Random goal and agent positions
-            goal_pos = (
-                int(jax.random.randint(rng_goal, (), 1, height - 1)),
-                int(jax.random.randint(rng_goal, (), 1, width - 1)),
+        all_levels = []
+        for b in range(n_bins):
+            bin_lo = density_min + b * (density_max - density_min) / n_bins
+            bin_hi = density_min + (b + 1) * (density_max - density_min) / n_bins
+            rng, bin_rng = jax.random.split(rng)
+            bin_levels = generate_constrained_levels(
+                self.agent, bin_rng, levels_per_bin,
+                {'wall_density': (bin_lo, bin_hi)},
             )
-            agent_pos = (
-                int(jax.random.randint(rng_agent, (), 1, height - 1)),
-                int(jax.random.randint(rng_agent, (), 1, width - 1)),
-            )
-            agent_dir = int(jax.random.randint(rng_dir, (), 0, 4))
+            all_levels.extend(levels_to_dicts(bin_levels, levels_per_bin))
 
-            levels.append({
-                'wall_map': wall_map,
-                'wall_density': wall_map.sum() / (height * width),
-                'goal_pos': goal_pos,
-                'agent_pos': agent_pos,
-                'agent_dir': agent_dir,
-            })
-
-        return levels
+        return all_levels
 
     def analyze(self) -> Dict[str, Any]:
         """

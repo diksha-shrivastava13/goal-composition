@@ -63,31 +63,16 @@ class BehavioralCouplingExperiment(TrainingTimeExperiment):
     def name(self) -> str:
         return "behavioral_coupling"
 
-    def __init__(
-        self,
-        collection_interval: int = 100,
-        probe_n_samples: int = 50,
-        rolling_window: int = 20,
-        granger_max_lag: int = 10,
-        random_baseline_samples: int = 100,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize behavioral coupling experiment.
-
-        Args:
-            collection_interval: Steps between data collection
-            probe_n_samples: Number of samples for probe loss estimation
-            rolling_window: Window size for rolling correlation
-            granger_max_lag: Maximum lag for Granger causality tests
-            random_baseline_samples: Samples for computing random baseline
         """
         super().__init__(**kwargs)
-        self.collection_interval = collection_interval
-        self.probe_n_samples = probe_n_samples
-        self.rolling_window = rolling_window
-        self.granger_max_lag = granger_max_lag
-        self.random_baseline_samples = random_baseline_samples
+        self.collection_interval = self.exp_config("collection_interval")
+        self.probe_n_samples = self.exp_config("probe_n_samples")
+        self.rolling_window = self.exp_config("rolling_window")
+        self.granger_max_lag = self.exp_config("granger_max_lag")
+        self.random_baseline_samples = self.exp_config("random_baseline_samples")
 
         self._timeseries = CouplingTimeSeries()
         self._random_baseline: Optional[float] = None
@@ -190,38 +175,23 @@ class BehavioralCouplingExperiment(TrainingTimeExperiment):
             return 1.0
 
     def _generate_random_level(self, rng) -> Dict[str, Any]:
-        """Generate a random level for probe loss evaluation."""
+        """Generate a random level using the agent's environment."""
         import jax
+        from .utils.paired_helpers import levels_to_dicts
 
-        height, width = 13, 13
-        wall_prob = 0.1 + float(jax.random.uniform(rng)) * 0.2
-
-        wall_map = np.array(jax.random.bernoulli(rng, wall_prob, (height, width)))
-        wall_map[0, :] = wall_map[-1, :] = wall_map[:, 0] = wall_map[:, -1] = False
-
-        rng_goal, rng_agent = jax.random.split(rng)
-        goal_pos = (
-            int(jax.random.randint(rng_goal, (), 1, height - 1)),
-            int(jax.random.randint(rng_goal, (), 1, width - 1)),
-        )
-        agent_pos = (
-            int(jax.random.randint(rng_agent, (), 1, height - 1)),
-            int(jax.random.randint(rng_agent, (), 1, width - 1)),
-        )
-
-        return {
-            'wall_map': wall_map,
-            'wall_density': wall_map.sum() / (height * width),
-            'goal_pos': goal_pos,
-            'agent_pos': agent_pos,
-            'agent_dir': 0,
-        }
+        level = self.agent.sample_random_level(rng)
+        level_dict = levels_to_dicts(jax.tree_util.tree_map(lambda x: x[None], level), 1)[0]
+        level_dict['wall_density'] = float(np.array(level.wall_map).sum() / np.array(level.wall_map).size)
+        level_dict['agent_dir'] = 0
+        return level_dict
 
     def _compute_random_baseline(self) -> float:
-        """Compute random baseline probe loss."""
-        # For random baseline, we assume maximum uncertainty
-        # This is 1.0 for normalized losses
-        return 1.0
+        """Compute random baseline probe loss using agent_aware_loss."""
+        try:
+            from .utils.agent_aware_loss import compute_random_baseline_loss
+            return compute_random_baseline_loss()
+        except ImportError:
+            return float('nan')
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Any]:
         """
@@ -245,11 +215,12 @@ class BehavioralCouplingExperiment(TrainingTimeExperiment):
         data = self._timeseries.to_arrays()
 
         if len(data['steps']) < self.rolling_window:
-            return {
+            self._results = {
                 'error': 'Insufficient data points for analysis',
                 'n_points': len(data['steps']),
                 'required': self.rolling_window,
             }
+            return self._results
 
         results = {}
 
@@ -309,10 +280,10 @@ class BehavioralCouplingExperiment(TrainingTimeExperiment):
         performance = data['task_performance']
         steps = data['steps']
 
-        rolling_corr = compute_rolling_correlation(
+        rolling_corr, rolling_indices = compute_rolling_correlation(
             signal,
             performance,
-            window=self.rolling_window
+            window_size=self.rolling_window
         )
 
         # Find periods of strong correlation
@@ -335,7 +306,7 @@ class BehavioralCouplingExperiment(TrainingTimeExperiment):
 
         return {
             'rolling_correlations': rolling_corr.tolist(),
-            'rolling_steps': steps[self.rolling_window:].tolist(),
+            'rolling_steps': rolling_indices.tolist(),
             'mean_rolling_corr': float(np.nanmean(rolling_corr)),
             'std_rolling_corr': float(np.nanstd(rolling_corr)),
             'strong_correlation_periods': strong_corr_periods,

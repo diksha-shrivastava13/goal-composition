@@ -55,7 +55,7 @@ class ConditionResult:
 
     # Level feature distribution
     mean_wall_density: float
-    mean_path_length: float
+    mean_goal_distance: float
 
 
 class AdversaryAblationExperiment(CheckpointExperiment):
@@ -82,13 +82,9 @@ class AdversaryAblationExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "adversary_ablation"
 
-    def __init__(
-        self,
-        n_levels_per_condition: int = 500,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_levels_per_condition = n_levels_per_condition
+        self.n_levels_per_condition = self.exp_config("n_levels_per_condition")
         self._results_by_condition: Dict[Tuple[str, str], ConditionResult] = {}
         self._require_paired()
 
@@ -101,7 +97,6 @@ class AdversaryAblationExperiment(CheckpointExperiment):
         """Run all factorial conditions using GPU-batched rollouts."""
         import time
         import logging
-        from tqdm import tqdm
 
         logger = logging.getLogger(__name__)
         timings = {}
@@ -128,7 +123,7 @@ class AdversaryAblationExperiment(CheckpointExperiment):
                     wandb.log(log_dict)
 
         n = self.n_levels_per_condition
-        max_steps = 256
+        max_steps = self.config.get("max_steps", 256)
 
         for adv_cond in AdversaryCondition:
             for ant_cond in AntagonistCondition:
@@ -139,28 +134,41 @@ class AdversaryAblationExperiment(CheckpointExperiment):
                 _log(f"{cond_key}/generate_levels", msg="Generating levels...")
                 t0 = time.time()
                 rng_levels, rng_pro, rng_ant = jax.random.split(cond_rng, 3)
-                level_rngs = jax.random.split(rng_levels, n)
-                levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+                if adv_cond == AdversaryCondition.NO_ADVERSARY:
+                    level_rngs = jax.random.split(rng_levels, n)
+                    levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+                elif adv_cond == AdversaryCondition.FROZEN:
+                    adv_ts = getattr(self.train_state, 'adv_train_state', None)
+                    if adv_ts is not None:
+                        from ..utils.paired_helpers import generate_adversary_levels
+                        levels = generate_adversary_levels(self.agent, adv_ts, rng_levels, n)
+                    else:
+                        level_rngs = jax.random.split(rng_levels, n)
+                        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+                elif adv_cond == AdversaryCondition.EASY:
+                    from ..utils.paired_helpers import generate_constrained_levels
+                    levels = generate_constrained_levels(
+                        self.agent, rng_levels, n,
+                        {'wall_density': (0.0, 0.2)},
+                    )
+                elif adv_cond == AdversaryCondition.HARD:
+                    from ..utils.paired_helpers import generate_constrained_levels
+                    levels = generate_constrained_levels(
+                        self.agent, rng_levels, n,
+                        {'wall_density': (0.3, 0.6)},
+                    )
+                else:
+                    level_rngs = jax.random.split(rng_levels, n)
+                    levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
                 jax.block_until_ready(levels)
                 _log(f"{cond_key}/generate_levels", time.time() - t0)
 
-                # --- 2. Extract CPU-side level properties ---
-                _log(f"{cond_key}/cpu_level_properties", msg="Computing level properties...")
+                # --- 2. Extract level features (vectorised, no Python loop) ---
+                _log(f"{cond_key}/level_features", msg="Extracting level features...")
                 t0 = time.time()
-                wall_maps = np.array(levels.wall_map)
-                goal_positions = np.array(levels.goal_pos)
-                agent_positions = np.array(levels.agent_pos)
-
-                wall_density = wall_maps.mean(axis=(1, 2))
-                path_lengths = np.array([
-                    self._compute_path_length({
-                        'wall_map': wall_maps[i],
-                        'agent_pos': tuple(agent_positions[i]),
-                        'goal_pos': tuple(goal_positions[i]),
-                    })
-                    for i in tqdm(range(n), desc=f"BFS path lengths ({cond_key})", leave=False)
-                ])
-                _log(f"{cond_key}/cpu_level_properties", time.time() - t0)
+                from ..utils.paired_helpers import extract_level_features_batch
+                batch_features = extract_level_features_batch(levels)
+                _log(f"{cond_key}/level_features", time.time() - t0)
 
                 # --- 3. Protagonist batched rollout ---
                 _log(f"{cond_key}/pro_rollout", msg="Running protagonist rollout...")
@@ -206,8 +214,8 @@ class AdversaryAblationExperiment(CheckpointExperiment):
                     mean_regret=float(regrets.mean()),
                     pro_hstates=pro_hstates,
                     ant_hstates=ant_hstates,
-                    mean_wall_density=float(wall_density.mean()),
-                    mean_path_length=float(path_lengths.mean()),
+                    mean_wall_density=float(batch_features['wall_density'].mean()),
+                    mean_goal_distance=float(batch_features['goal_distance'].mean()),
                 )
                 self._results_by_condition[(adv_cond.value, ant_cond.value)] = result
                 _log(f"{cond_key}/done", msg=f"Condition complete: regret={result.mean_regret:.3f}")
@@ -221,33 +229,6 @@ class AdversaryAblationExperiment(CheckpointExperiment):
             np.array(h_c).flatten(),
             np.array(h_h).flatten()
         ])
-
-    def _compute_path_length(self, level: Dict[str, Any]) -> int:
-        """Compute BFS path length."""
-        from collections import deque
-
-        wall_map = level['wall_map']
-        start = level['agent_pos']
-        goal = level['goal_pos']
-
-        if start == goal:
-            return 0
-
-        h, w = wall_map.shape
-        visited = {start}
-        queue = deque([(start, 0)])
-
-        while queue:
-            (x, y), dist = queue.popleft()
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = x + dx, y + dy
-                if (0 <= nx < h and 0 <= ny < w and
-                    (nx, ny) not in visited and not wall_map[nx, ny]):
-                    if (nx, ny) == goal:
-                        return dist + 1
-                    visited.add((nx, ny))
-                    queue.append(((nx, ny), dist + 1))
-        return -1
 
     def analyze(self) -> Dict[str, Any]:
         """ANOVA-style analysis of factorial design."""
@@ -378,7 +359,7 @@ class AdversaryAblationExperiment(CheckpointExperiment):
             # Use level features as proxy for Û components
             shifts[f"{adv}_{ant}"] = {
                 'mean_wall_density': result.mean_wall_density,
-                'mean_path_length': result.mean_path_length,
+                'mean_goal_distance': result.mean_goal_distance,
                 'mean_regret': result.mean_regret,
             }
 

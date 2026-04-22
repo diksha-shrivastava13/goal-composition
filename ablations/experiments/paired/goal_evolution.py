@@ -53,21 +53,13 @@ class GoalEvolutionExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "goal_evolution"
 
-    def __init__(
-        self,
-        n_samples_per_step: int = 100,
-        trajectory_length: int = 50,
-        hidden_dim: int = 256,
-        n_shard_components: int = 10,
-        policy_effect_threshold: float = 0.1,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples_per_step = n_samples_per_step
-        self.trajectory_length = trajectory_length
-        self.hidden_dim = hidden_dim
-        self.n_shard_components = n_shard_components
-        self.policy_effect_threshold = policy_effect_threshold
+        self.n_samples_per_step = self.exp_config("n_samples_per_step")
+        self.trajectory_length = self.exp_config("trajectory_length")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.n_shard_components = self.exp_config("n_shard_components")
+        self.policy_effect_threshold = self.exp_config("policy_effect_threshold")
         self._trajectory_data: List[Dict[str, Any]] = []
         self._shards: List[Shard] = []
         self._composition_events: List[CompositionEvent] = []
@@ -88,7 +80,7 @@ class GoalEvolutionExperiment(CheckpointExperiment):
 
     def _collect_step_data(self, rng: chex.PRNGKey, step: int) -> Dict[str, Any]:
         """Collect data for a single step using real network evaluations."""
-        rng, level_rng, hstate_rng, action_rng = jax.random.split(rng, 4)
+        rng, level_rng, hstate_rng, action_rng, diff_rng = jax.random.split(rng, 5)
 
         # Generate real levels
         levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
@@ -116,9 +108,9 @@ class GoalEvolutionExperiment(CheckpointExperiment):
         ]
 
         # Compute adversary features from level statistics
-        mean_wall = float(np.mean(features_batch['wall_density']))
-        mean_dist = float(np.mean(features_batch['goal_distance']))
-        difficulty = mean_wall * 0.5 + mean_dist * 0.05
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulty = float(np.mean(difficulties))
 
         return {
             'step': step,
@@ -127,7 +119,7 @@ class GoalEvolutionExperiment(CheckpointExperiment):
             'level_features': level_features_list,
             'adversary_features': {
                 'difficulty': difficulty,
-                'curriculum_phase': 'early' if step < 15 else ('mid' if step < 35 else 'late'),
+                'curriculum_phase': 'early' if step / self.trajectory_length < 0.33 else ('mid' if step / self.trajectory_length < 0.66 else 'late'),
             },
         }
 
@@ -150,8 +142,11 @@ class GoalEvolutionExperiment(CheckpointExperiment):
             )
             components = model.fit_transform(hstates)
             dictionary = model.components_
-        except Exception:
-            # Fallback to simpler analysis
+        except (ValueError, np.linalg.LinAlgError, RuntimeError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"DictionaryLearning failed at step {step}: {e}. Returning empty shards."
+            )
             return []
 
         shards = []
@@ -307,9 +302,9 @@ class GoalEvolutionExperiment(CheckpointExperiment):
                     if overlap > len(shard.dimension_indices) * 0.5:
                         persistence = max(persistence, later_shard.birth_step - birth)
 
-            half_lives.append(persistence if persistence > 0 else 10)  # Default half-life
+            half_lives.append(persistence if persistence > 0 else float('nan'))
 
-        return float(np.mean(half_lives)) if half_lives else 10.0
+        return float(np.nanmean(half_lives)) if half_lives else float('nan')
 
     def _detect_compositions(
         self,

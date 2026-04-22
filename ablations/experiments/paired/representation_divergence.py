@@ -49,15 +49,11 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "representation_divergence"
 
-    def __init__(
-        self,
-        n_levels_per_checkpoint: int = 200,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, checkpoint_steps: Optional[List[int]] = None, **kwargs):
         super().__init__(**kwargs)
-        self.n_levels_per_checkpoint = n_levels_per_checkpoint
-        self.hidden_dim = hidden_dim
+        self.n_levels_per_checkpoint = self.exp_config("n_levels_per_checkpoint")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.checkpoint_steps = checkpoint_steps
         self._snapshots: List[DivergenceSnapshot] = []
         self._require_paired()
 
@@ -66,7 +62,59 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
             raise ValueError(f"RepresentationDivergenceExperiment requires PAIRED")
 
     def collect_data(self, rng: chex.PRNGKey) -> List[DivergenceSnapshot]:
-        """Collect data at current checkpoint using real network evaluations."""
+        """Collect divergence data across multiple checkpoints.
+
+        If checkpoint_steps is provided and the checkpoint directory contains
+        multiple saved steps, iterates over them to build a temporal trajectory.
+        Otherwise falls back to analyzing the single loaded checkpoint.
+        """
+        import os
+        import glob as glob_mod
+
+        # Try to find multiple checkpoints in the output directory
+        checkpoint_dir = os.path.dirname(self.output_dir) if hasattr(self, 'output_dir') else None
+        checkpoint_paths = []
+
+        if checkpoint_dir:
+            # Look for checkpoint subdirectories (common patterns: step_N, checkpoint_N)
+            for pattern in ['step_*', 'checkpoint_*', 'ckpt_*']:
+                matches = sorted(glob_mod.glob(os.path.join(checkpoint_dir, pattern)))
+                if matches:
+                    checkpoint_paths = matches
+                    break
+
+        if checkpoint_paths and len(checkpoint_paths) > 1:
+            # Multiple checkpoints available — iterate over them
+            from ..run_experiment import load_checkpoint as _load_ckpt
+            from ablations.common.types import PAIREDTrainState
+            from ..run_experiment import _wrap_paired_train_state
+
+            for ckpt_path in checkpoint_paths:
+                rng, snap_rng = jax.random.split(rng)
+                try:
+                    ts, _ = _load_ckpt(ckpt_path, agent=self.agent)
+                    if isinstance(ts, PAIREDTrainState):
+                        ts = _wrap_paired_train_state(ts)
+
+                    # Temporarily swap train_state
+                    original_ts = self.train_state
+                    self.train_state = ts
+                    self._collect_single_checkpoint(snap_rng)
+                    self.train_state = original_ts
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"Failed to load checkpoint {ckpt_path}: {e}"
+                    )
+                    continue
+        else:
+            # Single checkpoint — collect one snapshot
+            self._collect_single_checkpoint(rng)
+
+        return self._snapshots
+
+    def _collect_single_checkpoint(self, rng: chex.PRNGKey):
+        """Collect divergence data at a single checkpoint."""
         checkpoint_step = getattr(self.train_state, 'update_count', 0)
 
         rng, level_rng, pro_rng, ant_rng = jax.random.split(rng, 4)
@@ -103,7 +151,6 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
         )
 
         self._snapshots.append(snapshot)
-        return self._snapshots
 
     def _compute_cka(self, X: np.ndarray, Y: np.ndarray) -> float:
         """Compute linear CKA."""

@@ -58,12 +58,7 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "adversary_dynamics"
 
-    def __init__(
-        self,
-        n_episodes: int = 200,
-        window_size: int = 20,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize adversary dynamics experiment.
 
@@ -72,8 +67,8 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
             window_size: Rolling window for trend analysis
         """
         super().__init__(**kwargs)
-        self.n_episodes = n_episodes
-        self.window_size = window_size
+        self.n_episodes = self.exp_config("n_episodes")
+        self.window_size = self.exp_config("window_size")
 
         self._data: Optional[AdversaryData] = None
         self._results: Dict[str, Any] = {}
@@ -116,14 +111,27 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
 
         self._data = AdversaryData()
         n = self.n_episodes
-        max_steps = 256
+        max_steps = self.config.get("max_steps", 256)
 
         # --- Generate all levels at once ---
-        _log("generate_levels", msg="Generating levels via vmap...")
+        _log("generate_levels", msg="Generating levels...")
         t0 = time.time()
         rng, rng_levels = jax.random.split(rng)
-        level_rngs = jax.random.split(rng_levels, n)
-        levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        # Use adversary to generate levels if available
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is not None:
+            try:
+                from ..utils.paired_helpers import generate_adversary_levels
+                # Generate levels using the adversary's learned generation policy
+                levels = generate_adversary_levels(
+                    self.agent, adv_ts, rng_levels, n, adv_num_steps=50
+                )
+            except Exception:
+                level_rngs = jax.random.split(rng_levels, n)
+                levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        else:
+            level_rngs = jax.random.split(rng_levels, n)
+            levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
         jax.block_until_ready(levels)
         _log("generate_levels", time.time() - t0, "Level generation complete")
 
@@ -146,9 +154,10 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
         _log("protagonist_rollout", msg="Running batched protagonist rollout...")
         t0 = time.time()
         rng, rng_pro = jax.random.split(rng)
+        pro_ts = getattr(self.train_state, 'pro_train_state', self.train_state)
         pro_result = batched_rollout(
             rng_pro, levels, max_steps,
-            self.train_state.apply_fn, self.train_state.params,
+            pro_ts.apply_fn, pro_ts.params,
             self.agent.env, self.agent.env_params,
             self.agent.initialize_hidden_state(n),
             collection_steps=[-1],
@@ -207,11 +216,14 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
         self._data.episode_indices = list(range(n))
 
         # Level features for diversity analysis
-        safe_path = np.where(path_lengths > 0, path_lengths / 30.0, 0.0)
+        grid_size = getattr(self.agent.env, 'max_height', 13)
+        max_path = float(grid_size * grid_size)
+        max_diag = float(np.sqrt(2) * grid_size)
+        safe_path = np.where(path_lengths > 0, path_lengths / max_path, 0.0)
         goal_dist_arr = np.array(self._data.goal_distances)
         features = np.stack([
             wall_density,
-            goal_dist_arr / 18.0,
+            goal_dist_arr / max_diag,
             safe_path,
         ], axis=-1)
         self._data.level_features = [features[i] for i in range(n)]
@@ -290,32 +302,42 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
         return results
 
     def _analyze_difficulty_trajectory(self) -> Dict[str, Any]:
-        """Analyze how difficulty evolves over training."""
+        """Analyze difficulty distribution across sampled episodes.
+
+        Note: Uses cross-sectional statistics rather than rolling-window trend
+        analysis, as episode ordering within a single checkpoint does not
+        represent a true temporal sequence.
+        """
         wall_densities = np.array(self._data.wall_densities)
         goal_distances = np.array(self._data.goal_distances)
 
-        # Compute rolling statistics
         n = len(wall_densities)
-        if n < self.window_size:
+        if n < 5:
             return {'error': 'Insufficient data for trajectory analysis'}
 
-        # Rolling mean difficulty
-        rolling_density = np.convolve(
-            wall_densities,
-            np.ones(self.window_size) / self.window_size,
-            mode='valid'
-        )
+        from scipy.stats import spearmanr
 
-        # Trend analysis (linear regression)
-        x = np.arange(len(rolling_density))
-        slope, intercept = np.polyfit(x, rolling_density, 1)
+        # Cross-sectional statistics
+        episode_indices = np.arange(n)
+
+        # Spearman rank correlation between episode index and difficulty
+        rho_density, p_density = spearmanr(episode_indices, wall_densities)
+        rho_goal, p_goal = spearmanr(episode_indices, goal_distances)
 
         return {
-            'initial_difficulty': float(np.mean(wall_densities[:self.window_size])),
-            'final_difficulty': float(np.mean(wall_densities[-self.window_size:])),
-            'difficulty_trend_slope': float(slope),
-            'trend_direction': 'increasing' if slope > 0.001 else ('decreasing' if slope < -0.001 else 'stable'),
+            'mean_wall_density': float(np.mean(wall_densities)),
+            'std_wall_density': float(np.std(wall_densities)),
             'mean_goal_distance': float(np.mean(goal_distances)),
+            'std_goal_distance': float(np.std(goal_distances)),
+            'density_index_correlation': {
+                'spearman_rho': float(rho_density) if not np.isnan(rho_density) else 0.0,
+                'p_value': float(p_density) if not np.isnan(p_density) else 1.0,
+            },
+            'goal_distance_index_correlation': {
+                'spearman_rho': float(rho_goal) if not np.isnan(rho_goal) else 0.0,
+                'p_value': float(p_goal) if not np.isnan(p_goal) else 1.0,
+            },
+            'difficulty_range': float(np.max(wall_densities) - np.min(wall_densities)),
         }
 
     def _analyze_mode_collapse(self) -> Dict[str, Any]:
@@ -374,19 +396,26 @@ class AdversaryDynamicsExperiment(CheckpointExperiment):
             mode='valid'
         )
 
-        # Regret trend
+        # Regret trend — guard against NaN/constant data that makes SVD fail
         x = np.arange(len(rolling_regret))
-        slope, intercept = np.polyfit(x, rolling_regret, 1)
+        valid_mask = np.isfinite(rolling_regret)
+        if valid_mask.sum() >= 2 and np.std(rolling_regret[valid_mask]) > 1e-10:
+            try:
+                slope, intercept = np.polyfit(x[valid_mask], rolling_regret[valid_mask], 1)
+            except np.linalg.LinAlgError:
+                slope = 0.0
+        else:
+            slope = 0.0
 
         return {
-            'mean_regret': float(np.mean(regrets)),
-            'std_regret': float(np.std(regrets)),
-            'initial_regret': float(np.mean(regrets[:self.window_size])),
-            'final_regret': float(np.mean(regrets[-self.window_size:])),
+            'mean_regret': float(np.nanmean(regrets)),
+            'std_regret': float(np.nanstd(regrets)),
+            'initial_regret': float(np.nanmean(regrets[:self.window_size])),
+            'final_regret': float(np.nanmean(regrets[-self.window_size:])),
             'regret_trend_slope': float(slope),
-            'mean_protagonist_return': float(np.mean(pro_returns)),
-            'mean_antagonist_return': float(np.mean(ant_returns)),
-            'antagonist_advantage': float(np.mean(ant_returns) - np.mean(pro_returns)),
+            'mean_protagonist_return': float(np.nanmean(pro_returns)),
+            'mean_antagonist_return': float(np.nanmean(ant_returns)),
+            'antagonist_advantage': float(np.nanmean(ant_returns) - np.nanmean(pro_returns)),
         }
 
     def _analyze_exploit_discovery(self) -> Dict[str, Any]:

@@ -21,6 +21,7 @@ import chex
 from ..base import CheckpointExperiment
 from ..utils.paired_helpers import (
     generate_levels,
+    generate_adversary_levels,
     extract_level_features_batch,
     get_pro_ant_returns,
     get_pro_hstates,
@@ -64,19 +65,12 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "adversary_strategy_clustering"
 
-    def __init__(
-        self,
-        n_rollouts_per_checkpoint: int = 100,
-        min_cluster_size: int = 10,
-        use_hdbscan: bool = True,
-        n_clusters_kmeans: int = 5,  # Fallback if HDBSCAN unavailable
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_rollouts_per_checkpoint = n_rollouts_per_checkpoint
-        self.min_cluster_size = min_cluster_size
-        self.use_hdbscan = use_hdbscan
-        self.n_clusters_kmeans = n_clusters_kmeans
+        self.n_rollouts_per_checkpoint = self.exp_config("n_rollouts_per_checkpoint")
+        self.min_cluster_size = self.exp_config("min_cluster_size")
+        self.use_hdbscan = self.exp_config("use_hdbscan")
+        self.n_clusters_kmeans = self.exp_config("n_clusters_kmeans")
 
         self._rollouts: List[AdversaryRollout] = []
         self._clusters: List[StrategyCluster] = []
@@ -93,9 +87,17 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
         checkpoint_step = getattr(self.train_state, 'update_count', 0)
         n = self.n_rollouts_per_checkpoint
 
-        # Generate all levels in a single batched call
+        # Generate levels using adversary policy if available, else random
         rng, gen_rng, hstate_rng, eval_rng = jax.random.split(rng, 4)
-        levels = generate_levels(self.agent, gen_rng, n)
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is not None:
+            levels = generate_adversary_levels(self.agent, adv_ts, gen_rng, n)
+        else:
+            import logging
+            logging.getLogger(__name__).warning(
+                "No adv_train_state; falling back to random levels"
+            )
+            levels = generate_levels(self.agent, gen_rng, n)
 
         # Extract features for all levels
         batch_features = extract_level_features_batch(levels)
@@ -123,12 +125,26 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
             # Wrap in (1, hidden_dim) so mean(axis=0) is a no-op
             hstate_seq = hstate_i[np.newaxis, :]
 
-            # Actions: not directly available from rollout; use a placeholder
-            # The clustering primarily relies on hstates and features
+            # Extract real adversary actions via action distribution
+            adv_ts = getattr(self.train_state, 'adv_train_state', None)
             max_actions = 50
             n_actions = 7
-            rng, action_rng = jax.random.split(rng)
-            actions = np.array(jax.random.randint(action_rng, (max_actions,), 0, n_actions))
+            if adv_ts is not None:
+                try:
+                    from ..utils.paired_helpers import get_action_distribution
+                    level_i = jax.tree_util.tree_map(lambda x: x[i:i+1], levels)
+                    rng, act_rng = jax.random.split(rng)
+                    logits, _ = get_action_distribution(
+                        adv_ts, self.agent, level_i, act_rng, max_steps=max_actions,
+                    )
+                    # Convert logits to most-likely actions
+                    actions = np.array(logits[0].argmax(axis=-1))[:max_actions]
+                except Exception:
+                    rng, action_rng = jax.random.split(rng)
+                    actions = np.array(jax.random.randint(action_rng, (max_actions,), 0, n_actions))
+            else:
+                rng, action_rng = jax.random.split(rng)
+                actions = np.array(jax.random.randint(action_rng, (max_actions,), 0, n_actions))
 
             self._rollouts.append(AdversaryRollout(
                 actions=actions,
@@ -166,6 +182,9 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
 
         # 5. Export labels for other experiments
         results['strategy_labels'] = labels.tolist()
+
+        # 6. Protagonist classification — does protagonist encode adversary strategy?
+        results['protagonist_strategy_encoding'] = self._classify_protagonist_strategy(labels)
 
         return results
 
@@ -233,6 +252,17 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
             # Representative action sequence (mean)
             mean_actions = np.mean([r.actions for r in cluster_rollouts], axis=0)
 
+            # Compute per-cluster silhouette score as stability measure
+            cluster_stability = 1.0
+            if mask.sum() >= 2 and len(np.unique(labels)) >= 2:
+                try:
+                    from sklearn.metrics import silhouette_samples
+                    embeddings = self._embed_sequences()
+                    sil_samples = silhouette_samples(embeddings, labels)
+                    cluster_stability = float(np.mean(sil_samples[mask]))
+                except Exception:
+                    cluster_stability = 1.0
+
             clusters.append(StrategyCluster(
                 cluster_id=int(cluster_id),
                 n_samples=len(cluster_rollouts),
@@ -240,7 +270,7 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
                 std_regret=float(np.std(regrets)),
                 feature_profile=features,
                 representative_actions=mean_actions,
-                stability=1.0,  # Placeholder
+                stability=cluster_stability,
             ))
 
         return clusters
@@ -295,6 +325,52 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
         if self._labels is None:
             raise ValueError("Must call analyze before getting labels")
         return self._labels
+
+    def _classify_protagonist_strategy(self, strategy_labels: np.ndarray) -> Dict[str, Any]:
+        """Train LogisticRegression to predict adversary strategy cluster from protagonist h-states."""
+        from ..utils.paired_helpers import generate_levels, get_pro_hstates
+        import jax
+
+        unique_labels = np.unique(strategy_labels)
+        if len(unique_labels) < 2:
+            return {'error': 'Need at least 2 strategy clusters for classification'}
+
+        # Collect protagonist hidden states on the same levels
+        try:
+            rng = jax.random.PRNGKey(123)
+            levels = generate_levels(self.agent, rng, len(strategy_labels))
+            rng, hstate_rng = jax.random.split(rng)
+            hstates = get_pro_hstates(hstate_rng, levels, self)
+            hstates_np = np.array(hstates)
+        except Exception as e:
+            return {'error': f'Failed to collect protagonist h-states: {e}'}
+
+        n_samples = min(len(strategy_labels), len(hstates_np))
+        X = hstates_np[:n_samples]
+        y = strategy_labels[:n_samples]
+
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import cross_val_score
+        from sklearn.preprocessing import StandardScaler
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        try:
+            clf = LogisticRegression(max_iter=1000)
+            scores = cross_val_score(clf, X_scaled, y, cv=min(5, len(unique_labels)), scoring='accuracy')
+            chance_level = 1.0 / len(unique_labels)
+
+            return {
+                'cv_accuracy_mean': float(np.mean(scores)),
+                'cv_accuracy_std': float(np.std(scores)),
+                'chance_level': chance_level,
+                'above_chance': float(np.mean(scores)) > chance_level + 0.05,
+                'n_samples': n_samples,
+                'n_clusters': len(unique_labels),
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
     def visualize(self) -> Dict[str, np.ndarray]:
         """Create strategy clustering visualizations."""

@@ -2,14 +2,14 @@
 Run all experiments on multiple agents and checkpoints.
 
 This script runs the full experiment suite on saved checkpoints:
-- Non-PAIRED methods: 11 universal post-hoc experiments per checkpoint
-- PAIRED method: 11 universal + 22 PAIRED-specific = 33 post-hoc experiments per checkpoint
+- Non-PAIRED methods: 13 universal post-hoc experiments per checkpoint
+- PAIRED method: 13 universal + 22 PAIRED-specific = 35 post-hoc experiments per checkpoint
 
 Usage:
     # Run universal experiments on ACCEL checkpoints
     python -m ablations.experiments.run_all --results_dir checkpoints/accel --output_dir results --training_method accel
 
-    # Run all 33 experiments on PAIRED checkpoints
+    # Run all 35 experiments on PAIRED checkpoints
     python -m ablations.experiments.run_all --results_dir checkpoints/paired --output_dir results --training_method paired
 
     # Run specific experiments only
@@ -26,87 +26,15 @@ import glob
 
 import jax
 
-
-# Universal post-hoc experiments (run on any checkpoint, any method)
-UNIVERSAL_EXPERIMENTS = [
-    # Core experiments
-    'level_probing',
-    'value_calibration',
-    'activation_analysis',
-    'cross_agent_comparison',
-    # Transfer & robustness
-    'mutation_adaptation',
-    'causal_intervention',
-    'counterfactual',
-    # Advanced interpretability
-    'output_probing',
-    # Novel experiments
-    'goal_extraction',
-    'cross_episode_flow',
-    'dr_coverage',
-    # Prediction experiments
-    'n_env_prediction',
-    'n_step_prediction',
-]
-
-# PAIRED-specific experiments (22 experiments, only for paired training method)
-PAIRED_EXPERIMENTS = [
-    # A: Utility Function Extraction
-    'utility_extraction',
-    'adversary_policy_extraction',
-    'bilateral_utility',
-    # B: Causal Interventions
-    'adversary_ablation',
-    'regret_decomposition',
-    'teaching_signal_intervention',
-    'counterfactual_curriculum',
-    'activation_patching',
-    # C: Three-Agent Dynamics
-    'representation_divergence',
-    'antagonist_audit',
-    'adversary_strategy_clustering',
-    'coalition_dynamics',
-    # D: Belief Revision Tracking
-    'representation_trajectory',
-    'belief_revision_detection',
-    'goal_evolution',
-    # F: Theoretical Validation
-    'causal_model_extraction',
-    'multiscale_goals',
-    'shard_dynamics',
-    'belief_behaviour_divergence',
-    'teaching_opacity',
-    # Moved from main (PAIRED-only)
-    'adversary_dynamics',
-    'regret_transfer',
-]
-
-# Training-time experiments (require hooks, cannot run post-hoc on checkpoints)
-TRAINING_TIME_EXPERIMENTS = [
-    'behavioral_coupling',
-    'symbolic_regression',
-    'phase_transition',
-]
-
-# Base agent types (for non-PAIRED methods)
-BASE_AGENTS = [
-    'next_env_prediction',
-    'accel_probe',
-    'persistent_lstm',
-    'context_vector',
-    'episodic_memory',
-]
-
-# PAIRED agent types
-PAIRED_AGENTS = [f'paired_{a}' for a in BASE_AGENTS]
-
-
-def get_experiments_for_method(training_method: str) -> List[str]:
-    """Get the list of experiments applicable to a training method."""
-    experiments = list(UNIVERSAL_EXPERIMENTS)
-    if training_method == "paired":
-        experiments.extend(PAIRED_EXPERIMENTS)
-    return experiments
+from ..configs import (
+    UNIVERSAL_EXPERIMENTS,
+    PAIRED_EXPERIMENTS,
+    TRAINING_TIME_EXPERIMENTS,
+    BASE_AGENTS,
+    PAIRED_AGENTS,
+    get_experiments_for_method,
+    EXPERIMENT_PARAM_KEYS,
+)
 
 
 def find_checkpoints(results_dir: str, agent_type: str) -> List[str]:
@@ -131,6 +59,7 @@ def run_single_experiment(
     output_dir: str,
     seed: int = 0,
     training_method: str = "accel",
+    config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a single experiment (wrapper for subprocess)."""
     from .run_experiment import run_experiment
@@ -143,6 +72,7 @@ def run_single_experiment(
             output_dir=output_dir,
             seed=seed,
             training_method=training_method,
+            config_overrides=config_overrides,
         )
         return {'status': 'success', 'result': result}
     except Exception as e:
@@ -158,6 +88,7 @@ def run_all_experiments(
     checkpoints_per_agent: Optional[int] = None,
     parallel: int = 1,
     seed: int = 0,
+    config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run all experiments on all agents and checkpoints.
@@ -171,6 +102,7 @@ def run_all_experiments(
         checkpoints_per_agent: Max checkpoints per agent (default: all)
         parallel: Number of parallel workers
         seed: Random seed
+        config_overrides: Runtime config overrides for experiment params (n_levels, max_steps, etc.)
 
     Returns:
         Dict with run summary
@@ -211,6 +143,7 @@ def run_all_experiments(
                     'output_dir': str(exp_output_dir),
                     'seed': seed,
                     'training_method': training_method,
+                    'config_overrides': config_overrides,
                 })
 
     print(f"Running {len(tasks)} experiment tasks:")
@@ -282,6 +215,144 @@ def run_all_experiments(
     return summary
 
 
+def compute_cross_experiment_correlations(
+    all_results: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Compute cross-experiment correlations from collected results.
+
+    Key correlation (PDF Exp 29): R² between probe accuracy (from level_probing)
+    and adaptation speed (from mutation_adaptation) across agents.
+
+    Args:
+        all_results: Nested dict of agent_type → step → experiment_name → results
+
+    Returns:
+        Dict with cross-experiment correlation metrics
+    """
+    import numpy as np
+
+    correlations = {}
+
+    # --- Exp 29 × Exp 1: Probe accuracy ↔ adaptation speed ---
+    # For each agent at each step, extract:
+    #   - level_probing: mean probe R² across features
+    #   - mutation_adaptation: mean adaptation speed
+    probe_accuracies = []
+    adaptation_speeds = []
+    agent_labels = []
+
+    for agent_type, steps in all_results.items():
+        for step, experiments in steps.items():
+            lp = experiments.get('level_probing', {})
+            ma = experiments.get('mutation_adaptation', {})
+
+            # Extract probe R² from level_probing results
+            lp_results = lp.get('results', {})
+            probe_r2s = []
+            # level_probing stores per-feature R² in probe_results
+            probe_results = lp_results.get('probe_results', {})
+            for feat_name, feat_data in probe_results.items():
+                if isinstance(feat_data, dict):
+                    r2 = feat_data.get('r2', feat_data.get('mean_score'))
+                    if r2 is not None:
+                        probe_r2s.append(float(r2))
+
+            # Fallback: try summary metrics
+            if not probe_r2s:
+                for key, val in lp_results.items():
+                    if 'r2' in str(key).lower() and isinstance(val, (int, float)):
+                        probe_r2s.append(float(val))
+
+            # Extract adaptation speed from mutation_adaptation results
+            ma_results = ma.get('results', {})
+            speed_data = ma_results.get('adaptation_speed', {})
+            mean_speed = speed_data.get('overall_mean_speed')
+
+            if probe_r2s and mean_speed is not None:
+                probe_accuracies.append(float(np.mean(probe_r2s)))
+                adaptation_speeds.append(float(mean_speed))
+                agent_labels.append(f"{agent_type}@{step}")
+
+    if len(probe_accuracies) >= 3:
+        probe_arr = np.array(probe_accuracies)
+        speed_arr = np.array(adaptation_speeds)
+
+        # Pearson correlation
+        corr = float(np.corrcoef(probe_arr, speed_arr)[0, 1])
+
+        # R² via linear regression
+        from sklearn.linear_model import LinearRegression
+        from sklearn.metrics import r2_score
+        model = LinearRegression()
+        model.fit(probe_arr.reshape(-1, 1), speed_arr)
+        r2 = float(r2_score(speed_arr, model.predict(probe_arr.reshape(-1, 1))))
+
+        correlations['probe_accuracy_vs_adaptation_speed'] = {
+            'pearson_r': corr,
+            'r2': r2,
+            'slope': float(model.coef_[0]),
+            'intercept': float(model.intercept_),
+            'n_datapoints': len(probe_accuracies),
+            'agent_labels': agent_labels,
+            'probe_accuracies': probe_accuracies,
+            'adaptation_speeds': adaptation_speeds,
+            'interpretation': (
+                'Positive correlation supports Exp 29 hypothesis: '
+                'agents with stronger training dynamics representations '
+                'adapt faster to mutations.'
+            ),
+        }
+    else:
+        correlations['probe_accuracy_vs_adaptation_speed'] = {
+            'error': f'Insufficient data: need >=3 agent×step pairs with both '
+                     f'level_probing and mutation_adaptation results, found {len(probe_accuracies)}',
+        }
+
+    # --- Exp 5 × Exp 29: Horizon decay rate ↔ adaptation speed ---
+    decay_rates = []
+    speeds_for_decay = []
+    labels_for_decay = []
+
+    for agent_type, steps in all_results.items():
+        for step, experiments in steps.items():
+            nep = experiments.get('n_env_prediction', {})
+            ma = experiments.get('mutation_adaptation', {})
+
+            nep_results = nep.get('results', {})
+            decay_params = nep_results.get('decay_params', {})
+
+            # Get mean decay rate across features
+            feat_decay_rates = []
+            for feat, params in decay_params.items():
+                if isinstance(params, dict) and params.get('fit_success'):
+                    feat_decay_rates.append(params['b'])
+
+            ma_results = ma.get('results', {})
+            speed_data = ma_results.get('adaptation_speed', {})
+            mean_speed = speed_data.get('overall_mean_speed')
+
+            if feat_decay_rates and mean_speed is not None:
+                decay_rates.append(float(np.mean(feat_decay_rates)))
+                speeds_for_decay.append(float(mean_speed))
+                labels_for_decay.append(f"{agent_type}@{step}")
+
+    if len(decay_rates) >= 3:
+        decay_arr = np.array(decay_rates)
+        speed_arr = np.array(speeds_for_decay)
+        corr = float(np.corrcoef(decay_arr, speed_arr)[0, 1])
+
+        correlations['horizon_decay_vs_adaptation_speed'] = {
+            'pearson_r': corr,
+            'n_datapoints': len(decay_rates),
+            'interpretation': (
+                'Negative correlation (slower decay = faster adaptation) supports '
+                'the hypothesis that longer-horizon curriculum models aid generalization.'
+            ),
+        }
+
+    return correlations
+
+
 def generate_summary_report(output_dir: str) -> Dict[str, Any]:
     """Generate summary report from experiment results."""
     output_path = Path(output_dir)
@@ -326,6 +397,11 @@ def generate_summary_report(output_dir: str) -> Dict[str, Any]:
             experiments_run.update(experiments.keys())
         summary['experiments_by_agent'][agent_type] = list(experiments_run)
 
+    # Cross-experiment correlations
+    cross_experiment = compute_cross_experiment_correlations(all_results)
+    if cross_experiment:
+        summary['cross_experiment'] = cross_experiment
+
     # Save summary
     summary_path = output_path / 'analysis_summary.json'
     with open(summary_path, 'w') as f:
@@ -335,41 +411,44 @@ def generate_summary_report(output_dir: str) -> Dict[str, Any]:
 
 
 def main():
+    from ..configs.cli import (
+        add_common_args,
+        add_experiment_param_args,
+        add_posthoc_args,
+    )
+
     parser = argparse.ArgumentParser(description="Run all experiments on checkpoints")
-    parser.add_argument('--results_dir', type=str, required=True,
-                        help='Directory containing trained agent checkpoints')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='Output directory for experiment results')
-    parser.add_argument('--training_method', type=str, default='accel',
-                        choices=['accel', 'plr', 'robust_plr', 'dr', 'paired'],
-                        help='Training method (determines which experiments to run)')
-    parser.add_argument('--agents', type=str, nargs='+', default=None,
-                        help='Agent types to run (default: method-appropriate agents)')
+
+    # Shared args
+    add_common_args(parser)
+    add_experiment_param_args(parser)
+    add_posthoc_args(parser)
+
+    # Entry-point-specific
     parser.add_argument('--experiments', type=str, nargs='+', default=None,
                         help='Experiments to run (default: method-appropriate set)')
-    parser.add_argument('--checkpoints_per_agent', type=int, default=None,
-                        help='Max checkpoints per agent (default: all)')
-    parser.add_argument('--parallel', type=int, default=1,
-                        help='Number of parallel workers')
-    parser.add_argument('--seed', type=int, default=0,
-                        help='Random seed')
     parser.add_argument('--summarize', action='store_true',
                         help='Only generate summary report from existing results')
 
     args = parser.parse_args()
 
     if args.summarize:
-        generate_summary_report(args.output_dir)
+        output_dir = args.output_dir or "."
+        generate_summary_report(output_dir)
     else:
+        # Build config overrides from experiment params
+        config_overrides = {k: getattr(args, k) for k in EXPERIMENT_PARAM_KEYS if getattr(args, k) is not None}
+
         run_all_experiments(
             results_dir=args.results_dir,
-            output_dir=args.output_dir,
+            output_dir=args.output_dir or "results",
             training_method=args.training_method,
             agents=args.agents,
             experiments=args.experiments,
             checkpoints_per_agent=args.checkpoints_per_agent,
             parallel=args.parallel,
             seed=args.seed,
+            config_overrides=config_overrides or None,
         )
 
 

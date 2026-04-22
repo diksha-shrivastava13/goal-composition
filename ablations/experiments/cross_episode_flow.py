@@ -68,25 +68,17 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "cross_episode_flow"
 
-    def __init__(
-        self,
-        n_episode_sequences: int = 20,
-        sequence_length: int = 10,
-        max_lag_to_test: int = 5,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize cross-episode flow experiment.
-
-        Args:
-            n_episode_sequences: Number of episode sequences to run
-            sequence_length: Episodes per sequence
-            max_lag_to_test: Maximum lag for memory capacity test
         """
         super().__init__(**kwargs)
-        self.n_episode_sequences = n_episode_sequences
-        self.sequence_length = sequence_length
-        self.max_lag_to_test = min(max_lag_to_test, sequence_length - 1)
+        self.n_episode_sequences = self.exp_config("n_episode_sequences")
+        self.sequence_length = self.exp_config("sequence_length")
+        self.max_lag_to_test = min(
+            self.exp_config("max_lag_to_test"),
+            self.sequence_length - 1,
+        )
 
         self._data: Optional[CrossEpisodeData] = None
         self._results: Dict[str, Any] = {}
@@ -176,13 +168,25 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
             for seq_idx in range(n_seqs):
                 wall_density = float(wall_maps[seq_idx].mean())
 
+                # Compute novelty as L2 distance of level features from running mean
+                level_feat = np.array([wall_density, float(result.episode_returns[seq_idx])])
+                if not hasattr(self, '_running_mean'):
+                    self._running_mean = level_feat.copy()
+                    self._running_count = 1
+                    novelty = 0.0
+                else:
+                    novelty = float(np.linalg.norm(level_feat - self._running_mean))
+                    self._running_count += 1
+                    alpha = 1.0 / self._running_count
+                    self._running_mean = (1 - alpha) * self._running_mean + alpha * level_feat
+
                 features = {
                     'return': float(result.episode_returns[seq_idx]),
                     'solved': 1.0 if result.episode_solved[seq_idx] else 0.0,
                     'length': int(result.episode_lengths[seq_idx]),
                     'episode_idx': ep_idx,
                     'wall_density': wall_density,
-                    'novelty_score': float(np.random.random()),
+                    'novelty_score': novelty,
                 }
 
                 ep_data = {
@@ -205,10 +209,23 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
                     )
                     ep_data['adversary_pattern'] = adversary_pattern
 
-                    if result.episode_solved[seq_idx]:
-                        regret = 0.1 + float(jax.random.uniform(adv_rng)) * 0.2
+                    # Real regret: run antagonist on this level if available
+                    ant_ts = getattr(self.train_state, 'ant_train_state', None)
+                    if ant_ts is not None:
+                        try:
+                            rng, ant_rng = jax.random.split(rng)
+                            level_i = jax.tree_util.tree_map(lambda x: x[seq_idx:seq_idx+1], levels)
+                            ant_r = batched_rollout(
+                                ant_rng, level_i, max_steps,
+                                ant_ts.apply_fn, ant_ts.params,
+                                self.agent.env, self.agent.env_params,
+                                self.agent.initialize_hidden_state(1),
+                            )
+                            regret = float(ant_r.episode_returns[0]) - float(result.episode_returns[seq_idx])
+                        except Exception:
+                            regret = float('nan')
                     else:
-                        regret = 0.5 + wall_density * 0.5
+                        regret = float('nan')
                     ep_data['regret'] = regret
                     features['regret'] = regret
 
@@ -222,9 +239,18 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
         for seq_idx in tqdm(range(n_seqs), desc="Memory probing", leave=False):
             sequence_data = all_sequence_data[seq_idx]
 
+            # Compute lag-1 accuracies first and attach to episode data
+            lag1_accuracies = self._test_lag_accuracy(sequence_data, 1)
+            for i, acc in enumerate(lag1_accuracies):
+                if i < len(sequence_data):
+                    sequence_data[i]['probe_accuracy'] = acc
+
             for lag in range(1, self.max_lag_to_test + 1):
-                accuracies = self._test_lag_accuracy(sequence_data, lag)
-                self._data.probe_accuracies_by_lag[lag].extend(accuracies)
+                if lag == 1:
+                    self._data.probe_accuracies_by_lag[lag].extend(lag1_accuracies)
+                else:
+                    accuracies = self._test_lag_accuracy(sequence_data, lag)
+                    self._data.probe_accuracies_by_lag[lag].extend(accuracies)
 
                 if self.has_regret:
                     adv_retention = self._test_adversary_pattern_retention(sequence_data, lag)
@@ -271,14 +297,26 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
             # Get hidden state from probe episode
             probe_hstate = probe_ep.get('hidden_state_tuple')
             if probe_hstate is None:
-                # Fallback to similarity-based method if tuple not available
+                # Use dense hidden state with Ridge probe to predict source features
                 source_hidden = source_ep['hidden_state']
                 probe_hidden = probe_ep['hidden_state']
-                similarity = np.dot(source_hidden, probe_hidden) / (
-                    np.linalg.norm(source_hidden) * np.linalg.norm(probe_hidden) + 1e-6
-                )
-                accuracy = (similarity + 1) / 2
-                accuracies.append(float(accuracy))
+
+                # Build feature vector from source level
+                source_features = source_ep.get('features', {})
+                if source_features:
+                    feat_vals = np.array([float(v) for v in source_features.values()])
+                    # Quick Ridge probe: predict source features from probe hidden state
+                    from sklearn.linear_model import Ridge
+                    X_train = probe_hidden.reshape(1, -1)
+                    y_train = feat_vals.reshape(1, -1)
+                    # With single sample, R² isn't meaningful — use reconstruction error
+                    pred = X_train @ np.linalg.lstsq(X_train, y_train, rcond=None)[0]
+                    recon_error = np.mean((pred - y_train) ** 2)
+                    max_var = np.var(feat_vals) + 1e-8
+                    accuracy = float(np.clip(1.0 - recon_error / max_var, 0, 1))
+                else:
+                    accuracy = 0.0
+                accuracies.append(accuracy)
                 continue
 
             # Try to decode SOURCE episode's level from PROBE's hidden state
@@ -366,22 +404,45 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
         episode_idx: int,
         rng: chex.PRNGKey,
     ) -> Dict[str, float]:
-        """
-        Compute adversary generation pattern features (PAIRED).
+        """Compute adversary generation pattern features from real network data (PAIRED).
 
-        These features characterize the adversary's strategy for this episode.
+        Uses adversary network forward pass to get action entropy and value estimate.
+        Falls back to structural features if adversary is unavailable.
         """
         wall_density = level['wall_density']
 
-        # Adversary strategy features (simulated)
-        # In real implementation, would extract from adversary policy
-        rng, r1, r2, r3 = jax.random.split(rng, 4)
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is not None:
+            try:
+                from .utils.agent_aware_loss import create_observation_from_level
+                obs = create_observation_from_level(level)
+                hstate = self.agent.initialize_hidden_state(1)
+                obs_batch = type(obs)(obs.image[None, None, ...], obs.agent_dir[None, None, ...])
+                done_batch = jnp.zeros((1, 1), dtype=bool)
 
+                outputs = adv_ts.apply_fn(adv_ts.params, (obs_batch, done_batch), hstate)
+                if len(outputs) == 4:
+                    _, pi, value, _ = outputs
+                else:
+                    _, pi, value = outputs
+
+                action_entropy = float(pi.entropy()[0, 0]) if hasattr(pi, 'entropy') else 0.5
+                value_est = float(value[0, 0])
+
+                return {
+                    'action_entropy': action_entropy,
+                    'value_estimate': value_est,
+                    'wall_density': wall_density,
+                    'episode_in_curriculum': float(episode_idx),
+                }
+            except Exception:
+                pass
+
+        # Fallback: structural features only
         return {
-            'difficulty_target': float(0.3 + jax.random.uniform(r1) * 0.5),
-            'wall_concentration': float(wall_density * (0.8 + jax.random.uniform(r2) * 0.4)),
-            'path_complexity_target': float(0.4 + jax.random.uniform(r3) * 0.4),
-            'strategy_type': float(episode_idx % 5),  # Cycle through strategy types
+            'action_entropy': 0.5,  # Unknown
+            'value_estimate': wall_density,
+            'wall_density': wall_density,
             'episode_in_curriculum': float(episode_idx),
         }
 
@@ -426,34 +487,39 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
         """
         Compute correlation between hidden state and adversary pattern features.
 
-        Higher correlation = pattern is encoded in hidden state.
+        Uses Ridge probe: fits a linear model predicting pattern features from
+        the full hidden state, returns R^2 as the encoding score.
         """
-        # Use first few dimensions of h-state as proxy for pattern encoding
         pattern_values = np.array(list(pattern.values()))
 
-        # Select dimensions that could encode pattern (heuristic: first N dims)
-        n_pattern_dims = min(len(pattern_values) * 10, len(hstate))
-        hstate_region = hstate[:n_pattern_dims]
+        # If we have collected enough hstate-pattern pairs, use Ridge probe
+        if hasattr(self, '_pattern_hstates') and len(self._pattern_hstates) >= 5:
+            from sklearn.linear_model import Ridge
+            X = np.array(self._pattern_hstates)
+            y = np.array(self._pattern_values)
+            try:
+                model = Ridge(alpha=1.0)
+                model.fit(X, y)
+                score = model.score(X, y)
+                return float(max(score, 0.0))
+            except Exception:
+                pass
 
-        # Compute proxy for pattern encoding:
-        # Check if h-state variance in pattern-related dims correlates with pattern features
-        # Simplified: use mean activation as proxy
-        region_means = []
-        dim_per_feature = n_pattern_dims // len(pattern_values)
+        # Collect hstate-pattern pairs for future Ridge probe
+        if not hasattr(self, '_pattern_hstates'):
+            self._pattern_hstates = []
+            self._pattern_values = []
+        self._pattern_hstates.append(hstate.copy())
+        self._pattern_values.append(pattern_values.copy())
 
-        for i in range(len(pattern_values)):
-            start = i * dim_per_feature
-            end = start + dim_per_feature
-            region_mean = np.mean(np.abs(hstate_region[start:end]))
-            region_means.append(region_mean)
-
-        region_means = np.array(region_means)
-
-        # Correlation between region activations and pattern values
-        if np.std(region_means) < 1e-6 or np.std(pattern_values) < 1e-6:
+        # Fallback for first few samples: simple correlation
+        self._used_fallback_scoring = True
+        if np.std(hstate) < 1e-6 or np.std(pattern_values) < 1e-6:
             return 0.0
 
-        correlation = np.corrcoef(region_means, pattern_values)[0, 1]
+        # Use full hstate correlation with pattern as simple fallback
+        n_dims = min(len(pattern_values), len(hstate))
+        correlation = np.corrcoef(hstate[:n_dims], pattern_values[:n_dims])[0, 1]
         return float(np.abs(correlation)) if not np.isnan(correlation) else 0.0
 
     def analyze(self) -> Dict[str, Any]:
@@ -481,6 +547,10 @@ class CrossEpisodeFlowExperiment(CheckpointExperiment):
         if self.has_regret and self._data.adversary_pattern_retention_by_lag:
             results['adversary_pattern_retention'] = self._analyze_adversary_pattern_retention()
             results['regret_memory_relationship'] = self._analyze_regret_memory_relationship()
+
+        # Flag if fallback correlation scoring was used instead of Ridge probe
+        if getattr(self, '_used_fallback_scoring', False):
+            results['encoding_score_is_fallback'] = True
 
         self._results = results
         return results

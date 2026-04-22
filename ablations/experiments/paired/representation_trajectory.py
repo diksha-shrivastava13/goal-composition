@@ -47,19 +47,12 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "representation_trajectory"
 
-    def __init__(
-        self,
-        n_samples_per_step: int = 50,
-        trajectory_length: int = 100,
-        hidden_dim: int = 256,
-        reduced_dim: int = 20,  # For tractable VAR
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples_per_step = n_samples_per_step
-        self.trajectory_length = trajectory_length
-        self.hidden_dim = hidden_dim
-        self.reduced_dim = reduced_dim
+        self.n_samples_per_step = self.exp_config("n_samples_per_step")
+        self.trajectory_length = self.exp_config("trajectory_length")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.reduced_dim = self.exp_config("reduced_dim")
         self._trajectory: List[TrajectoryPoint] = []
         self._require_paired()
 
@@ -82,7 +75,7 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         step: int,
     ) -> TrajectoryPoint:
         """Collect data for a single trajectory point using real network evaluations."""
-        rng, level_rng, h_rng, val_rng, act_rng = jax.random.split(rng, 5)
+        rng, level_rng, h_rng, val_rng, act_rng, diff_rng = jax.random.split(rng, 6)
 
         # Generate real levels for this trajectory point
         levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
@@ -92,8 +85,10 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         mean_wall_density = float(batch_features['wall_density'].mean())
         mean_goal_distance = float(batch_features['goal_distance'].mean())
 
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties = compute_difficulty(levels, self, diff_rng)
         adversary_features = {
-            'difficulty': mean_wall_density + mean_goal_distance * 0.1,
+            'difficulty': float(np.mean(difficulties)),
             'wall_density_target': mean_wall_density,
         }
 
@@ -132,8 +127,20 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         var_results = self._fit_var_model()
         results['var_model'] = var_results
 
+        # Flag low-confidence results if R² is very low
+        r2 = var_results.get('r2', 0.0)
+        if isinstance(r2, float) and r2 < 0.1:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"VAR model R²={r2:.3f} < 0.1 — results may be unreliable"
+            )
+            results['low_confidence'] = True
+        else:
+            results['low_confidence'] = False
+
         # Decompose variance
         results['adversary_driven_fraction'] = self._compute_adversary_fraction(var_results)
+        results['adversary_fraction_is_approximate'] = True
         results['autonomous_fraction'] = 1.0 - results['adversary_driven_fraction']
 
         # Representation velocity

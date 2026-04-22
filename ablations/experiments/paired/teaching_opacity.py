@@ -13,8 +13,8 @@ import chex
 
 from ..base import CheckpointExperiment
 from ..utils.paired_helpers import (
-    generate_levels, extract_level_features_batch, get_pro_hstates,
-    get_action_distribution, get_values_from_rollout,
+    generate_levels, generate_adversary_levels, extract_level_features_batch,
+    get_pro_hstates, get_action_distribution, get_values_from_rollout,
 )
 
 
@@ -45,19 +45,15 @@ class TeachingOpacityExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "teaching_opacity"
 
-    def __init__(
-        self,
-        n_samples: int = 500,
-        n_adversary_strategies: int = 5,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples = n_samples
-        self.n_adversary_strategies = n_adversary_strategies
-        self.hidden_dim = hidden_dim
+        self.n_samples = self.exp_config("n_samples")
+        self.n_adversary_strategies = self.exp_config("n_adversary_strategies")
+        self.hidden_dim = self.exp_config("hidden_dim")
+        self.n_strategy_clusters = self.exp_config("n_strategy_clusters")
         self._measurements: List[OpacityMeasurement] = []
         self._strategy_predictor_weights: Optional[Dict] = None
+        self._max_diagonal: Optional[float] = None
         self._require_paired()
 
     def _require_paired(self):
@@ -66,18 +62,46 @@ class TeachingOpacityExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> List[OpacityMeasurement]:
         """Collect opacity measurements using real network data."""
-        # First train strategy predictor on real data
+        # Compute max grid diagonal FIRST (needed by _train_strategy_predictor)
+        env_inner = getattr(self.agent.env, '_env', self.agent.env)
+        env_h = getattr(env_inner, 'max_height', 13)
+        env_w = getattr(env_inner, 'max_width', 13)
+        self._max_diagonal = float(np.sqrt(env_h**2 + env_w**2))
+
+        # Train strategy predictor on real data
         rng, train_rng = jax.random.split(rng)
         self._train_strategy_predictor(train_rng)
 
-        # Generate real levels and get real protagonist hidden states
+        # Generate levels using adversary policy if available, else random
         rng, level_rng, hstate_rng = jax.random.split(rng, 3)
-        levels = generate_levels(self.agent, level_rng, self.n_samples)
+        rng, diff_rng = jax.random.split(rng)
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is not None:
+            levels = generate_adversary_levels(self.agent, adv_ts, level_rng, self.n_samples)
+        else:
+            levels = generate_levels(self.agent, level_rng, self.n_samples)
         hstates = get_pro_hstates(hstate_rng, levels, self)
         self.hidden_dim = hstates.shape[1]
 
         # Extract level features as adversary strategy proxy
         features_batch = extract_level_features_batch(levels)
+
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties_arr = compute_difficulty(levels, self, diff_rng)
+
+        # Pre-compute data-driven terciles for strategy classification
+        wds = np.array(features_batch['wall_density'])
+        gds = np.array(features_batch['goal_distance']) / self._max_diagonal
+        self._wd_terciles = (float(np.percentile(wds, 33)), float(np.percentile(wds, 67)))
+        self._gd_terciles = (float(np.percentile(gds, 33)), float(np.percentile(gds, 67)))
+
+        # Fit k-means clustering on [wall_density, goal_distance_norm] for strategy types
+        from sklearn.cluster import KMeans
+        cluster_features = np.column_stack([wds, gds])
+        n_clusters = min(self.n_strategy_clusters, len(wds))
+        kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+        self._strategy_labels = kmeans.fit_predict(cluster_features)
+        self._kmeans = kmeans
 
         for i in range(self.n_samples):
             wall_density = float(features_batch['wall_density'][i])
@@ -85,13 +109,11 @@ class TeachingOpacityExperiment(CheckpointExperiment):
 
             # Adversary "strategy" = the level properties it chose
             strategy = {
-                'difficulty': wall_density * 0.5 + goal_distance * 0.05,
+                'difficulty': float(difficulties_arr[i]),
                 'wall_focus': wall_density,
-                'distance_focus': goal_distance / 18.4,  # Normalize by max grid diagonal
+                'distance_focus': goal_distance / self._max_diagonal,
                 'variation': float(np.std(np.array(levels.wall_map)[i])),
-                'strategy_type': float(
-                    self._classify_strategy(wall_density, goal_distance)
-                ),
+                'strategy_type': float(self._strategy_labels[i]),
             }
 
             h = hstates[i]
@@ -126,29 +148,23 @@ class TeachingOpacityExperiment(CheckpointExperiment):
 
         return self._measurements
 
-    def _classify_strategy(self, wall_density: float, goal_distance: float) -> int:
-        """Classify level into discrete strategy type based on features."""
-        if wall_density > 0.3 and goal_distance > 8.0:
-            return 0  # Hard: dense walls + far goal
-        elif wall_density > 0.3:
-            return 1  # Wall-heavy
-        elif goal_distance > 8.0:
-            return 2  # Distance-heavy
-        elif wall_density < 0.1:
-            return 3  # Open/easy
-        else:
-            return 4  # Moderate
-
     def _train_strategy_predictor(self, rng: chex.PRNGKey):
         """Train a probe to predict adversary strategy from real protagonist h-state."""
-        rng, level_rng, hstate_rng = jax.random.split(rng, 3)
+        rng, level_rng, hstate_rng, diff_rng = jax.random.split(rng, 4)
 
         n_train = 200
-        levels = generate_levels(self.agent, level_rng, n_train)
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+        if adv_ts is not None:
+            levels = generate_adversary_levels(self.agent, adv_ts, level_rng, n_train)
+        else:
+            levels = generate_levels(self.agent, level_rng, n_train)
         training_hstates = get_pro_hstates(hstate_rng, levels, self)
         self.hidden_dim = training_hstates.shape[1]
 
         features_batch = extract_level_features_batch(levels)
+
+        from ..utils.paired_helpers import compute_difficulty
+        train_difficulties = compute_difficulty(levels, self, diff_rng)
 
         # Build strategy targets from real level features
         training_strategies = []
@@ -156,9 +172,9 @@ class TeachingOpacityExperiment(CheckpointExperiment):
             wd = float(features_batch['wall_density'][i])
             gd = float(features_batch['goal_distance'][i])
             training_strategies.append([
-                wd * 0.5 + gd * 0.05,  # difficulty
+                float(train_difficulties[i]),  # difficulty
                 wd,                      # wall_focus
-                gd / 18.4,              # distance_focus (normalized)
+                gd / self._max_diagonal,  # distance_focus (normalized)
             ])
 
         training_strategies = np.array(training_strategies)

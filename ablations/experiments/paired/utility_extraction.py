@@ -87,17 +87,11 @@ class UtilityExtractionExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "utility_extraction"
 
-    def __init__(
-        self,
-        n_samples: int = 500,
-        use_pysr: bool = True,
-        pysr_iterations: int = 100,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples = n_samples
-        self.use_pysr = use_pysr
-        self.pysr_iterations = pysr_iterations
+        self.n_samples = self.exp_config("n_samples")
+        self.use_pysr = self.exp_config("use_pysr")
+        self.pysr_iterations = self.exp_config("pysr_iterations")
         self._data: Optional[UtilityExtractionData] = None
         self._require_paired()
 
@@ -140,7 +134,7 @@ class UtilityExtractionExperiment(CheckpointExperiment):
         self._data = UtilityExtractionData()
         training_step = getattr(self.train_state, 'update_count', 0)
         n = self.n_samples
-        max_steps = 256
+        max_steps = self.config.get("max_steps", 256)
 
         # --- Generate all levels at once ---
         _log("generate_levels", msg="Generating levels via vmap...")
@@ -222,11 +216,11 @@ class UtilityExtractionExperiment(CheckpointExperiment):
         self._data.regrets = regrets.tolist()
         self._data.training_steps = [training_step] * n
 
-        # Adversary entropy (placeholder per level)
-        rng_entropies = jax.random.split(rng, n)
-        self._data.adversary_entropies = [
-            self._compute_adversary_entropy(rng_entropies[i]) for i in range(n)
-        ]
+        # Adversary entropy via batch rollout through MazeEditor
+        rng, entropy_rng = jax.random.split(rng)
+        self._data.adversary_entropies = self._compute_adversary_entropy_batch(
+            entropy_rng, n
+        )
 
         _log("collect_data_done", msg=f"Data collection complete ({n} samples)")
         return self._data
@@ -320,7 +314,10 @@ class UtilityExtractionExperiment(CheckpointExperiment):
         )
 
         try:
-            rng = jax.random.PRNGKey(hash(str(level.get('wall_map', [[]])[0][:3])) % 2**31)
+            # Derive seed from level content (deterministic, no hash(str(...)))
+            wall_arr = np.asarray(level.get('wall_map', [[0]])).flatten()
+            seed_val = int(np.sum(wall_arr * np.arange(1, len(wall_arr) + 1)) % (2**31))
+            rng = jax.random.PRNGKey(seed_val)
             total_loss, loss_metrics = compute_agent_prediction_loss(
                 self.agent, self.train_state, level, rng,
             )
@@ -329,39 +326,31 @@ class UtilityExtractionExperiment(CheckpointExperiment):
                 'goal_loss': loss_metrics.get('goal_loss', total_loss / 3),
                 'total_loss': total_loss,
             }
-        except Exception:
-            # Fallback: compute from hstate distance to level features
-            hstate_flat = np.array(hstate).flatten()
-            wall_map_flat = np.array(level['wall_map']).flatten()
-            # Use cosine similarity as proxy for prediction quality
-            h_norm = np.linalg.norm(hstate_flat[:len(wall_map_flat)])
-            w_norm = np.linalg.norm(wall_map_flat)
-            if h_norm > 0 and w_norm > 0:
-                cos_sim = np.dot(hstate_flat[:len(wall_map_flat)], wall_map_flat) / (h_norm * w_norm)
-                wall_loss = float(1.0 - abs(cos_sim))
-            else:
-                wall_loss = 1.0
-            return {
-                'wall_loss': wall_loss,
-                'goal_loss': 1.0 - wall_loss * 0.5,
-                'total_loss': wall_loss + (1.0 - wall_loss * 0.5),
-            }
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Per-feature probe loss failed: {e}. Returning error dict."
+            )
+            return {'error': str(e), 'wall_loss': float('nan'), 'goal_loss': float('nan'), 'total_loss': float('nan')}
 
-    def _compute_adversary_entropy(self, rng: chex.PRNGKey) -> float:
-        """Compute adversary generation entropy from real policy."""
+    def _compute_adversary_entropy_batch(self, rng: chex.PRNGKey, n: int) -> List[float]:
+        """Compute adversary generation entropy for n levels in a single batch.
+
+        Uses run_adversary_rollout() to get real per-level entropy from the
+        adversary's MazeEditor rollout. Falls back to zeros if adv_train_state
+        is unavailable.
+        """
         adv_ts = getattr(self.train_state, 'adv_train_state', None)
-        if adv_ts is None:
-            return 0.0
-        try:
-            # Generate a level and get adversary's action entropy
-            from ..utils.paired_helpers import generate_levels, get_action_distribution
-            levels = generate_levels(self.agent, rng, 1)
-            _, entropies = get_action_distribution(adv_ts, self.agent, levels, rng)
-            # Mean entropy across steps (excluding NaN)
-            valid = entropies[~np.isnan(entropies)]
-            return float(np.mean(valid)) if len(valid) > 0 else 0.0
-        except Exception:
-            return 0.0
+        if adv_ts is not None:
+            from ..utils.paired_helpers import run_adversary_rollout
+            adv_result = run_adversary_rollout(self.agent, adv_ts, rng, n)
+            return adv_result.per_level_entropy.tolist()
+        else:
+            import logging
+            logging.getLogger(__name__).warning(
+                "No adv_train_state; adversary entropy will be 0.0"
+            )
+            return [0.0] * n
 
     def analyze(self) -> Dict[str, Any]:
         """Fit symbolic regression and extract Û."""
@@ -415,6 +404,9 @@ class UtilityExtractionExperiment(CheckpointExperiment):
 
         # 6. Causal validation sub-metrics (A1 causal claims)
         results['causal_validation'] = self._compute_causal_validation(X, y_pred_loss, y_regret)
+
+        # 7. MLP probe: h-states → regret (proxy for U*)
+        results['mlp_probe_u_star'] = self._fit_mlp_probe(y_regret)
 
         return results
 
@@ -699,6 +691,51 @@ class UtilityExtractionExperiment(CheckpointExperiment):
                 f"{'Causally valid.' if causal_fidelity > 0.3 and counterfactual_consistency > 0.7 else 'Causal claims need scrutiny.'}"
             ),
         }
+
+    def _fit_mlp_probe(self, y_regret: np.ndarray) -> Dict[str, Any]:
+        """Train MLP probe on protagonist h-states → regret (proxy for U*)."""
+        if self._data is None:
+            return {'error': 'No data available'}
+
+        data = self._data.to_arrays()
+        hstates = data.get('pro_hstates', None)
+        if hstates is None or len(hstates) == 0:
+            return {'error': 'No protagonist h-states available'}
+
+        # Align valid samples
+        valid = np.isfinite(y_regret)
+        if valid.sum() < 50:
+            return {'error': 'Insufficient valid samples for MLP probe'}
+
+        X_h = hstates[valid]
+        y = y_regret[valid]
+
+        from sklearn.neural_network import MLPRegressor
+        from sklearn.model_selection import cross_val_score
+        from sklearn.preprocessing import StandardScaler
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_h)
+
+        try:
+            mlp = MLPRegressor(
+                hidden_layer_sizes=(64, 32),
+                max_iter=500,
+                early_stopping=True,
+                validation_fraction=0.15,
+                random_state=42,
+            )
+            scores = cross_val_score(mlp, X_scaled, y, cv=5, scoring='r2')
+            mlp.fit(X_scaled, y)
+            train_r2 = float(mlp.score(X_scaled, y))
+            return {
+                'cv_r2_mean': float(np.mean(scores)),
+                'cv_r2_std': float(np.std(scores)),
+                'train_r2': train_r2,
+                'n_samples': int(valid.sum()),
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
     def visualize(self) -> Dict[str, np.ndarray]:
         """Create visualizations."""

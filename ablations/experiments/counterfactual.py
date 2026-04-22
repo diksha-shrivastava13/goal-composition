@@ -87,25 +87,16 @@ class CounterfactualExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "counterfactual"
 
-    def __init__(
-        self,
-        n_episodes_per_condition: int = 100,
-        injection_strength: float = 1.0,
-        n_injection_episodes: int = 10,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize counterfactual experiment.
-
-        Args:
-            n_episodes_per_condition: Episodes per injection condition
-            injection_strength: How strongly to inject false history
-            n_injection_episodes: Number of fake episodes to simulate
         """
         super().__init__(**kwargs)
-        self.n_episodes_per_condition = n_episodes_per_condition
-        self.injection_strength = injection_strength
-        self.n_injection_episodes = n_injection_episodes
+        self.n_episodes_per_condition = self.exp_config("n_episodes_per_condition")
+        self.injection_strength = self.exp_config("injection_strength")
+        self.n_injection_episodes = self.exp_config("n_injection_episodes")
+        self.antagonist_rollout_steps = self.exp_config("antagonist_rollout_steps")
+        self.regret_conditioning_steps = self.exp_config("regret_conditioning_steps")
 
         self._baseline_result: Optional[InjectionResult] = None
         self._injection_results: Dict[InjectionType, InjectionResult] = {}
@@ -143,7 +134,7 @@ class CounterfactualExperiment(CheckpointExperiment):
 
         results = {}
         n = self.n_episodes_per_condition
-        max_steps = 256
+        max_steps = self.config.get("max_steps", 256)
 
         # Determine injection types based on training method
         if self.has_regret:
@@ -273,13 +264,21 @@ class CounterfactualExperiment(CheckpointExperiment):
             return base_hstate
 
         if injection_type == InjectionType.SUCCESS_HISTORY:
-            pattern = create_success_history(self.n_injection_episodes)
+            rng, hist_rng = jax.random.split(rng)
+            pattern = create_success_history(
+                agent=self.agent, train_state=self.train_state,
+                rng=hist_rng, n_episodes=self.n_injection_episodes,
+            )
             return inject_hidden_state(
                 base_hstate, pattern, self.injection_strength
             )
 
         elif injection_type == InjectionType.FAILURE_HISTORY:
-            pattern = create_failure_history(self.n_injection_episodes)
+            rng, hist_rng = jax.random.split(rng)
+            pattern = create_failure_history(
+                agent=self.agent, train_state=self.train_state,
+                rng=hist_rng, n_episodes=self.n_injection_episodes,
+            )
             return inject_hidden_state(
                 base_hstate, pattern, self.injection_strength
             )
@@ -309,7 +308,8 @@ class CounterfactualExperiment(CheckpointExperiment):
     ) -> Any:
         """
         Get antagonist hidden states for bilateral injection (PAIRED).
-        Runs antagonist for 10 steps on n levels to populate hidden states.
+        Runs antagonist for self.antagonist_rollout_steps on n levels to
+        populate hidden states.
         """
         ant_train_state = getattr(self.train_state, 'ant_train_state', None)
         if ant_train_state is None:
@@ -319,9 +319,9 @@ class CounterfactualExperiment(CheckpointExperiment):
         level_rngs = jax.random.split(rng_levels, n)
         conditioning_levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
 
-        # Short rollout (10 steps) to populate antagonist hidden state
+        # Short rollout to populate antagonist hidden state
         result = batched_rollout(
-            rng_rollout, conditioning_levels, 10,
+            rng_rollout, conditioning_levels, self.antagonist_rollout_steps,
             ant_train_state.apply_fn,
             ant_train_state.params,
             self.agent.env, self.agent.env_params,
@@ -338,15 +338,53 @@ class CounterfactualExperiment(CheckpointExperiment):
     ) -> Any:
         """
         Get hidden states from regret-conditioned context (PAIRED).
-        Runs protagonist for 20 steps on n conditioning levels.
-        """
-        rng, rng_levels, rng_rollout = jax.random.split(rng, 3)
-        level_rngs = jax.random.split(rng_levels, n)
-        conditioning_levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
 
-        # Short rollout (20 steps) to build conditioned hidden state
+        Generates levels filtered by difficulty based on source_regret:
+        - 'high': keeps only top-tercile wall_density levels
+        - 'low': keeps only bottom-tercile wall_density levels
+
+        Runs protagonist for self.regret_conditioning_steps on the filtered
+        levels to build conditioned hidden state.
+        """
+        # Generate 3x more levels than needed, then filter by difficulty
+        n_generate = n * 3
+        rng, rng_levels = jax.random.split(rng)
+        level_rngs = jax.random.split(rng_levels, n_generate)
+        all_levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
+        jax.block_until_ready(all_levels)
+
+        # Compute wall density for filtering
+        wall_maps = np.array(all_levels.wall_map)
+        wall_densities = wall_maps.mean(axis=tuple(range(1, wall_maps.ndim)))
+
+        # Filter by difficulty tercile
+        p33 = np.percentile(wall_densities, 33)
+        p67 = np.percentile(wall_densities, 67)
+
+        if source_regret == 'high':
+            mask = wall_densities >= p67
+        elif source_regret == 'low':
+            mask = wall_densities <= p33
+        else:
+            mask = np.ones(n_generate, dtype=bool)
+
+        selected_indices = np.where(mask)[0][:n]
+
+        # If not enough levels pass the filter, pad with what we have
+        if len(selected_indices) < n:
+            extra = np.random.choice(
+                np.where(mask)[0], size=n - len(selected_indices), replace=True
+            )
+            selected_indices = np.concatenate([selected_indices, extra])
+
+        conditioning_levels = jax.tree_util.tree_map(
+            lambda x: x[selected_indices], all_levels
+        )
+
+        # Short rollout to build conditioned hidden state
+        rng, rng_rollout = jax.random.split(rng)
         result = batched_rollout(
-            rng_rollout, conditioning_levels, 20,
+            rng_rollout, conditioning_levels, self.regret_conditioning_steps,
             self.train_state.apply_fn,
             self.train_state.params,
             self.agent.env, self.agent.env_params,

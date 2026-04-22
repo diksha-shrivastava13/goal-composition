@@ -5,7 +5,7 @@ over all environments in parallel. Supports optional per-step collection
 of values, rewards, actions, entropies, and hidden-state snapshots.
 """
 
-from typing import NamedTuple, Optional, List
+from typing import NamedTuple, Optional, List, Dict, Any
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -120,7 +120,9 @@ def batched_rollout(
         # Forward pass: obs (n_envs, *obs_shape) -> add time dim -> (1, n_envs, *obs_shape)
         obs_batch = jax.tree_util.tree_map(lambda x: x[None, ...], obs)
         done_batch = ep_done[None, :]  # (1, n_envs)
-        hstate, pi, value = apply_fn(params, (obs_batch, done_batch), hstate)
+        _result = apply_fn(params, (obs_batch, done_batch), hstate)
+        # Indexed access safely ignores extra return values from different network architectures
+        hstate, pi, value = _result[0], _result[1], _result[2]
 
         # --- Collect at positive steps ---
         current_step = step_idx + 1  # 1-indexed
@@ -279,3 +281,152 @@ def batched_rollout(
         hstates_by_step=hstates_by_step,
         final_hstate=out_final_hstate,
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared helper functions (agent-generic, used by both universal and PAIRED
+# experiments).  These were originally in paired_helpers.py but are not
+# PAIRED-specific.
+# ---------------------------------------------------------------------------
+
+def generate_levels(agent, rng: chex.PRNGKey, n: int):
+    """Generate n random levels using the agent's environment.
+
+    Returns:
+        levels: Batched Level pytree with leading dim n
+    """
+    level_rngs = jax.random.split(rng, n)
+    levels = jax.vmap(agent.sample_random_level)(level_rngs)
+    jax.block_until_ready(levels)
+    return levels
+
+
+def generate_constrained_levels(agent, rng: chex.PRNGKey, n: int,
+                                difficulty_range=(0.0, 1.0)):
+    """Generate levels filtered to a difficulty range.
+
+    Oversamples and filters by BFS path-length difficulty.
+    """
+    oversample = max(n * 4, 100)
+    gen_rng, sel_rng = jax.random.split(rng)
+    candidates = generate_levels(agent, gen_rng, oversample)
+
+    # Compute difficulty via BFS path length
+    difficulties = np.array([
+        compute_difficulty_single(candidates, i)
+        for i in range(oversample)
+    ])
+
+    lo, hi = difficulty_range
+    mask = (difficulties >= lo) & (difficulties <= hi)
+    valid_indices = np.where(mask)[0]
+
+    if len(valid_indices) < n:
+        # Fall back to all candidates
+        selected = np.arange(min(n, oversample))
+    else:
+        selected = jax.random.choice(
+            sel_rng, valid_indices, shape=(n,), replace=False
+        )
+
+    return jax.tree_util.tree_map(lambda x: x[selected], candidates)
+
+
+def levels_to_dicts(levels, n: int) -> List[Dict[str, Any]]:
+    """Convert batched Level pytree to list of plain dicts."""
+    wall_maps = np.array(levels.wall_map)
+    goal_positions = np.array(levels.goal_pos)
+    agent_positions = np.array(levels.agent_pos)
+
+    result = []
+    for i in range(n):
+        d = {
+            'wall_map': wall_maps[i],
+            'wall_density': float(wall_maps[i].mean()),
+            'goal_pos': tuple(int(x) for x in goal_positions[i])
+                if goal_positions.ndim > 1
+                else (int(goal_positions[i]),),
+            'agent_pos': tuple(int(x) for x in agent_positions[i])
+                if agent_positions.ndim > 1
+                else (int(agent_positions[i]),),
+        }
+        result.append(d)
+    return result
+
+
+def mutate_level_walls(level, rng, k):
+    """Toggle k random interior walls in a Level struct.
+
+    Args:
+        level: A single Level struct (unbatched).
+        rng: JAX random key.
+        k: Number of walls to toggle.
+
+    Returns:
+        New Level with k interior wall cells toggled.
+    """
+    wall_map = np.array(level.wall_map)
+    h, w = wall_map.shape
+    interior = [(i, j) for i in range(1, h - 1) for j in range(1, w - 1)]
+    indices = jax.random.choice(rng, len(interior), shape=(min(k, len(interior)),), replace=False)
+    for idx in np.array(indices):
+        r, c = interior[idx]
+        wall_map[r, c] = 1 - wall_map[r, c]
+    return level.replace(wall_map=jnp.array(wall_map))
+
+
+def compute_bfs_path_length(wall_map_np, agent_pos, goal_pos) -> int:
+    """Compute BFS shortest path length on a grid.
+
+    Returns path length, or -1 if no path exists.
+    """
+    from collections import deque
+    h, w = wall_map_np.shape
+    start = (int(agent_pos[0]), int(agent_pos[1]))
+    end = (int(goal_pos[0]), int(goal_pos[1]))
+
+    if start == end:
+        return 0
+    if wall_map_np[start[0], start[1]] == 1 or wall_map_np[end[0], end[1]] == 1:
+        return -1
+
+    visited = set()
+    visited.add(start)
+    queue = deque([(start, 0)])
+
+    while queue:
+        (r, c), dist = queue.popleft()
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and (nr, nc) not in visited and wall_map_np[nr][nc] == 0:
+                if (nr, nc) == end:
+                    return dist + 1
+                visited.add((nr, nc))
+                queue.append(((nr, nc), dist + 1))
+    return -1
+
+
+def compute_difficulty_single(levels, idx: int) -> float:
+    """Compute difficulty for a single level in a batched Level pytree.
+
+    Difficulty = BFS path length / grid area.  Returns 0 if no path.
+    """
+    wall_map = np.array(levels.wall_map[idx])
+    agent_pos = np.array(levels.agent_pos[idx])
+    goal_pos = np.array(levels.goal_pos[idx])
+
+    path_len = compute_bfs_path_length(wall_map, agent_pos, goal_pos)
+    if path_len <= 0:
+        return 0.0
+    h, w = wall_map.shape
+    return float(path_len) / float(h * w)
+
+
+def compute_difficulty(levels) -> np.ndarray:
+    """Compute difficulty for all levels in a batched Level pytree.
+
+    Returns:
+        np.ndarray of shape (n,) with difficulty scores.
+    """
+    n = np.array(levels.wall_map).shape[0]
+    return np.array([compute_difficulty_single(levels, i) for i in range(n)])

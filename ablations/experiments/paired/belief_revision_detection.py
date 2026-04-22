@@ -47,21 +47,13 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "belief_revision_detection"
 
-    def __init__(
-        self,
-        n_samples_per_step: int = 50,
-        trajectory_length: int = 200,
-        detection_window: int = 10,
-        sigma_threshold: float = 2.0,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples_per_step = n_samples_per_step
-        self.trajectory_length = trajectory_length
-        self.detection_window = detection_window
-        self.sigma_threshold = sigma_threshold
-        self.hidden_dim = hidden_dim
+        self.n_samples_per_step = self.exp_config("n_samples_per_step")
+        self.trajectory_length = self.exp_config("trajectory_length")
+        self.detection_window = self.exp_config("detection_window")
+        self.sigma_threshold = self.exp_config("sigma_threshold")
+        self.hidden_dim = self.exp_config("hidden_dim")
         self._trajectory_data: List[Dict[str, Any]] = []
         self._events: List[BeliefRevisionEvent] = []
         self._require_paired()
@@ -81,7 +73,7 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
 
     def _collect_step_data(self, rng: chex.PRNGKey, step: int) -> Dict[str, Any]:
         """Collect data for a single step using real network evaluations."""
-        rng, level_rng, h_rng, val_rng, act_rng = jax.random.split(rng, 5)
+        rng, level_rng, h_rng, val_rng, act_rng, diff_rng = jax.random.split(rng, 6)
 
         # Generate real levels for this step
         levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
@@ -96,8 +88,10 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
         wall_density_std = float(batch_features['wall_density'].std())
         level_type_shift = wall_density_std > 0.15  # High variance indicates mixed types
 
+        from ..utils.paired_helpers import compute_difficulty
+        difficulties = compute_difficulty(levels, self, diff_rng)
         adversary_features = {
-            'difficulty': mean_wall_density + mean_goal_distance * 0.1,
+            'difficulty': float(np.mean(difficulties)),
             'level_type_shift': level_type_shift,
             'wall_density': mean_wall_density,
         }
@@ -137,73 +131,91 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
         return float(-np.sum(probs * np.log(probs + 1e-10)))
 
     def detect_events(self) -> List[BeliefRevisionEvent]:
-        """Detect belief revision events."""
+        """Detect belief revision events using probe-based detection.
+
+        Instead of z-scores on raw changes, trains Ridge probes on sliding
+        baseline windows and detects revision events where probe accuracy
+        drops significantly, then measures recovery rate.
+        """
         if len(self._trajectory_data) < self.detection_window * 2:
             return []
 
+        from sklearn.linear_model import Ridge
+
         events = []
+        n = len(self._trajectory_data)
 
-        # Compute running statistics
-        value_changes = []
-        policy_changes = []
-        repr_changes = []
+        # Collect h-states and difficulty targets
+        hstates = np.array([d['hstate_mean'] for d in self._trajectory_data])
+        difficulties = np.array([
+            d.get('wall_density', d.get('difficulty', 0.0))
+            for d in self._trajectory_data
+        ])
 
-        for i in range(1, len(self._trajectory_data)):
-            curr = self._trajectory_data[i]
-            prev = self._trajectory_data[i - 1]
+        # Sliding window probe-based detection
+        window = self.detection_window
+        accuracy_drop_threshold = 0.20  # Flag revision when accuracy drops > 20%
 
-            # Value change
-            v_change = abs(curr['value_mean'] - prev['value_mean'])
-            value_changes.append(v_change)
+        for i in range(window, n - window):
+            # Baseline window: [i - window, i)
+            baseline_h = hstates[i - window:i]
+            baseline_y = difficulties[i - window:i]
 
-            # Policy change (entropy change as proxy)
-            p_change = abs(curr['policy_entropy'] - prev['policy_entropy'])
-            policy_changes.append(p_change)
+            # Test window: [i, i + window)
+            test_h = hstates[i:i + window]
+            test_y = difficulties[i:i + window]
 
-            # Representation change
-            r_change = np.linalg.norm(curr['hstate_mean'] - prev['hstate_mean'])
-            repr_changes.append(r_change)
+            if np.std(baseline_y) < 1e-8 or np.std(test_y) < 1e-8:
+                continue
 
-        # Compute running mean and std
-        for i in range(self.detection_window, len(value_changes)):
-            window_start = i - self.detection_window
+            try:
+                probe = Ridge(alpha=1.0)
+                probe.fit(baseline_h, baseline_y)
 
-            # Running statistics
-            v_mean = np.mean(value_changes[window_start:i])
-            v_std = np.std(value_changes[window_start:i]) + 1e-10
-            p_mean = np.mean(policy_changes[window_start:i])
-            p_std = np.std(policy_changes[window_start:i]) + 1e-10
-            r_mean = np.mean(repr_changes[window_start:i])
-            r_std = np.std(repr_changes[window_start:i]) + 1e-10
+                # Baseline R² (on training data)
+                baseline_r2 = float(probe.score(baseline_h, baseline_y))
 
-            # Current changes
-            v_curr = value_changes[i]
-            p_curr = policy_changes[i]
-            r_curr = repr_changes[i]
+                # Test R² (on next window)
+                test_r2 = float(probe.score(test_h, test_y))
 
-            # Z-scores
-            v_z = (v_curr - v_mean) / v_std
-            p_z = (p_curr - p_mean) / p_std
-            r_z = (r_curr - r_mean) / r_std
+                accuracy_drop = baseline_r2 - test_r2
 
-            # Detect event if all exceed threshold
-            if v_z > self.sigma_threshold and p_z > self.sigma_threshold and r_z > self.sigma_threshold:
-                step = i + 1  # Offset for indexing
+                if accuracy_drop > accuracy_drop_threshold:
+                    # Measure recovery: how quickly does probe accuracy recover?
+                    recovery_steps = 0
+                    for j in range(i + 1, min(n - window, i + window * 3)):
+                        recovery_h = hstates[j:j + window]
+                        recovery_y = difficulties[j:j + window]
+                        if np.std(recovery_y) < 1e-8:
+                            continue
+                        recovery_r2 = float(probe.score(recovery_h, recovery_y))
+                        if recovery_r2 >= baseline_r2 * 0.8:
+                            recovery_steps = j - i
+                            break
 
-                # Get adversary context
-                adversary_context = self._get_adversary_context(step, window=5)
+                    # Get adversary context
+                    adversary_context = self._get_adversary_context(i, window=5)
 
-                # Measure persistence
-                persistence = self._measure_persistence(step)
+                    # Measure persistence
+                    persistence = self._measure_persistence(i)
 
-                events.append(BeliefRevisionEvent(
-                    step=step,
-                    value_change=float(v_curr),
-                    policy_change=float(p_curr),
-                    representation_change=float(r_curr),
-                    adversary_context=adversary_context,
-                    persistence=persistence,
-                ))
+                    # Compute change magnitudes for the event
+                    curr = self._trajectory_data[i]
+                    prev = self._trajectory_data[i - 1]
+                    v_change = abs(curr['value_mean'] - prev['value_mean'])
+                    p_change = abs(curr['policy_entropy'] - prev['policy_entropy'])
+                    r_change = float(np.linalg.norm(curr['hstate_mean'] - prev['hstate_mean']))
+
+                    events.append(BeliefRevisionEvent(
+                        step=i,
+                        value_change=float(v_change),
+                        policy_change=float(p_change),
+                        representation_change=float(r_change),
+                        adversary_context=adversary_context,
+                        persistence=persistence,
+                    ))
+            except Exception:
+                continue
 
         self._events = events
         return events

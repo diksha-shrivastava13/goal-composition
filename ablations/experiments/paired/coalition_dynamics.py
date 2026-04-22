@@ -14,6 +14,7 @@ import chex
 from ..base import CheckpointExperiment
 from ..utils.paired_helpers import (
     generate_levels,
+    generate_adversary_levels,
     extract_level_features_batch,
     get_pro_ant_returns,
 )
@@ -44,17 +45,11 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "coalition_dynamics"
 
-    def __init__(
-        self,
-        n_samples_per_step: int = 50,
-        trajectory_length: int = 100,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.n_samples_per_step = n_samples_per_step
-        self.trajectory_length = trajectory_length
-        self.hidden_dim = hidden_dim
+        self.n_samples_per_step = self.exp_config("n_samples_per_step")
+        self.trajectory_length = self.exp_config("trajectory_length")
+        self.hidden_dim = self.exp_config("hidden_dim")
         self._time_series: Optional[TimeSeriesData] = None
         self._require_paired()
 
@@ -73,8 +68,12 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
         for t in range(self.trajectory_length):
             rng, gen_rng, eval_rng = jax.random.split(rng, 3)
 
-            # Generate a batch of real levels for this time step
-            levels = generate_levels(self.agent, gen_rng, self.n_samples_per_step)
+            # Generate levels using adversary policy if available, else random
+            adv_ts = getattr(self.train_state, 'adv_train_state', None)
+            if adv_ts is not None:
+                levels = generate_adversary_levels(self.agent, adv_ts, gen_rng, self.n_samples_per_step)
+            else:
+                levels = generate_levels(self.agent, gen_rng, self.n_samples_per_step)
 
             # Extract level features to compute adversary difficulty
             batch_features = extract_level_features_batch(levels)
@@ -106,25 +105,39 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
         return self._time_series
 
     def analyze(self) -> Dict[str, Any]:
-        """Analyze coalition dynamics."""
+        """Analyze coalition dynamics.
+
+        Note: Uses cross-sectional correlation and mutual information rather than
+        Granger causality, as samples within a single checkpoint are i.i.d. batches
+        rather than a true temporal sequence.
+        """
         if self._time_series is None:
             raise ValueError("Must call collect_data first")
 
+        from scipy.stats import spearmanr
+
         results = {}
 
-        # Granger causality tests
-        results['adversary_leads_antagonist'] = self._granger_test(
+        # Cross-sectional correlations (Spearman rank)
+        rho, p = spearmanr(
             self._time_series.adversary_difficulty,
             self._time_series.antagonist_performance,
         )
-        results['antagonist_leads_adversary'] = self._granger_test(
-            self._time_series.antagonist_performance,
-            self._time_series.adversary_difficulty,
-        )
-        results['protagonist_feedback_strength'] = self._granger_test(
+        results['adversary_antagonist_correlation'] = {
+            'spearman_rho': float(rho) if not np.isnan(rho) else 0.0,
+            'p_value': float(p) if not np.isnan(p) else 1.0,
+            'significant': float(p) < 0.05 if not np.isnan(p) else False,
+        }
+
+        rho, p = spearmanr(
             self._time_series.protagonist_performance,
             self._time_series.adversary_difficulty,
         )
+        results['protagonist_adversary_correlation'] = {
+            'spearman_rho': float(rho) if not np.isnan(rho) else 0.0,
+            'p_value': float(p) if not np.isnan(p) else 1.0,
+            'significant': float(p) < 0.05 if not np.isnan(p) else False,
+        }
 
         # Coalition coherence (mutual information)
         results['coalition_coherence'] = self._compute_mutual_information(
@@ -185,9 +198,12 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
             except np.linalg.LinAlgError:
                 continue
 
-            # F-statistic (simplified)
-            if rss_unrestricted > 1e-10:
-                f_stat = ((rss_restricted - rss_unrestricted) / rss_unrestricted) * (n - lag - 2)
+            # F-statistic: F = ((RSS_r - RSS_u) / (p2 - p1)) / (RSS_u / (n - p2))
+            n_obs = len(y_target)
+            p_restricted = 2   # intercept + y_lag
+            p_unrestricted = 3  # intercept + y_lag + x_lag
+            if rss_unrestricted > 1e-10 and n_obs > p_unrestricted:
+                f_stat = ((rss_restricted - rss_unrestricted) / (p_unrestricted - p_restricted)) / (rss_unrestricted / (n_obs - p_unrestricted))
                 results[f'lag_{lag}'] = {
                     'f_statistic': float(f_stat),
                     'improvement': float((rss_restricted - rss_unrestricted) / rss_restricted),

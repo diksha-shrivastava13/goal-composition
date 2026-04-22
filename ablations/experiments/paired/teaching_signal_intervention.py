@@ -16,6 +16,7 @@ from ..base import CheckpointExperiment
 from ..utils.paired_helpers import (
     generate_levels,
     generate_constrained_levels,
+    generate_adversary_levels,
     extract_level_features_batch,
     get_pro_hstates,
     get_pro_ant_returns,
@@ -66,19 +67,12 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         'DISTANT_GOAL_ONLY': {'goal_distance': (0.8, 1.0)},
     }
 
-    def __init__(
-        self,
-        baseline_steps: int = 500,
-        intervention_steps: int = 1000,
-        post_steps: int = 500,
-        hidden_dim: int = 256,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.baseline_steps = baseline_steps
-        self.intervention_steps = intervention_steps
-        self.post_steps = post_steps
-        self.hidden_dim = hidden_dim
+        self.baseline_steps = self.exp_config("baseline_steps")
+        self.intervention_steps = self.exp_config("intervention_steps")
+        self.post_steps = self.exp_config("post_steps")
+        self.hidden_dim = self.exp_config("hidden_dim")
         self._results: Dict[str, Dict[str, PhaseData]] = {}
         self._require_paired()
 
@@ -131,16 +125,54 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         n_steps: int,
         constraints: Optional[Dict[str, Tuple[float, float]]],
     ) -> PhaseData:
-        """Collect data during a single phase using real network evaluations."""
+        """Collect data during a single phase using real adversary-generated levels.
+
+        Baseline/post phases use real adversary levels. Intervention phase
+        generates adversary levels then filters/modifies them by constraints,
+        testing which aspects of the teaching signal drive belief revision.
+        """
+        from ..utils.paired_helpers import generate_adversary_levels
         rng, level_rng, h_rng, val_rng, act_rng, ret_rng = jax.random.split(rng, 6)
 
-        # Generate real levels
-        if constraints:
-            levels = generate_constrained_levels(
-                self.agent, level_rng, n_steps, constraints
+        # Get adversary train state
+        adv_ts = getattr(self.train_state, 'adv_train_state', None)
+
+        if adv_ts is not None:
+            # Generate levels via the adversary's learned policy
+            rng, adv_rng = jax.random.split(rng)
+            n_generate = n_steps * 3 if constraints else n_steps
+            adversary_levels = generate_adversary_levels(
+                self.agent, adv_ts, adv_rng, n_generate
             )
+
+            if constraints:
+                # Filter adversary-generated levels by constraints
+                batch_feats = extract_level_features_batch(adversary_levels)
+                mask = np.ones(n_generate, dtype=bool)
+                for feat_name, (min_val, max_val) in constraints.items():
+                    feat_key = feat_name.lower().replace(' ', '_')
+                    if feat_key in batch_feats:
+                        vals = np.array(batch_feats[feat_key])
+                        mask &= (vals >= min_val) & (vals <= max_val)
+
+                valid_idx = np.where(mask)[0]
+                if len(valid_idx) < n_steps:
+                    # Not enough: use all valid + random fill from adversary levels
+                    extra = np.random.default_rng(seed=42).choice(n_generate, n_steps - len(valid_idx))
+                    selected = np.concatenate([valid_idx, extra])[:n_steps]
+                else:
+                    selected = valid_idx[:n_steps]
+                levels = jax.tree_util.tree_map(lambda x: x[selected], adversary_levels)
+            else:
+                levels = jax.tree_util.tree_map(lambda x: x[:n_steps], adversary_levels)
         else:
-            levels = generate_levels(self.agent, level_rng, n_steps)
+            # Fallback: no adversary available
+            if constraints:
+                levels = generate_constrained_levels(
+                    self.agent, level_rng, n_steps, constraints
+                )
+            else:
+                levels = generate_levels(self.agent, level_rng, n_steps)
 
         # Extract level features
         batch_features = extract_level_features_batch(levels)
@@ -156,14 +188,12 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         value_matrix = get_values_from_rollout(
             self.train_state, self.agent, levels, val_rng
         )
-        # Aggregate per-level: mean value across timesteps
         values = value_matrix.mean(axis=1)
 
-        # Get real policy entropies from protagonist rollout
+        # Get real policy entropies
         _logits, entropy_matrix = get_action_distribution(
             self.train_state, self.agent, levels, act_rng
         )
-        # Aggregate per-level: mean entropy across timesteps
         policy_entropies = entropy_matrix.mean(axis=1)
 
         # Get real returns
@@ -181,7 +211,7 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         )
 
     def analyze(self) -> Dict[str, Any]:
-        """Analyze intervention effects."""
+        """Analyze intervention effects including prediction error spikes."""
         if not self._results:
             raise ValueError("Must call collect_data first")
 
@@ -211,6 +241,34 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
             intervention_results['policy_shift_untargeted'] = self._compute_policy_shift_untargeted(
                 phases, intervention_name
             )
+
+            # Prediction error spike: compare value prediction error at intervention onset
+            baseline_data = phases['baseline']
+            during_data = phases['during']
+            after_data = phases['after']
+
+            baseline_pred_error = float(np.mean(np.abs(
+                baseline_data.values - baseline_data.returns
+            )))
+            during_pred_error = float(np.mean(np.abs(
+                during_data.values - during_data.returns
+            )))
+            after_pred_error = float(np.mean(np.abs(
+                after_data.values - after_data.returns
+            )))
+
+            # Spike = relative increase at intervention onset
+            pred_error_spike = (during_pred_error - baseline_pred_error) / (baseline_pred_error + 1e-8)
+            pred_error_recovery = (during_pred_error - after_pred_error) / (during_pred_error + 1e-8)
+
+            intervention_results['prediction_error'] = {
+                'baseline': baseline_pred_error,
+                'during_intervention': during_pred_error,
+                'post_intervention': after_pred_error,
+                'spike_magnitude': pred_error_spike,
+                'recovery_rate': pred_error_recovery,
+                'spike_detected': pred_error_spike > 0.1,
+            }
 
             results[intervention_name] = intervention_results
 

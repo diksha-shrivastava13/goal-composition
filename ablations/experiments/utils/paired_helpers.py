@@ -5,7 +5,7 @@ All functions use the actual trained networks (protagonist, antagonist, adversar
 via batched_rollout or direct forward passes.
 """
 
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, NamedTuple
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -70,7 +70,10 @@ def generate_constrained_levels(
         'wall_density': wall_densities,
         'goal_distance': goal_distances_norm,
         'open_space_ratio': 1.0 - wall_densities,
-        'corridor_ratio': wall_densities,  # Approximate
+        'corridor_ratio': np.array([
+            compute_corridor_count(np.array(candidates.wall_map)[i]) / max(np.array(candidates.wall_map)[i].size, 1)
+            for i in range(len(wall_densities))
+        ]),
         'dense_walls': wall_densities,
     }
     for feat_name, (min_val, max_val) in constraints.items():
@@ -90,7 +93,7 @@ def generate_constrained_levels(
         selected = valid_indices[:n]
 
     # Index into the Level pytree
-    return jax.tree.map(lambda x: x[selected], candidates)
+    return jax.tree_util.tree_map(lambda x: x[selected], candidates)
 
 
 def extract_level_features_batch(levels) -> Dict[str, np.ndarray]:
@@ -154,7 +157,7 @@ def run_batched_rollout(
     """
     from .batched_rollout import batched_rollout
 
-    n = jax.tree.leaves(levels)[0].shape[0]
+    n = jax.tree_util.tree_leaves(levels)[0].shape[0]
     init_hstate = agent.initialize_hidden_state(n)
 
     return batched_rollout(
@@ -225,7 +228,7 @@ def get_real_hstates(
 
     if result.final_hstate is not None:
         # LSTM hstate is (carry, hidden) each of shape (n, features)
-        leaves = jax.tree.leaves(result.final_hstate)
+        leaves = jax.tree_util.tree_leaves(result.final_hstate)
         # Concatenate all leaves and flatten per-env
         parts = [np.array(l).reshape(len(np.array(l)), -1) for l in leaves]
         return np.concatenate(parts, axis=-1)
@@ -314,6 +317,191 @@ def compute_bfs_path_length(level_dict: Dict[str, Any]) -> int:
     return -1  # No path found
 
 
+def compute_difficulty(levels, experiment, rng: chex.PRNGKey) -> np.ndarray:
+    """Compute real difficulty per level using protagonist returns.
+
+    Returns:
+        np.ndarray of shape (n,) with difficulty scores in [0, 1].
+        Difficulty = 1 - pro_return (higher return = easier level).
+    """
+    pro_returns = get_protagonist_returns(rng, levels, experiment)
+    return np.clip(1.0 - pro_returns, 0.0, 1.0)
+
+
+def compute_difficulty_single(level_dict: Dict[str, Any], experiment, rng: chex.PRNGKey) -> float:
+    """Compute difficulty for a single level dict.
+
+    Wraps compute_difficulty for single-level use.
+    """
+    import jax
+    # Create a batched level from single dict by sampling and replacing wall_map
+    level_rng, diff_rng = jax.random.split(rng)
+    level = experiment.agent.sample_random_level(level_rng)
+    level = level.replace(wall_map=jnp.array(level_dict['wall_map']))
+    level_batch = jax.tree_util.tree_map(lambda x: x[None], level)
+    difficulties = compute_difficulty(level_batch, experiment, diff_rng)
+    return float(difficulties[0])
+
+
+def compute_corridor_count(wall_map: np.ndarray) -> int:
+    """Count cells with exactly 2 passable orthogonal neighbors (real corridor detection).
+
+    A corridor cell is a passable cell where exactly 2 of the 4 orthogonal
+    neighbors are also passable, forming a narrow passage.
+    """
+    h, w = wall_map.shape
+    corridors = 0
+    for i in range(1, h - 1):
+        for j in range(1, w - 1):
+            if not wall_map[i, j]:  # Cell is passable
+                passable_neighbors = 0
+                for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < h and 0 <= nj < w and not wall_map[ni, nj]:
+                        passable_neighbors += 1
+                if passable_neighbors == 2:
+                    corridors += 1
+    return corridors
+
+
+def generate_adversary_levels(agent, adv_train_state, rng, n, adv_num_steps=50):
+    """Generate n levels using the adversary's learned generation policy.
+
+    Runs the adversary through the MazeEditor environment to produce levels
+    via its trained policy (not random sampling).
+
+    Args:
+        agent: PAIREDBaseAgent with adv_env, adv_env_params, sample_empty_level
+        adv_train_state: adversary's FlaxTrainState (apply_fn + params)
+        rng: random key
+        n: number of levels to generate
+        adv_num_steps: adversary generation steps (default 50)
+
+    Returns:
+        levels: batched Level pytree (n levels)
+    """
+    from ablations.common.networks import AdversaryActorCritic
+    from ablations.common.training import sample_trajectories_rnn
+
+    # Create empty level templates
+    empty_level = agent.sample_empty_level()
+    empty_levels = jax.tree_util.tree_map(
+        lambda x: jnp.array([x]).repeat(n, axis=0), empty_level
+    )
+
+    # Initialize adversary hidden state
+    init_hstate = AdversaryActorCritic.initialize_carry((n,))
+
+    # Reset MazeEditor to empty levels
+    rng, rng_reset = jax.random.split(rng)
+    init_obs, init_env_state = jax.vmap(
+        agent.adv_env.reset_to_level, in_axes=(0, 0, None)
+    )(jax.random.split(rng_reset, n), empty_levels, agent.adv_env_params)
+
+    # Run adversary rollout through MazeEditor
+    rng, rng_rollout = jax.random.split(rng)
+    (_, _, _, last_env_state, _), _ = sample_trajectories_rnn(
+        rng_rollout, agent.adv_env, agent.adv_env_params,
+        adv_train_state, init_hstate, init_obs, init_env_state,
+        n, adv_num_steps,
+        track_positions=False,
+    )
+
+    # Extract generated levels from final env state
+    return last_env_state.level
+
+
+class AdversaryRolloutResult(NamedTuple):
+    """Result of running the adversary through the MazeEditor environment."""
+    levels: Any           # Batched Level pytree (n,)
+    final_hstates: Any    # np.ndarray (n, hidden_dim) — LSTM c+h concatenated
+    per_level_entropy: Any  # np.ndarray (n,) — mean -log_prob over generation steps
+
+
+def run_adversary_rollout(agent, adv_train_state, rng, n, adv_num_steps=50):
+    """Run adversary through MazeEditor, capturing levels, h-states, and entropy.
+
+    Unlike generate_adversary_levels() which only returns generated levels, this
+    function also captures the adversary's hidden states and per-level entropy
+    (mean negative log-prob over generation steps).
+
+    Args:
+        agent: PAIREDBaseAgent with adv_env, adv_env_params, sample_empty_level
+        adv_train_state: adversary's FlaxTrainState (apply_fn + params)
+        rng: random key
+        n: number of levels to generate
+        adv_num_steps: adversary generation steps (default 50)
+
+    Returns:
+        AdversaryRolloutResult with levels, final_hstates, per_level_entropy
+    """
+    from ablations.common.networks import AdversaryActorCritic
+    from ablations.common.training import sample_trajectories_rnn
+
+    # Create empty level templates
+    empty_level = agent.sample_empty_level()
+    empty_levels = jax.tree_util.tree_map(
+        lambda x: jnp.array([x]).repeat(n, axis=0), empty_level
+    )
+
+    # Initialize adversary hidden state
+    init_hstate = AdversaryActorCritic.initialize_carry((n,))
+
+    # Reset MazeEditor to empty levels
+    rng, rng_reset = jax.random.split(rng)
+    init_obs, init_env_state = jax.vmap(
+        agent.adv_env.reset_to_level, in_axes=(0, 0, None)
+    )(jax.random.split(rng_reset, n), empty_levels, agent.adv_env_params)
+
+    # Run adversary rollout through MazeEditor
+    rng, rng_rollout = jax.random.split(rng)
+    (_, hstate, _, last_env_state, _), (_, _, _, _, log_probs, _, _) = sample_trajectories_rnn(
+        rng_rollout, agent.adv_env, agent.adv_env_params,
+        adv_train_state, init_hstate, init_obs, init_env_state,
+        n, adv_num_steps,
+        track_positions=False,
+    )
+
+    # Extract generated levels from final env state
+    levels = last_env_state.level
+
+    # Flatten hstate using same leaf-concatenation pattern as get_real_hstates()
+    leaves = jax.tree_util.tree_leaves(hstate)
+    parts = [np.array(l).reshape(n, -1) for l in leaves]
+    final_hstates = np.concatenate(parts, axis=-1)
+
+    # Entropy = mean negative log-prob per level over generation steps
+    # log_probs shape: (adv_num_steps, n)
+    per_level_entropy = np.array(-jnp.mean(log_probs, axis=0))
+
+    return AdversaryRolloutResult(
+        levels=levels,
+        final_hstates=final_hstates,
+        per_level_entropy=per_level_entropy,
+    )
+
+
+def mutate_level_walls(level, rng, k):
+    """Toggle k random interior walls in a Level struct.
+
+    Args:
+        level: A single Level struct (unbatched).
+        rng: JAX random key.
+        k: Number of walls to toggle.
+
+    Returns:
+        New Level with k interior wall cells toggled.
+    """
+    wall_map = np.array(level.wall_map)
+    h, w = wall_map.shape
+    interior = [(i, j) for i in range(1, h - 1) for j in range(1, w - 1)]
+    indices = jax.random.choice(rng, len(interior), shape=(min(k, len(interior)),), replace=False)
+    for idx in np.array(indices):
+        r, c = interior[idx]
+        wall_map[r, c] = 1 - wall_map[r, c]
+    return level.replace(wall_map=jnp.array(wall_map))
+
+
 def levels_to_dicts(levels, n: int) -> List[Dict[str, Any]]:
     """Convert batched Level pytree to list of plain dicts."""
     wall_maps = np.array(levels.wall_map)
@@ -324,6 +512,7 @@ def levels_to_dicts(levels, n: int) -> List[Dict[str, Any]]:
     for i in range(n):
         d = {
             'wall_map': wall_maps[i],
+            'wall_density': float(wall_maps[i].mean()),
             'goal_pos': tuple(int(x) for x in goal_positions[i])
                 if goal_positions.ndim > 1
                 else (int(goal_positions[i]),),

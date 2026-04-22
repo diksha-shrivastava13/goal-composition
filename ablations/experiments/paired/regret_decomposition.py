@@ -65,13 +65,25 @@ class RegretDecompositionExperiment(CheckpointExperiment):
         'antagonist_boosted': {'antagonist': 'oracle'},
     }
 
-    def __init__(
-        self,
-        n_levels: int = 500,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
+        """
+        Args:
+            n_levels: Number of levels to decompose.
+            min_regret_threshold: Minimum regret to classify source
+                (below this → NEITHER). Default 0.1.
+            dominance_ratio: Ratio for one source to dominate the other.
+                Default 1.5 (50% stronger contribution).
+            adaptive_threshold: If True, normalize min_regret_threshold
+                by the 10th percentile of observed dataset regrets.
+            solvability_threshold: Minimum antagonist return to consider
+                a level "solvable". Default 0.8.
+        """
         super().__init__(**kwargs)
-        self.n_levels = n_levels
+        self.n_levels = self.exp_config("n_levels")
+        self.min_regret_threshold = self.exp_config("min_regret_threshold")
+        self.dominance_ratio = self.exp_config("dominance_ratio")
+        self.adaptive_threshold = self.exp_config("adaptive_threshold")
+        self.solvability_threshold = self.exp_config("solvability_threshold")
         self._results_by_condition: Dict[str, List[Dict[str, Any]]] = {}
         self._decompositions: List[DecompositionResult] = []
         self._require_paired()
@@ -142,7 +154,19 @@ class RegretDecompositionExperiment(CheckpointExperiment):
             # Random policy: use uniform random actions (no trained weights)
             # Approximate by running protagonist with a fresh random init state
             # to get a baseline; returns will naturally be low
-            return np.array(jax.random.uniform(rng, (self.n_levels,)) * 0.3 + 0.1)
+            # Random policy baseline: uniform random actions produce near-zero returns
+            # Run real rollout but use a random init state (agent hasn't learned = random-like)
+            init_hstate = jax.tree_util.tree_map(jnp.zeros_like, self.agent.initialize_hidden_state(self.n_levels))
+            from ..utils.batched_rollout import batched_rollout
+            result = batched_rollout(
+                rng, self._levels, 256,
+                self.train_state.pro_train_state.apply_fn,
+                self.train_state.pro_train_state.params,
+                self.agent.env, self.agent.env_params,
+                init_hstate,
+                collection_steps=[],
+            )
+            return np.array(result.episode_returns)
         elif mode == 'oracle':
             # Oracle: use the stronger agent (antagonist) as a proxy for near-optimal
             ant_ts = getattr(self.train_state, 'ant_train_state', None)
@@ -183,13 +207,30 @@ class RegretDecompositionExperiment(CheckpointExperiment):
         results['regret_source_attribution'] = self._compute_source_attribution()
         results['solvability_dependence'] = self._test_solvability_constraint()
 
+        # H-state probing for regret source classification
+        results['hstate_regret_source_probing'] = self._probe_regret_source_from_hstates()
+
         return results
 
     def _decompose_regret_sources(self):
-        """Decompose regret into sources for each level."""
+        """Decompose regret into sources for each level.
+
+        Uses adversary-implied difficulty baseline ('oracle') to separate
+        antagonist-strong vs protagonist-weak contributions. The min_regret_threshold
+        filters negligible regret, and dominance_ratio determines when one
+        source clearly dominates the other.
+        """
         baseline = self._results_by_condition['baseline']
         ant_capped = self._results_by_condition['antagonist_capped']
         pro_boosted = self._results_by_condition['protagonist_boosted']
+
+        # Adaptive threshold: scale by 10th percentile of dataset regrets
+        threshold = self.min_regret_threshold
+        if self.adaptive_threshold:
+            all_regrets = [baseline[i]['regret'] for i in range(len(baseline))]
+            p10 = np.percentile(all_regrets, 10)
+            if p10 > 0:
+                threshold = self.min_regret_threshold * p10
 
         for i in range(len(baseline)):
             base_regret = baseline[i]['regret']
@@ -203,11 +244,11 @@ class RegretDecompositionExperiment(CheckpointExperiment):
             pro_contribution = max(0, base_regret - boosted_regret)
 
             # Classify source
-            if base_regret < 0.1:
+            if base_regret < threshold:
                 source = RegretSource.NEITHER
-            elif ant_contribution > pro_contribution * 1.5:
+            elif ant_contribution > pro_contribution * self.dominance_ratio:
                 source = RegretSource.ANTAGONIST_STRONG
-            elif pro_contribution > ant_contribution * 1.5:
+            elif pro_contribution > ant_contribution * self.dominance_ratio:
                 source = RegretSource.PROTAGONIST_WEAK
             else:
                 source = RegretSource.BOTH
@@ -294,12 +335,71 @@ class RegretDecompositionExperiment(CheckpointExperiment):
         boosted_ant_returns = [d['ant_return'] for d in boosted]
 
         # Solvability = fraction of levels where oracle antagonist succeeds
-        solvability = float(np.mean([r > 0.8 for r in boosted_ant_returns]))
+        solvability = float(np.mean([r > self.solvability_threshold for r in boosted_ant_returns]))
 
         return {
             'solvability_rate': solvability,
             'mean_oracle_antagonist_return': float(np.mean(boosted_ant_returns)),
         }
+
+    def _probe_regret_source_from_hstates(self) -> Dict[str, Any]:
+        """Train classifier on protagonist h-states to predict regret source."""
+        if not self._decompositions:
+            return {'error': 'No decompositions available'}
+
+        # Collect protagonist h-states
+        from ..utils.paired_helpers import get_pro_hstates
+        import jax
+
+        if self._levels is None:
+            return {'error': 'No levels stored for h-state probing'}
+
+        try:
+            rng = jax.random.PRNGKey(42)
+            hstates = get_pro_hstates(rng, self._levels, self)
+            hstates_np = np.array(hstates)
+        except Exception as e:
+            return {'error': f'Failed to collect h-states: {e}'}
+
+        # Build labels from decomposition
+        labels = np.array([d.regret_source.value for d in self._decompositions])
+        n_samples = min(len(labels), len(hstates_np))
+        labels = labels[:n_samples]
+        X = hstates_np[:n_samples]
+
+        # Need at least 2 classes
+        unique_labels = np.unique(labels)
+        if len(unique_labels) < 2:
+            return {'error': 'Only one regret source class found', 'unique_classes': unique_labels.tolist()}
+
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import cross_val_score
+        from sklearn.preprocessing import StandardScaler
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        try:
+            clf = LogisticRegression(max_iter=1000)
+            scores = cross_val_score(clf, X_scaled, labels, cv=min(5, len(unique_labels)), scoring='accuracy')
+            clf.fit(X_scaled, labels)
+
+            # Per-source accuracy
+            per_source = {}
+            for src in unique_labels:
+                mask = labels == src
+                if mask.sum() > 0:
+                    per_source[str(src)] = float(clf.score(X_scaled[mask], labels[mask]))
+
+            return {
+                'cv_accuracy_mean': float(np.mean(scores)),
+                'cv_accuracy_std': float(np.std(scores)),
+                'n_samples': n_samples,
+                'n_classes': len(unique_labels),
+                'per_source_accuracy': per_source,
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
     def visualize(self) -> Dict[str, np.ndarray]:
         """Visualize decomposition results."""

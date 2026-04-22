@@ -122,6 +122,21 @@ class BaseExperiment(ABC):
         self.results = {}
         self.figures = {}
 
+    def exp_config(self, param: str, fallback=None):
+        """Look up an experiment-specific config parameter.
+
+        Resolution order:
+          1. ``exp.<self.name>.<param>`` (namespaced, from experiment_defaults)
+          2. ``config[param]`` (flat, backward compat with old checkpoint configs)
+          3. *fallback*
+        """
+        namespaced = f"exp.{self.name}.{param}"
+        if namespaced in self.config:
+            return self.config[namespaced]
+        if param in self.config:
+            return self.config[param]
+        return fallback
+
     @property
     def has_branches(self) -> bool:
         """Whether the training method uses curriculum branches."""

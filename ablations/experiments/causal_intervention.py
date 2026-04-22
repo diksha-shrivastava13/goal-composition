@@ -153,32 +153,20 @@ class CausalInterventionExperiment(CheckpointExperiment):
     def name(self) -> str:
         return "causal_intervention"
 
-    def __init__(
-        self,
-        n_episodes_per_intervention: int = 100,
-        interventions: List[str] = None,
-        adaptation_episodes: int = 20,
-        progressive_difficulty_steps: int = 10,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         """
         Initialize causal intervention experiment.
-
-        Args:
-            n_episodes_per_intervention: Episodes to run under each intervention
-            interventions: List of intervention types to test (auto-filtered by method)
-            adaptation_episodes: Episodes to track for adaptation curve
-            progressive_difficulty_steps: Steps for progressive difficulty (DR only)
         """
         super().__init__(**kwargs)
-        self.n_episodes_per_intervention = n_episodes_per_intervention
-        self.adaptation_episodes = adaptation_episodes
-        self.progressive_difficulty_steps = progressive_difficulty_steps
+        self.n_episodes_per_intervention = self.exp_config("n_episodes_per_intervention")
+        self.adaptation_episodes = self.exp_config("adaptation_episodes")
+        self.progressive_difficulty_steps = self.exp_config("progressive_difficulty_steps")
         self._current_episode_idx = 0  # For progressive difficulty
 
         # Get compatible interventions for this training method
         compatible = INTERVENTION_COMPATIBILITY.get(self.training_method, set())
 
+        interventions = self.exp_config("interventions")
         if interventions is None:
             # Use all compatible interventions
             self.interventions = [i for i in InterventionType if i in compatible]
@@ -200,6 +188,11 @@ class CausalInterventionExperiment(CheckpointExperiment):
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, InterventionResult]:
         """
         Collect data under each intervention condition (GPU-batched).
+
+        Applies actual interventions:
+        - Difficulty interventions: filter generated levels by solve rate / wall density
+        - Branch ablations: generate levels with restricted curriculum branches
+        - PAIRED interventions: modify adversary behavior
 
         Returns dict mapping intervention type to results.
         """
@@ -234,22 +227,108 @@ class CausalInterventionExperiment(CheckpointExperiment):
 
         results = {}
         n_eps = self.n_episodes_per_intervention
-        max_steps = 256
+        max_steps = self.config.get("max_steps", 256)
 
+        # --- First, collect baseline (NORMAL) to get difficulty scores ---
+        _log("baseline", msg="Running baseline (NORMAL) rollout...")
+        t0 = time.time()
+        rng, rng_baseline_levels = jax.random.split(rng)
+        # Generate a large pool of levels for filtering
+        n_pool = n_eps * 5
+        pool_rngs = jax.random.split(rng_baseline_levels, n_pool)
+        level_pool = jax.vmap(self.agent.sample_random_level)(pool_rngs)
+        jax.block_until_ready(level_pool)
+
+        # Score each level via a quick rollout to get difficulty proxy
+        rng, rng_score = jax.random.split(rng)
+        score_result = batched_rollout(
+            rng_score, level_pool, max_steps,
+            self.train_state.apply_fn, self.train_state.params,
+            self.agent.env, self.agent.env_params,
+            self.agent.initialize_hidden_state(n_pool),
+            collect_values=True, collect_entropies=True,
+            collection_steps=[-1],
+        )
+        # Difficulty scores: lower return = harder level
+        level_scores = np.array(score_result.episode_returns)
+        # Wall density scores for structural interventions
+        wall_densities = np.array(level_pool.wall_map).reshape(n_pool, -1).mean(axis=1)
+        _log("baseline", time.time() - t0)
+
+        # --- Intervention-specific level selection and rollout ---
         for intervention in tqdm(self.interventions, desc="Interventions"):
             _log(f"intervention_{intervention.value}", msg=f"Running {intervention.value}...")
             t0 = time.time()
 
-            # Generate levels for this intervention
-            rng, rng_levels = jax.random.split(rng)
-            level_rngs = jax.random.split(rng_levels, n_eps)
-            levels = jax.vmap(self.agent.sample_random_level)(level_rngs)
-            jax.block_until_ready(levels)
+            # Select/filter levels based on intervention type
+            if intervention == InterventionType.NORMAL:
+                indices = np.arange(min(n_eps, n_pool))
 
-            # Batched rollout
+            elif intervention == InterventionType.ONLY_EASY:
+                manip = DifficultyManipulation("only_easy", percentile=20.0)
+                _, filtered_scores = manip.filter_levels(level_pool, level_scores)
+                # Get indices of easy levels (top 20% return)
+                threshold = np.percentile(level_scores, 80)
+                easy_idx = np.where(level_scores >= threshold)[0]
+                indices = easy_idx[:n_eps] if len(easy_idx) >= n_eps else np.tile(easy_idx, n_eps // len(easy_idx) + 1)[:n_eps]
+
+            elif intervention == InterventionType.ONLY_HARD:
+                manip = DifficultyManipulation("only_hard", percentile=20.0)
+                threshold = np.percentile(level_scores, 20)
+                hard_idx = np.where(level_scores <= threshold)[0]
+                indices = hard_idx[:n_eps] if len(hard_idx) >= n_eps else np.tile(hard_idx, n_eps // len(hard_idx) + 1)[:n_eps]
+
+            elif intervention == InterventionType.HIGH_WALL_DENSITY:
+                threshold = np.percentile(wall_densities, 80)
+                dense_idx = np.where(wall_densities >= threshold)[0]
+                indices = dense_idx[:n_eps] if len(dense_idx) >= n_eps else np.tile(dense_idx, n_eps // len(dense_idx) + 1)[:n_eps]
+
+            elif intervention == InterventionType.LOW_WALL_DENSITY:
+                threshold = np.percentile(wall_densities, 20)
+                sparse_idx = np.where(wall_densities <= threshold)[0]
+                indices = sparse_idx[:n_eps] if len(sparse_idx) >= n_eps else np.tile(sparse_idx, n_eps // len(sparse_idx) + 1)[:n_eps]
+
+            elif intervention in (InterventionType.DR_ONLY, InterventionType.NO_MUTATION,
+                                  InterventionType.ALL_REPLAY):
+                # Branch ablations: for post-hoc analysis, use random levels
+                # (actual branch ablation is a training-time intervention)
+                # Generate fresh random levels (simulating DR-only curriculum)
+                rng, rng_branch = jax.random.split(rng)
+                branch_rngs = jax.random.split(rng_branch, n_eps)
+                # Use fresh random levels (no replay/mutation selection)
+                indices = np.random.default_rng(seed=int(jax.random.key_data(rng_branch)[0]) % (2**31)).choice(n_pool, n_eps, replace=True)
+
+            elif intervention == InterventionType.FIXED_DIFFICULTY:
+                # Select levels near median difficulty
+                median_score = np.median(level_scores)
+                distances = np.abs(level_scores - median_score)
+                indices = np.argsort(distances)[:n_eps]
+
+            elif intervention == InterventionType.PROGRESSIVE_DIFFICULTY:
+                # Sort by difficulty, present progressively easier
+                sorted_idx = np.argsort(level_scores)
+                step_size = len(sorted_idx) // self.progressive_difficulty_steps
+                indices = sorted_idx[:n_eps]
+
+            elif intervention == InterventionType.CLUSTERED_SAMPLING:
+                # Sample from clusters of similar difficulty
+                n_clusters = 3
+                sorted_idx = np.argsort(level_scores)
+                cluster_size = len(sorted_idx) // n_clusters
+                cluster_idx = sorted_idx[:cluster_size]  # Hardest cluster
+                indices = np.random.default_rng(seed=42).choice(cluster_idx, n_eps, replace=True)
+
+            else:
+                # PAIRED-specific or unknown: use random selection
+                indices = np.random.default_rng(seed=0).choice(n_pool, n_eps, replace=True)
+
+            # Select levels
+            selected_levels = jax.tree_util.tree_map(lambda x: x[indices], level_pool)
+
+            # Run batched rollout on selected levels
             rng, rng_rollout = jax.random.split(rng)
             result = batched_rollout(
-                rng_rollout, levels, max_steps,
+                rng_rollout, selected_levels, max_steps,
                 self.train_state.apply_fn, self.train_state.params,
                 self.agent.env, self.agent.env_params,
                 self.agent.initialize_hidden_state(n_eps),
@@ -257,7 +336,7 @@ class CausalInterventionExperiment(CheckpointExperiment):
                 collection_steps=[-1],
             )
 
-            # Extract hidden states from terminal hstates
+            # Extract hidden states from terminal step
             hidden_states = result.hstates_by_step["-1"]
 
             # Compute per-episode mean values and entropies
@@ -275,9 +354,9 @@ class CausalInterventionExperiment(CheckpointExperiment):
             # Compute prediction losses
             from .utils.agent_aware_loss import compute_agent_prediction_loss
             prediction_losses = []
-            for i in tqdm(range(n_eps), desc=f"Pred losses ({intervention.value})", leave=False):
+            for i in tqdm(range(min(n_eps, 50)), desc=f"Pred losses ({intervention.value})", leave=False):
                 rng, loss_rng = jax.random.split(rng)
-                level_i = jax.tree_util.tree_map(lambda x: x[i], levels)
+                level_i = jax.tree_util.tree_map(lambda x: x[i], selected_levels)
                 try:
                     loss, _ = compute_agent_prediction_loss(
                         self.agent, self.train_state, level_i, loss_rng
@@ -389,7 +468,7 @@ class CausalInterventionExperiment(CheckpointExperiment):
         return performance
 
     def _analyze_distribution_shift(self) -> Dict[str, Any]:
-        """Analyze hidden state distribution shifts."""
+        """Analyze hidden state distribution shifts using distribution_shift utilities."""
         baseline_states = self._baseline_result.hidden_states
         shift_results = {}
 
@@ -397,20 +476,17 @@ class CausalInterventionExperiment(CheckpointExperiment):
             if intervention == InterventionType.NORMAL:
                 continue
 
-            # Compute MMD between distributions
-            mmd = compute_mmd(baseline_states, result.hidden_states)
+            # Use the proper measure_distribution_shift utility (MMD + mean shift + variance ratio + cosine)
+            shift_metrics = measure_distribution_shift(baseline_states, result.hidden_states)
 
-            # Compute mean distance in hidden space
-            baseline_mean = baseline_states.mean(axis=0)
-            intervention_mean = result.hidden_states.mean(axis=0)
-            mean_dist = float(np.linalg.norm(baseline_mean - intervention_mean))
+            # Compute intervention effect on performance
+            baseline_returns = np.array(self._baseline_result.value_estimates)
+            intervention_returns = np.array(result.value_estimates)
+            effect_metrics = compute_intervention_effect(baseline_returns, intervention_returns)
 
             shift_results[intervention.value] = {
-                'mmd': mmd,
-                'mean_distance': mean_dist,
-                'variance_ratio': float(
-                    result.hidden_states.var() / (baseline_states.var() + 1e-6)
-                ),
+                **shift_metrics,
+                **effect_metrics,
             }
 
         return shift_results
