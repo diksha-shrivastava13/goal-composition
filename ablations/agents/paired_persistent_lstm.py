@@ -62,6 +62,7 @@ class PAIREDPersistentLSTMAgent(PAIREDBaseAgent):
             level_history_wall_maps=train_state.level_history_wall_maps,
             history_ptr=train_state.history_ptr,
             history_total=train_state.history_total,
+            last_adversary_level=train_state.last_adversary_level,
         )
 
     def _get_student_init_hstate(self, train_state: PAIREDTrainState) -> chex.ArrayTree:

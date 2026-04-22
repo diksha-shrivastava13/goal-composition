@@ -801,6 +801,45 @@ class PAIREDBaseAgent(ABC):
 
         return agent_tracking
 
+    def _call_training_hooks(
+        self,
+        train_state: PAIREDTrainState,
+        metrics: dict,
+        step: int,
+    ):
+        """
+        Call training hooks for all registered training-time experiments.
+
+        Args:
+            train_state: Current PAIRED training state
+            metrics: Training metrics from this step
+            step: Current total training step
+        """
+        for experiment in self.training_experiments:
+            if hasattr(experiment, 'training_hook'):
+                try:
+                    hook_data = experiment.training_hook(train_state, metrics, step)
+                    if hook_data and self.config.get("use_wandb", True):
+                        prefixed = {f"exp/{experiment.name}/{k}": v for k, v in hook_data.items()}
+                        wandb.log(prefixed, step=step)
+                except Exception as e:
+                    print(f"Warning: training_hook failed for {experiment.name}: {e}")
+
+    def _finalize_training_experiments(self):
+        """
+        Finalize training-time experiments after training completes.
+
+        Calls analyze() and visualize() on each experiment.
+        """
+        for experiment in self.training_experiments:
+            try:
+                print(f"Finalizing experiment: {experiment.name}")
+                results = experiment.analyze()
+                viz = experiment.visualize()
+                experiment.save()
+            except Exception as e:
+                print(f"Warning: finalize failed for {experiment.name}: {e}")
+
     def _update_probe(
         self,
         rng: chex.PRNGKey,
