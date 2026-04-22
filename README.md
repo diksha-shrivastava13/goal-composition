@@ -17,6 +17,147 @@ Structure, experiments, and dependencies may evolve as the project progresses.
 
 ---
 
+### 🤸‍♀️ Repository Structure
+
+This is the repository structure, most of the current active work (March 2026) is under ablations/.
+
+```
+├── ablations
+│   ├── __init__.py
+│   ├── agents
+│   │   ├── __init__.py
+│   │   ├── accel_probe.py
+│   │   ├── base.py
+│   │   ├── context_vector.py
+│   │   ├── episodic_memory.py
+│   │   ├── next_env_prediction.py
+│   │   ├── paired_accel_probe.py
+│   │   ├── paired_base.py
+│   │   ├── paired_context_vector.py
+│   │   ├── paired_episodic_memory.py
+│   │   ├── paired_next_env_prediction.py
+│   │   ├── paired_persistent_lstm.py
+│   │   └── persistent_lstm.py
+│   ├── common
+│   │   ├── __init__.py
+│   │   ├── curriculum_state.py
+│   │   ├── environment.py
+│   │   ├── metrics.py
+│   │   ├── networks.py
+│   │   ├── probe_runner.py
+│   │   ├── training.py
+│   │   ├── types.py
+│   │   ├── utils.py
+│   │   └── visualization.py
+│   ├── configs
+│   │   ├── __init__.py
+│   │   ├── presets.py
+│   │   └── README.md
+│   ├── experiments
+│   │   ├── __init__.py
+│   │   ├── activation_analysis.py
+│   │   ├── base.py
+│   │   ├── behavioral_coupling.py
+│   │   ├── causal_intervention.py
+│   │   ├── counterfactual.py
+│   │   ├── cross_agent_comparison.py
+│   │   ├── cross_episode_flow.py
+│   │   ├── dr_coverage.py
+│   │   ├── goal_extraction.py
+│   │   ├── level_probing.py
+│   │   ├── mutation_adaptation.py
+│   │   ├── n_env_prediction.py
+│   │   ├── n_step_prediction.py
+│   │   ├── output_probing.py
+│   │   ├── paired
+│   │   │   ├── __init__.py
+│   │   │   ├── activation_patching.py
+│   │   │   ├── adversary_ablation.py
+│   │   │   ├── adversary_dynamics.py
+│   │   │   ├── adversary_policy_extraction.py
+│   │   │   ├── adversary_strategy_clustering.py
+│   │   │   ├── antagonist_audit.py
+│   │   │   ├── belief_behaviour_divergence.py
+│   │   │   ├── belief_revision_detection.py
+│   │   │   ├── bilateral_utility.py
+│   │   │   ├── causal_model_extraction.py
+│   │   │   ├── coalition_dynamics.py
+│   │   │   ├── counterfactual_curriculum.py
+│   │   │   ├── goal_evolution.py
+│   │   │   ├── multiscale_goals.py
+│   │   │   ├── regret_decomposition.py
+│   │   │   ├── regret_transfer.py
+│   │   │   ├── representation_divergence.py
+│   │   │   ├── representation_trajectory.py
+│   │   │   ├── shard_dynamics.py
+│   │   │   ├── teaching_opacity.py
+│   │   │   ├── teaching_signal_intervention.py
+│   │   │   └── utility_extraction.py
+│   │   ├── phase_transition.py
+│   │   ├── probes
+│   │   │   ├── __init__.py
+│   │   │   ├── output_probe.py
+│   │   │   └── property_probe.py
+│   │   ├── run_all.py
+│   │   ├── run_experiment.py
+│   │   ├── run_paired_suite.py
+│   │   ├── symbolic_regression.py
+│   │   ├── utils
+│   │   │   ├── __init__.py
+│   │   │   ├── activation_patching.py
+│   │   │   ├── agent_aware_loss.py
+│   │   │   ├── batched_rollout.py
+│   │   │   ├── calibration_utils.py
+│   │   │   ├── distribution_shift.py
+│   │   │   ├── history_injection.py
+│   │   │   ├── memory_probing.py
+│   │   │   ├── paired_helpers.py
+│   │   │   ├── rsa_cka.py
+│   │   │   ├── time_series_analysis.py
+│   │   │   ├── transfer_metrics.py
+│   │   │   └── transition_metrics.py
+│   │   └── value_calibration.py
+│   ├── memory
+│   │   ├── __init__.py
+│   │   ├── context_vector.py
+│   │   ├── episodic_buffer.py
+│   │   ├── persistent_rnn.py
+│   │   └── reset_rnn.py
+│   └── scripts
+│       ├── evaluate.py
+│       ├── shell
+│       │   ├── run_matrix.sh
+│       │   └── train_all.sh
+│       ├── train_all.py
+│       ├── train_with_experiments.py
+│       └── train.py
+├── docs
+│   └── research_strategy.tex
+├── elicting_world_models
+│   ├── __init__.py
+│   └── accel_minigrid_cwm.py
+├── LICENSE
+├── misgeneralisation
+│   ├── __init__.py
+│   └── keys_chests_accel.py
+├── originals
+│   ├── original_accel.py
+│   ├── original_dr.py
+│   └── original_paired.py
+├── README.md
+├── requirements_dev_local.txt
+├── requirements_gpu_snapshot.txt
+├── requirements_no_jax.txt
+├── scalable_oversight
+│   ├── __init__.py
+│   ├── accel_probe.py
+│   ├── nep_dr.py
+│   ├── next_env_prediction.py
+│   └── prediction_head_ablations.py
+└── setup_gpu_instance.sh
+
+```
+
 ### ⭐ Reproducibility
 
 Experiments in this repository were conducted using a GPU-based environment with a manually installed JAX CUDA stack.
