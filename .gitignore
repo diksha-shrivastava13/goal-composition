@@ -1,6 +1,9 @@
 # Training artifacts
 wandb/
 checkpoints/
+experiments/
+test_checkpoints/
+test_results/
 
 # Python
 __pycache__/
