@@ -165,6 +165,7 @@ def get_agent_config(agent_type: str) -> Dict[str, Any]:
 def get_config(
     training_method: str,
     agent_type: str,
+    include_experiments: bool = True,
     **overrides,
 ) -> Dict[str, Any]:
     """
@@ -173,6 +174,7 @@ def get_config(
     Args:
         training_method: One of accel, plr, robust_plr, dr, paired
         agent_type: One of the agent types (base or paired_*)
+        include_experiments: If True, merge experiment defaults (exp.* keys)
         **overrides: Override any config values
 
     Returns:
@@ -189,7 +191,7 @@ def get_config(
         )
 
     # Start with base defaults
-    from ..common.utils import get_default_config
+    from .defaults import get_default_config
     config = get_default_config()
 
     # Apply training method config
@@ -199,6 +201,11 @@ def get_config(
     # Apply agent config
     config.update(get_agent_config(agent_type))
     config["agent_type"] = agent_type
+
+    # Apply experiment defaults (namespaced as exp.<name>.<param>)
+    if include_experiments:
+        from .experiment_defaults import get_all_experiment_defaults
+        config.update(get_all_experiment_defaults())
 
     # Apply overrides
     config.update(overrides)
