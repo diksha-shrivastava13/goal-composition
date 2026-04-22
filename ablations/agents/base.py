@@ -12,9 +12,12 @@ AGENT-CENTRIC DESIGN:
 
 from abc import ABC, abstractmethod
 from typing import Tuple, Optional, Callable
+import logging
 import time
 import os
 import json
+
+logger = logging.getLogger(__name__)
 
 import jax
 import jax.numpy as jnp
@@ -1416,8 +1419,7 @@ class BaseAgent(ABC):
             # R->M visualization is handled in probe_tracking (1-to-1 correspondence)
 
         except Exception as e:
-            # Don't fail training due to probe errors
-            pass
+            logger.debug("Probe update failed: %s", e)
 
         return train_state.replace(visualization_data=viz_data)
 
@@ -1535,6 +1537,7 @@ class BaseAgent(ABC):
             # images: (max_steps, num_levels, H, W, C) -> (max_steps, num_levels, C, H, W)
             frames = images.transpose(0, 1, 4, 2, 3)
         except Exception:
+            logger.debug("Frame rendering failed", exc_info=True)
             frames = None
 
         result = {
@@ -1605,7 +1608,7 @@ class BaseAgent(ABC):
                     np.array(highest_weighted_img), caption="Highest Weighted Level"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # Per-branch level images
             branch_level_map = {
@@ -1628,7 +1631,7 @@ class BaseAgent(ABC):
                             wandb.Image(np.array(img)) for img in branch_imgs[:4]
                         ]
                     except Exception:
-                        pass
+                        logger.debug("Visualization/metric failed", exc_info=True)
 
         # =====================================================================
         # EVAL ANIMATIONS (wandb.Video)
@@ -1644,7 +1647,7 @@ class BaseAgent(ABC):
                         level_frames, fps=4, format="gif"
                     )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
         # =====================================================================
         # PROBE METRICS (for agents with probes)
@@ -1802,7 +1805,7 @@ class BaseAgent(ABC):
                     log_dict["probe/divergence/empirical_wall_density"] = float(divergence_metrics['empirical_wall_density'])
                     log_dict["probe/divergence/predicted_wall_density"] = float(divergence_metrics['predicted_wall_density'])
                 except Exception as e:
-                    pass
+                    logger.debug("Visualization/metric failed: %s", e)
 
                 # --- Information gain vs random baselines (Cat 7) ---
                 try:
@@ -1814,7 +1817,7 @@ class BaseAgent(ABC):
                     log_dict["probe/info_gain/goal_vs_random"] = goal_mode - random_baselines['goal_top1']
                     log_dict["probe/info_gain/total_loss_improvement"] = random_baselines['total_loss'] - total_loss
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # --- Matched/batch accuracy with greedy matching (Cat 8) ---
                 try:
@@ -1844,7 +1847,7 @@ class BaseAgent(ABC):
                     log_dict["probe/matched/dir_accuracy"] = float(matched_metrics['matched_dir_accuracy'])
                     log_dict["probe/matched/mean_match_loss"] = float(match_losses.mean())
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Novelty, learnability, open-endedness (Cat 5) ---
             if probe_tracking.total_samples > 10:
@@ -1964,7 +1967,7 @@ class BaseAgent(ABC):
             curriculum_log = build_curriculum_pred_log_dict(metrics, train_state)
             log_dict.update(curriculum_log)
         except Exception:
-            pass
+            logger.debug("Curriculum pred metrics failed", exc_info=True)
 
         # =====================================================================
         # VISUALIZATIONS (every eval call)
@@ -2025,7 +2028,7 @@ class BaseAgent(ABC):
                     wall_heatmap, caption="Wall Prediction from Hidden State"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Position prediction heatmap (Cat 9) ---
             try:
@@ -2037,7 +2040,7 @@ class BaseAgent(ABC):
                     pos_heatmap, caption="Position Prediction from Hidden State"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Batch wall prediction summary (Cat 9) ---
             try:
@@ -2050,7 +2053,7 @@ class BaseAgent(ABC):
                     batch_wall_summary, caption="Batch Wall Prediction (shows variance & samples)"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Batch position prediction summary (Cat 9) ---
             try:
@@ -2062,7 +2065,7 @@ class BaseAgent(ABC):
                     batch_pos_summary, caption="Batch Position Prediction (shows all actuals)"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Matched pairs visualization with greedy matching (Cat 9) ---
             try:
@@ -2079,7 +2082,7 @@ class BaseAgent(ABC):
                     matched_pairs_viz, caption="Greedy-Matched Prediction/Actual Pairs"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- R→M heatmap (when we have R→M data) ---
             if probe_tracking.last_r2m_valid:
@@ -2106,7 +2109,7 @@ class BaseAgent(ABC):
                         r2m_heatmap, caption="Replay→Mutate: Per-Instance Correspondence"
                     )
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Probe loss by branch plot ---
             try:
@@ -2118,7 +2121,7 @@ class BaseAgent(ABC):
                     branch_plot, caption="Probe Loss by Curriculum Branch"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Information content dashboard ---
             try:
@@ -2140,7 +2143,7 @@ class BaseAgent(ABC):
                     info_dashboard, caption="Information Content Dashboard"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Novelty-learnability plot ---
             try:
@@ -2162,7 +2165,7 @@ class BaseAgent(ABC):
                     nl_plot, caption="Novelty-Learnability Space"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Correlation scatter plot ---
             if probe_tracking.total_samples > 50:
@@ -2176,7 +2179,7 @@ class BaseAgent(ABC):
                         corr_plot, caption="Probe Accuracy vs Agent Return"
                     )
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
             # --- Hidden state t-SNE (expensive, do every ~10 evals) ---
             eval_freq = self.config.get("eval_freq", 250)
@@ -2195,7 +2198,7 @@ class BaseAgent(ABC):
                                 tsne_plot, caption="Hidden State t-SNE by Branch"
                             )
                         except Exception:
-                            pass
+                            logger.debug("t-SNE visualization failed", exc_info=True)
 
             # --- Pareto trajectory ---
             if hasattr(train_state, 'pareto_history') and train_state.pareto_history is not None:
@@ -2206,7 +2209,7 @@ class BaseAgent(ABC):
                             pareto_plot, caption="Novelty-Learnability Trajectory"
                         )
                     except Exception:
-                        pass
+                        logger.debug("Visualization/metric failed", exc_info=True)
 
         except Exception as e:
-            print(f"Warning: Failed to create visualizations: {e}")
+            logger.debug("Failed to create visualizations: %s", e)

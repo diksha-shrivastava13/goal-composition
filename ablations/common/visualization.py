@@ -13,11 +13,14 @@ Contains plotting functions for:
 """
 
 from typing import Optional
+import logging
 import numpy as np
 import jax
 import jax.numpy as jnp
 import chex
 import matplotlib
+
+logger = logging.getLogger(__name__)
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -2274,7 +2277,7 @@ def build_curriculum_pred_log_dict(metrics, train_state=None):
                             log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
                             plt.close(fig)
         except Exception:
-            pass
+            logger.debug("Scatter plot generation failed", exc_info=True)
 
     # --- Agent direction bar chart ---
     try:
@@ -2320,6 +2323,6 @@ def build_curriculum_pred_log_dict(metrics, train_state=None):
             log_dict["curriculum_pred/agent_dir_bar_chart"] = wandb.Image(fig)
             plt.close(fig)
     except Exception:
-        pass  # Bar chart generation failed, skip silently
+        logger.debug("Bar chart generation failed", exc_info=True)
 
     return log_dict

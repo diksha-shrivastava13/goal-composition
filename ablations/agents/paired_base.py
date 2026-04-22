@@ -18,8 +18,11 @@ AGENT-CENTRIC DESIGN:
 
 from abc import ABC, abstractmethod
 from typing import Tuple, Optional
+import logging
 import time
 import os
+
+logger = logging.getLogger(__name__)
 
 import jax
 import jax.numpy as jnp
@@ -117,9 +120,10 @@ class PAIREDBaseAgent(ABC):
       * Level difficulty features
     """
 
-    def __init__(self, config: dict, probe_runner=None):
+    def __init__(self, config: dict, probe_runner=None, training_experiments=None):
         self.config = config
         self.probe_runner = probe_runner  # Optional, for interpretability only
+        self.training_experiments = training_experiments or []
         self.setup_environment()
         # No level sampler needed - adversary generates levels
 
@@ -1045,6 +1049,7 @@ class PAIREDBaseAgent(ABC):
             ), (0, None))(states, self.env_params)
             frames = images.transpose(0, 1, 4, 2, 3)
         except Exception:
+            logger.debug("Frame rendering failed", exc_info=True)
             frames = None
 
         result = {
@@ -1185,7 +1190,7 @@ class PAIREDBaseAgent(ABC):
                         level_frames, fps=4, format="gif"
                     )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
         # =====================================================================
         # ADVERSARY LEVEL IMAGES (every eval call)
@@ -1198,7 +1203,7 @@ class PAIREDBaseAgent(ABC):
                     np.array(latest_wall_map), caption="Latest Adversary Level"
                 )
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
         # =====================================================================
         # PROTAGONIST PROBE METRICS (full per-component, calibration, divergence)
@@ -1266,7 +1271,7 @@ class PAIREDBaseAgent(ABC):
                     log_dict["probe/protagonist/divergence/goal_js"] = float(div_metrics['goal_js'])
                     log_dict["probe/protagonist/divergence/wall_density_error"] = float(div_metrics['wall_density_error'])
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # Info gain vs random baselines
                 try:
@@ -1278,7 +1283,7 @@ class PAIREDBaseAgent(ABC):
                     log_dict["probe/protagonist/info_gain/goal_vs_random"] = goal_mode - random_baselines['goal_top1']
                     log_dict["probe/protagonist/info_gain/total_loss_improvement"] = random_baselines['total_loss'] - total_loss
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
             # Per-instance metrics (meaningful for PAIRED: natural 1-to-1 correspondence)
             pi_total = probe_tracking.per_instance_total
@@ -1387,7 +1392,7 @@ class PAIREDBaseAgent(ABC):
             curriculum_log = build_curriculum_pred_log_dict(metrics, train_state)
             log_dict.update(curriculum_log)
         except Exception:
-            pass
+            logger.debug("Curriculum pred metrics failed", exc_info=True)
 
         # =====================================================================
         # VISUALIZATIONS (every eval call)
@@ -1421,7 +1426,7 @@ class PAIREDBaseAgent(ABC):
                     )
                     log_dict["paired/images/regret_dynamics"] = wandb.Image(regret_plot)
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # PAIRED open-endedness plot
                 if train_state.novelty_history is not None:
@@ -1433,7 +1438,7 @@ class PAIREDBaseAgent(ABC):
                         )
                         log_dict["paired/images/openendedness"] = wandb.Image(oe_plot)
                     except Exception:
-                        pass
+                        logger.debug("Visualization/metric failed", exc_info=True)
 
             # Protagonist probe visualizations
             if train_state.probe_tracking is not None and train_state.probe_tracking.total_samples > 10:
@@ -1478,7 +1483,7 @@ class PAIREDBaseAgent(ABC):
                         pos_heatmap, caption="Protagonist Position Prediction"
                     )
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # Information dashboard
                 try:
@@ -1500,7 +1505,7 @@ class PAIREDBaseAgent(ABC):
                         info_dashboard, caption="Protagonist Information Content"
                     )
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # Novelty-learnability plot
                 try:
@@ -1520,7 +1525,7 @@ class PAIREDBaseAgent(ABC):
                     nl_plot = create_novelty_learnability_plot(novelty, learnability, oe_score, regime)
                     log_dict["probe/protagonist/images/novelty_learnability"] = wandb.Image(nl_plot)
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # Correlation scatter
                 if probe_tracking.total_samples > 50:
@@ -1532,7 +1537,7 @@ class PAIREDBaseAgent(ABC):
                         )
                         log_dict["probe/protagonist/images/correlation"] = wandb.Image(corr_plot)
                     except Exception:
-                        pass
+                        logger.debug("Visualization/metric failed", exc_info=True)
 
             # Hidden state t-SNE (protagonist, expensive)
             eval_freq = self.config.get("eval_freq", 250)
@@ -1548,7 +1553,7 @@ class PAIREDBaseAgent(ABC):
                         )
                         log_dict["paired/images/hidden_state_tsne"] = wandb.Image(tsne_plot)
                     except Exception:
-                        pass
+                        logger.debug("Visualization/metric failed", exc_info=True)
 
         except Exception as e:
-            print(f"Warning: Failed to create PAIRED visualizations: {e}")
+            logger.debug("Failed to create PAIRED visualizations: %s", e)

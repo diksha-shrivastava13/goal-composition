@@ -20,9 +20,12 @@ AGENT-CENTRIC DESIGN:
 """
 
 from typing import Tuple, Optional
+import logging
 import jax
 import jax.numpy as jnp
 import optax
+
+logger = logging.getLogger(__name__)
 import chex
 import wandb
 import numpy as np
@@ -1021,7 +1024,7 @@ class NextEnvPredictionAgent(BaseAgent):
                             if len(branch_comp) > 0:
                                 log_dict[f"curriculum_pred/{branch_name}/pred/{comp}_mean"] = float(branch_comp.mean())
         except Exception:
-            pass
+            logger.debug("Visualization/metric failed", exc_info=True)
 
         # --- Scatter plots + bar chart (temporal colour gradient, matching scalable_oversight) ---
         # Uses persistent scatter_accum to accumulate [displacement, loss, update_step] across eval windows
@@ -1123,7 +1126,7 @@ class NextEnvPredictionAgent(BaseAgent):
                             log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
                             plt.close(fig)
         except Exception:
-            pass
+            logger.debug("Visualization/metric failed", exc_info=True)
 
         # Curriculum prediction visualizations, calibration, and divergence
         self._log_curriculum_visualizations(train_state, update_count, log_dict)
@@ -1146,7 +1149,7 @@ class NextEnvPredictionAgent(BaseAgent):
                     traj_plot = create_curriculum_trajectory_plot(cs)
                     log_dict["curriculum_pred/trajectory"] = wandb.Image(traj_plot)
                 except Exception:
-                    pass
+                    logger.debug("Visualization/metric failed", exc_info=True)
 
                 # --- Wall and position prediction heatmaps (Cat 10) ---
                 try:
@@ -1217,7 +1220,7 @@ class NextEnvPredictionAgent(BaseAgent):
                         log_dict["curriculum_pred/divergence/empirical_wall_density"] = float(div_metrics["empirical_wall_density"])
 
                 except Exception as e:
-                    pass
+                    logger.debug("Visualization/metric failed: %s", e)
 
             # Pareto frontier plot from NL state
             if hasattr(train_state, 'nl_state') and train_state.nl_state is not None:
@@ -1254,7 +1257,7 @@ class NextEnvPredictionAgent(BaseAgent):
                                 )
                                 log_dict["novelty_learnability/pareto_frontier"] = wandb.Image(pareto_plot)
                     except Exception:
-                        pass
+                        logger.debug("Visualization/metric failed", exc_info=True)
 
         except Exception as e:
-            print(f"Warning: Failed to create curriculum visualizations: {e}")
+            logger.debug("Failed to create curriculum visualizations: %s", e)

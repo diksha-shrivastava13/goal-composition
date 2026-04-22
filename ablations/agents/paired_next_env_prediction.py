@@ -15,12 +15,15 @@ This mirrors the non-PAIRED NextEnvPredictionAgent but adapted for the
 three-agent PAIRED paradigm.
 """
 
+import logging
 import jax
 import jax.numpy as jnp
 import chex
 import wandb
 import numpy as np
 from typing import Tuple, Optional
+
+logger = logging.getLogger(__name__)
 
 from jaxued.environments.underspecified_env import EnvParams
 
@@ -639,7 +642,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
                     log_dict["curriculum_pred/calibration/agent_dir_prob_at_actual"] = float(cal_metrics["agent_dir_prob_at_actual"])
 
             except Exception:
-                pass
+                logger.debug("Visualization/metric failed", exc_info=True)
 
         # NL state metrics
         nl_state = memory.get("nl_state")
@@ -690,7 +693,7 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
                             if np.isfinite(rho):
                                 log_dict["curriculum_pred/adversary/spearman/goal_vs_pred_loss"] = float(rho)
         except Exception:
-            pass
+            logger.debug("Visualization/metric failed", exc_info=True)
 
         # --- Scatter plots + bar chart (temporal colour gradient) ---
         try:
@@ -782,6 +785,6 @@ class PAIREDNextEnvPredictionAgent(PAIREDBaseAgent):
                         log_dict[f"curriculum_pred/{branch_name}/scatter/{var_name}"] = wandb.Image(fig)
                         plt.close(fig)
         except Exception:
-            pass
+            logger.debug("Visualization/metric failed", exc_info=True)
 
         return log_dict
