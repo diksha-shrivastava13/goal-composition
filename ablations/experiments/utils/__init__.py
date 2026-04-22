@@ -1,6 +1,16 @@
 """Utility functions for interpretability experiments."""
 
-from .batched_rollout import batched_rollout, RolloutResult
+from .batched_rollout import (
+    batched_rollout,
+    RolloutResult,
+    generate_levels,
+    generate_constrained_levels,
+    levels_to_dicts,
+    mutate_level_walls,
+    compute_bfs_path_length,
+    compute_difficulty_single,
+    compute_difficulty,
+)
 from .calibration_utils import (
     compute_multi_point_calibration,
     compute_branch_conditioned_ece,
@@ -63,9 +73,16 @@ from .agent_aware_loss import (
 )
 
 __all__ = [
-    # Batched rollout
+    # Batched rollout & shared level utilities
     "batched_rollout",
     "RolloutResult",
+    "generate_levels",
+    "generate_constrained_levels",
+    "levels_to_dicts",
+    "mutate_level_walls",
+    "compute_bfs_path_length",
+    "compute_difficulty_single",
+    "compute_difficulty",
     # Calibration
     "compute_multi_point_calibration",
     "compute_branch_conditioned_ece",

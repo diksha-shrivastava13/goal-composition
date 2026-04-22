@@ -142,9 +142,30 @@ __all__ = [
     "NEnvPredictionExperiment",
     "NStepPredictionExperiment",
 
-    # Method-specific experiments (DR-specific; PAIRED-specific in paired/)
+    # Method-specific experiments (DR-specific)
     "DRCoverageExperiment",
-    # Re-exported from paired/ for backwards compatibility
+
+    # PAIRED-specific experiments
+    "UtilityExtractionExperiment",
+    "AdversaryPolicyExtractionExperiment",
+    "BilateralUtilityExperiment",
+    "AdversaryAblationExperiment",
+    "RegretDecompositionExperiment",
+    "TeachingSignalInterventionExperiment",
+    "CounterfactualCurriculumExperiment",
+    "ActivationPatchingExperiment",
+    "RepresentationDivergenceExperiment",
+    "AntagonistAuditExperiment",
+    "AdversaryStrategyClusteringExperiment",
+    "CoalitionDynamicsExperiment",
+    "RepresentationTrajectoryExperiment",
+    "BeliefRevisionDetectionExperiment",
+    "GoalEvolutionExperiment",
+    "CausalModelExtractionExperiment",
+    "MultiscaleGoalsExperiment",
+    "ShardDynamicsExperiment",
+    "BeliefBehaviourDivergenceExperiment",
+    "TeachingOpacityExperiment",
     "AdversaryDynamicsExperiment",
     "RegretTransferExperiment",
 
@@ -156,6 +177,9 @@ __all__ = [
     "PAIRED_EXPERIMENTS",
     "BASE_AGENTS",
     "PAIRED_AGENTS",
+    "run_paired_suite",
+    "get_paired_experiments",
+    "PAIRED_EXPERIMENT_ORDER",
 ]
 
 
@@ -163,7 +187,7 @@ def get_experiment_by_name(name: str):
     """Get experiment class by name.
 
     Delegates to get_experiment_class which has the complete registry
-    of all 38 experiments (16 universal + 22 PAIRED-specific).
+    of all 38 experiments (13 universal + 22 PAIRED-specific + 3 training-time).
     """
     return get_experiment_class(name)
 

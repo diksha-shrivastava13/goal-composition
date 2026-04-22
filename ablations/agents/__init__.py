@@ -9,11 +9,11 @@ from .next_env_prediction import NextEnvPredictionAgent
 
 # PAIRED agents
 from .paired_base import PAIREDBaseAgent
-from .paired_accel_probe import PAIREDAccelProbeAgent          # TODO: bad naming
+from .paired_accel_probe import PAIREDAccelProbeAgent
 from .paired_persistent_lstm import PAIREDPersistentLSTMAgent
 from .paired_context_vector import PAIREDContextVectorAgent
 from .paired_episodic_memory import PAIREDEpisodicMemoryAgent
-from .paired_next_env_prediction import PAIREDNextEnvPredictionAgent     # TODO: bad naming
+from .paired_next_env_prediction import PAIREDNextEnvPredictionAgent
 
 __all__ = [
     # Base classes

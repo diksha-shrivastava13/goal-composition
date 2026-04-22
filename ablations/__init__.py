@@ -11,18 +11,8 @@ develop awareness of their training curriculum under different memory mechanisms
 4. context_vector - Compressed EMA context
 5. episodic_memory - Discrete episode buffer
 
-9 Interpretability Experiments:
-1. Level property probing
-2. Value calibration
-3. Mutation adaptation
-4. Causal intervention
-5. Weights/activations analysis
-6. Policy/value output probing
-7. Symbolic regression (U_hat extraction)
-8. Behavioral coupling
-9. Counterfactual intervention
+38 Interpretability Experiments (16 universal + 22 PAIRED-specific):
+See ablations/experiments/run_experiment.py for the complete registry.
 """
-
-# TODO: Update the list of experiments here, have far exceeded.
 
 __version__ = "0.1.0"
