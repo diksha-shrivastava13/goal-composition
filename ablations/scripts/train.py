@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# DEPRECATED: Use train_with_experiments.py instead (this script uses the old config system).
 """
 Training entry point for curriculum awareness ablations.
 

@@ -22,21 +22,11 @@ import sys
 from itertools import product
 from typing import List, Optional
 
-
-# 5 training methods
-ALL_METHODS = ["accel", "plr", "robust_plr", "dr", "paired"]
-
-# 5 base agents (for non-PAIRED methods)
-BASE_AGENTS = [
-    "accel_probe",
-    "persistent_lstm",
-    "context_vector",
-    "episodic_memory",
-    "next_env_prediction",
-]
-
-# 5 PAIRED agents (for PAIRED method)
-PAIRED_AGENTS = [f"paired_{agent}" for agent in BASE_AGENTS]
+from ablations.configs import (
+    ALL_TRAINING_METHODS as ALL_METHODS,
+    BASE_AGENTS,
+    PAIRED_AGENTS,
+)
 
 
 def get_configurations(
@@ -81,7 +71,7 @@ def train_configuration(
 ) -> int:
     """Train a single configuration. Returns exit code."""
     cmd = [
-        sys.executable, "-m", "ablations.scripts.train",
+        sys.executable, "-m", "ablations.scripts.train_with_experiments",
         "--training_method", method,
         "--agent_type", agent,
         "--seed", str(seed),

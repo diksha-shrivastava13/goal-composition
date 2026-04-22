@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# DEPRECATED: Use run_experiment.py or run_all.py instead (this script uses the old config system).
 """
 Evaluation entry point for curriculum awareness ablations.
 

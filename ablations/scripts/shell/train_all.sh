@@ -1,4 +1,5 @@
 #!/bin/bash
+# DEPRECATED: Use `python -m ablations.scripts.train_all` instead (this script uses the old config system).
 # Train all agent variants with multiple seeds
 
 set -e
