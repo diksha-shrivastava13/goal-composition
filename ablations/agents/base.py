@@ -746,7 +746,7 @@ class BaseAgent(ABC):
 
         train_state = train_state.replace(
             sampler=sampler,
-            update_state=UpdateState.MUTATION,
+            update_state=UpdateState.DR,
             num_mutation_updates=train_state.num_mutation_updates + 1,
             mutation_last_level_batch=child_levels,
             training_step=train_state.training_step + 1,
