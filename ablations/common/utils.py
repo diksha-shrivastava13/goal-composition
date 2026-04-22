@@ -171,293 +171,32 @@ def unflatten_hstate(hstate_flat: chex.Array, feature_dim: int = 256) -> tuple:
 
 
 def get_default_config() -> dict:
-    """Get default configuration dictionary."""
-    return {
-        # Run config
-        "seed": 0,
-        "run_name": "ablation",
-        "mode": "train",
+    """Get default configuration dictionary.
 
-        # Agent type
-        "agent_type": "accel_probe",
-
-        # Training method: accel, plr, robust_plr, dr, paired
-        "training_method": "accel",
-
-        # Training
-        "num_updates": 30000,
-        "num_train_envs": 32,
-        "num_steps": 256,
-        "lr": 1e-4,
-        "max_grad_norm": 0.5,
-        "num_minibatches": 1,
-        "gamma": 0.995,
-        "epoch_ppo": 5,
-        "clip_eps": 0.2,
-        "gae_lambda": 0.98,
-        "entropy_coeff": 1e-3,
-        "critic_coeff": 0.5,
-
-        # PLR
-        "score_function": "MaxMC",
-        "exploratory_grad_updates": False,  # True = PLR, False = Robust-PLR
-        "level_buffer_capacity": 4000,
-        "replay_prob": 0.8,
-        "staleness_coeff": 0.3,
-        "temperature": 0.3,
-        "top_k": 4,
-        "minimum_fill_ratio": 0.5,
-        "prioritization": "rank",
-        "buffer_duplicate_check": True,
-
-        # ACCEL
-        "use_accel": True,
-        "num_edits": 5,
-
-        # Environment
-        "agent_view_size": 5,
-        "n_walls": 25,
-
-        # Evaluation
-        "eval_freq": 250,
-        "eval_num_attempts": 10,
-        "eval_levels": [
-            "SixteenRooms", "SixteenRooms2",
-            "Labyrinth", "LabyrinthFlipped", "Labyrinth2",
-            "StandardMaze", "StandardMaze2", "StandardMaze3",
-        ],
-
-        # Checkpointing
-        "checkpoint_save_interval": 1,
-        "max_number_of_checkpoints": 120,
-
-        # Probe config
-        "use_probe": True,
-        "probe_lr": 1e-3,
-        "probe_tracking_buffer_size": 500,
-
-        # Memory-specific (for variants)
-        "context_dim": 64,
-        "context_decay": 0.9,
-        "memory_buffer_size": 64,
-        "memory_top_k": 8,
-
-        # Post-training evaluation
-        "n_env_predictions": 100,
-
-        # Curriculum prediction config (for next_env_prediction agent)
-        "wall_loss_region": "full",
-        "prediction_coeff": 0.1,
-        "curriculum_history_length": 64,
-        "curriculum_wall_weight": 1.0,
-        "curriculum_goal_weight": 1.0,
-        "curriculum_agent_pos_weight": 1.0,
-        "curriculum_agent_dir_weight": 1.0,
-        "nl_buffer_size": 100,
-
-        # PAIRED-specific config (when training_method == "paired")
-        "adv_random_z_dimension": 16,
-        "adv_zero_out_random_z": False,
-        "adv_num_steps": 50,
-        "adv_lr": 1e-4,
-        "adv_max_grad_norm": 0.5,
-        "adv_num_minibatches": 1,
-        "adv_gamma": 0.995,
-        "adv_epoch_ppo": 5,
-        "adv_clip_eps": 0.2,
-        "adv_gae_lambda": 0.98,
-        "adv_entropy_coeff": 1e-3,
-        "adv_critic_coeff": 0.5,
-        # Student (protagonist/antagonist) hyperparams for PAIRED
-        "student_num_steps": 256,
-        "student_lr": 1e-4,
-        "student_max_grad_norm": 0.5,
-        "student_num_minibatches": 1,
-        "student_gamma": 0.995,
-        "student_epoch_ppo": 5,
-        "student_clip_eps": 0.2,
-        "student_gae_lambda": 0.98,
-        "student_entropy_coeff": 1e-3,
-        "student_critic_coeff": 0.5,
-    }
+    .. deprecated:: Moved to ablations.configs.defaults.get_default_config().
+        This shim exists for backward compatibility.
+    """
+    from ablations.configs.defaults import get_default_config as _get_default_config
+    return _get_default_config()
 
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    .. deprecated:: Replaced by ablations.configs.cli.build_config_from_args().
+        This shim exists for backward compatibility.
+    """
+    from ablations.configs.cli import (
+        add_common_args,
+        add_training_args,
+        add_experiment_param_args,
+        build_config_from_args,
+    )
     import argparse
 
     parser = argparse.ArgumentParser(description="Curriculum Awareness Ablation Study")
-
-    # Run config
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--run_name", type=str, default="ablation")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "eval"])
-    parser.add_argument("--project", type=str, default="curriculum-awareness-ablation")
-
-    # Training method
-    parser.add_argument("--training_method", type=str, default="accel",
-                        choices=["accel", "plr", "robust_plr", "dr", "paired"],
-                        help="Training method for curriculum learning")
-
-    # Agent type
-    parser.add_argument("--agent_type", type=str, default="accel_probe",
-                        choices=["accel_probe", "persistent_lstm", "context_vector", "episodic_memory", "next_env_prediction"])
-
-    # Training
-    parser.add_argument("--num_updates", type=int, default=30000)
-    parser.add_argument("--num_train_envs", type=int, default=32)
-    parser.add_argument("--num_steps", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--max_grad_norm", type=float, default=0.5)
-    parser.add_argument("--num_minibatches", type=int, default=1)
-    parser.add_argument("--gamma", type=float, default=0.995)
-    parser.add_argument("--epoch_ppo", type=int, default=5)
-    parser.add_argument("--clip_eps", type=float, default=0.2)
-    parser.add_argument("--gae_lambda", type=float, default=0.98)
-    parser.add_argument("--entropy_coeff", type=float, default=1e-3)
-    parser.add_argument("--critic_coeff", type=float, default=0.5)
-
-    # PLR
-    parser.add_argument("--score_function", type=str, default="MaxMC", choices=["MaxMC", "pvl"])
-    parser.add_argument("--exploratory_grad_updates", action="store_true", default=False)
-    parser.add_argument("--level_buffer_capacity", type=int, default=4000)
-    parser.add_argument("--replay_prob", type=float, default=0.8)
-    parser.add_argument("--staleness_coeff", type=float, default=0.3)
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--top_k", type=int, default=4)
-    parser.add_argument("--minimum_fill_ratio", type=float, default=0.5)
-    parser.add_argument("--prioritization", type=str, default="rank", choices=["rank", "topk"])
-    parser.add_argument("--no_buffer_duplicate_check", action="store_true", default=False)
-
-    # ACCEL
-    parser.add_argument("--use_accel", action="store_true", default=True)
-    parser.add_argument("--no_accel", action="store_true", default=False)
-    parser.add_argument("--num_edits", type=int, default=5)
-
-    # Environment
-    parser.add_argument("--agent_view_size", type=int, default=5)
-    parser.add_argument("--n_walls", type=int, default=25)
-
-    # Evaluation
-    parser.add_argument("--eval_freq", type=int, default=250)
-    parser.add_argument("--eval_num_attempts", type=int, default=10)
-    parser.add_argument("--eval_levels", nargs="+", default=[
-        "SixteenRooms", "SixteenRooms2",
-        "Labyrinth", "LabyrinthFlipped", "Labyrinth2",
-        "StandardMaze", "StandardMaze2", "StandardMaze3",
-    ])
-
-    # Checkpointing
-    parser.add_argument("--checkpoint_save_interval", type=int, default=2)
-    parser.add_argument("--max_number_of_checkpoints", type=int, default=60)
-    parser.add_argument("--checkpoint_directory", type=str, default=None)
-    parser.add_argument("--checkpoint_to_eval", type=int, default=-1)
-
-    # Probe config
-    parser.add_argument("--use_probe", action="store_true", default=True)
-    parser.add_argument("--no_probe", action="store_true", default=False)
-    parser.add_argument("--probe_lr", type=float, default=1e-3)
-    parser.add_argument("--probe_tracking_buffer_size", type=int, default=500)
-
-    # Memory-specific
-    parser.add_argument("--context_dim", type=int, default=64)
-    parser.add_argument("--context_decay", type=float, default=0.9)
-    parser.add_argument("--memory_buffer_size", type=int, default=64)
-    parser.add_argument("--memory_top_k", type=int, default=8)
-
-    # Post-training evaluation
-    parser.add_argument("--n_env_predictions", type=int, default=100)
-
-    # Curriculum prediction args (for next_env_prediction agent)
-    parser.add_argument("--prediction_coeff", type=float, default=0.1,
-                        help="Weight for curriculum prediction loss")
-    parser.add_argument("--curriculum_history_length", type=int, default=64,
-                        help="Length of curriculum history buffer")
-    parser.add_argument("--curriculum_wall_weight", type=float, default=1.0,
-                        help="Weight for wall prediction loss")
-    parser.add_argument("--curriculum_goal_weight", type=float, default=1.0,
-                        help="Weight for goal position prediction loss")
-    parser.add_argument("--curriculum_agent_pos_weight", type=float, default=1.0,
-                        help="Weight for agent position prediction loss")
-    parser.add_argument("--curriculum_agent_dir_weight", type=float, default=1.0,
-                        help="Weight for agent direction prediction loss")
-    parser.add_argument("--nl_buffer_size", type=int, default=100,
-                        help="Buffer size for novelty/learnability tracking")
-
-    # PAIRED-specific arguments (when training_method == "paired")
-    parser.add_argument("--adv_random_z_dimension", type=int, default=16,
-                        help="Dimension of random z input for adversary diversity")
-    parser.add_argument("--adv_zero_out_random_z", action="store_true", default=False,
-                        help="Zero out random z (for ablation)")
-    parser.add_argument("--adv_num_steps", type=int, default=50,
-                        help="Number of steps for adversary level generation")
-    parser.add_argument("--adv_lr", type=float, default=1e-4,
-                        help="Adversary learning rate")
-    parser.add_argument("--adv_max_grad_norm", type=float, default=0.5,
-                        help="Adversary gradient clipping")
-    parser.add_argument("--adv_num_minibatches", type=int, default=1,
-                        help="Adversary minibatches")
-    parser.add_argument("--adv_gamma", type=float, default=0.995,
-                        help="Adversary discount factor")
-    parser.add_argument("--adv_epoch_ppo", type=int, default=5,
-                        help="Adversary PPO epochs")
-    parser.add_argument("--adv_clip_eps", type=float, default=0.2,
-                        help="Adversary PPO clip epsilon")
-    parser.add_argument("--adv_gae_lambda", type=float, default=0.98,
-                        help="Adversary GAE lambda")
-    parser.add_argument("--adv_entropy_coeff", type=float, default=1e-3,
-                        help="Adversary entropy coefficient")
-    parser.add_argument("--adv_critic_coeff", type=float, default=0.5,
-                        help="Adversary critic loss coefficient")
-
-    # Student (protagonist/antagonist) args for PAIRED
-    parser.add_argument("--student_num_steps", type=int, default=256,
-                        help="Number of steps for student rollouts in PAIRED")
-    parser.add_argument("--student_lr", type=float, default=1e-4,
-                        help="Student learning rate in PAIRED")
-    parser.add_argument("--student_max_grad_norm", type=float, default=0.5,
-                        help="Student gradient clipping in PAIRED")
-    parser.add_argument("--student_num_minibatches", type=int, default=1,
-                        help="Student minibatches in PAIRED")
-    parser.add_argument("--student_gamma", type=float, default=0.995,
-                        help="Student discount factor in PAIRED")
-    parser.add_argument("--student_epoch_ppo", type=int, default=5,
-                        help="Student PPO epochs in PAIRED")
-    parser.add_argument("--student_clip_eps", type=float, default=0.2,
-                        help="Student PPO clip epsilon in PAIRED")
-    parser.add_argument("--student_gae_lambda", type=float, default=0.98,
-                        help="Student GAE lambda in PAIRED")
-    parser.add_argument("--student_entropy_coeff", type=float, default=1e-3,
-                        help="Student entropy coefficient in PAIRED")
-    parser.add_argument("--student_critic_coeff", type=float, default=0.5,
-                        help="Student critic loss coefficient in PAIRED")
-
+    add_common_args(parser)
+    add_training_args(parser)
+    add_experiment_param_args(parser)
     args = parser.parse_args()
-
-    # Handle negation flags
-    config = vars(args)
-    if config.pop("no_accel"):
-        config["use_accel"] = False
-    if config.pop("no_probe"):
-        config["use_probe"] = False
-    config["buffer_duplicate_check"] = not config.pop("no_buffer_duplicate_check")
-
-    # Set use_accel and exploratory_grad_updates based on training_method for backward compatibility
-    training_method = config.get("training_method", "accel")
-    if training_method == "accel":
-        config["use_accel"] = True
-        config["exploratory_grad_updates"] = True
-    elif training_method == "plr":
-        config["use_accel"] = False
-        config["exploratory_grad_updates"] = True
-    elif training_method == "robust_plr":
-        config["use_accel"] = False
-        config["exploratory_grad_updates"] = False
-    elif training_method == "dr":
-        config["use_accel"] = False
-        config["exploratory_grad_updates"] = True  # Always update in DR
-    elif training_method == "paired":
-        config["use_accel"] = False
-        config["exploratory_grad_updates"] = True
-
-    return config
+    return build_config_from_args(args, include_experiments=False)
