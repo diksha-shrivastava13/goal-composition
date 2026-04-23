@@ -125,6 +125,7 @@ def create_training_experiments(
     agent,
     train_state,
     training_method: str,
+    config: dict,
 ) -> list:
     """
     Create training-time experiment instances.
@@ -134,6 +135,7 @@ def create_training_experiments(
         agent: Agent instance
         train_state: Initial train state
         training_method: Training method being used
+        config: Full config dict (with exp.* namespaced defaults)
 
     Returns:
         List of TrainingTimeExperiment instances
@@ -156,7 +158,7 @@ def create_training_experiments(
             exp = experiment_classes[name](
                 agent=agent,
                 train_state=train_state,
-                config={},
+                config=config,
                 training_method=training_method,
             )
             experiments.append(exp)
@@ -273,7 +275,7 @@ def train_with_experiments(
     if training_time_experiments:
         print(f"Setting up {len(training_time_experiments)} training-time experiments...")
         tt_exps = create_training_experiments(
-            training_time_experiments, agent, train_state, training_method
+            training_time_experiments, agent, train_state, training_method, config
         )
         agent.training_experiments = tt_exps
         print(f"  Attached: {[e.name for e in tt_exps]}")

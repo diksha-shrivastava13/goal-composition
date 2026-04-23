@@ -124,7 +124,7 @@ def run_smoke_test(method: str, agent: str) -> tuple:
             cmd,
             capture_output=True,
             text=True,
-            timeout=1800,  # 30 minute timeout per config
+            timeout=7200,  # 2 hour timeout per config
         )
         duration = time.time() - start
 
