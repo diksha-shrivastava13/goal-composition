@@ -212,11 +212,13 @@ def add_experiment_param_args(parser: argparse.ArgumentParser) -> None:
                             help="Number of samples for experiments")
     exp_params.add_argument("--n_episodes", type=int, default=None,
                             help="Number of episodes for experiments")
-    exp_params.add_argument("--adv_num_steps", type=int, default=None,
+    exp_params.add_argument("--exp_adv_num_steps", type=int, default=None,
                             help="Adversary rollout steps for PAIRED experiments")
 
 
-# Legacy flat-override keys (the keys added by add_experiment_param_args)
+# CLI attr names added by add_experiment_param_args.
+# exp_adv_num_steps is mapped back to adv_num_steps for experiment consumption.
+_EXPERIMENT_PARAM_CLI_KEYS = ["n_levels", "max_steps", "n_samples", "n_episodes", "exp_adv_num_steps"]
 EXPERIMENT_PARAM_KEYS = ["n_levels", "max_steps", "n_samples", "n_episodes", "adv_num_steps"]
 
 
@@ -324,10 +326,13 @@ def build_config_from_args(
             config[key] = val
 
     # Experiment param overrides (flat, only if explicitly set)
-    for key in EXPERIMENT_PARAM_KEYS:
-        val = getattr(args, key, None)
+    # exp_adv_num_steps on CLI maps to adv_num_steps in config
+    _cli_to_config = {"exp_adv_num_steps": "adv_num_steps"}
+    for cli_key in _EXPERIMENT_PARAM_CLI_KEYS:
+        val = getattr(args, cli_key, None)
         if val is not None:
-            config[key] = val
+            config_key = _cli_to_config.get(cli_key, cli_key)
+            config[config_key] = val
 
     # Handle num_env_steps -> num_updates conversion
     num_env_steps = getattr(args, "num_env_steps", None)

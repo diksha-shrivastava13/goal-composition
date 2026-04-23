@@ -357,7 +357,7 @@ Flat overrides that apply globally to all experiments using that key. For per-ex
 | `--max_steps`     | int  | —       | Max rollout steps                            |
 | `--n_samples`     | int  | —       | Number of samples                            |
 | `--n_episodes`    | int  | —       | Number of episodes                           |
-| `--adv_num_steps` | int  | —       | Adversary rollout steps (PAIRED experiments) |
+| `--exp_adv_num_steps` | int  | —       | Adversary rollout steps (PAIRED experiments) |
 
 ### Post-hoc Runner (`add_posthoc_args`)
 
