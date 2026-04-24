@@ -71,6 +71,7 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
         self.min_cluster_size = self.exp_config("min_cluster_size")
         self.use_hdbscan = self.exp_config("use_hdbscan")
         self.n_clusters_kmeans = self.exp_config("n_clusters_kmeans")
+        self.max_steps = self.exp_config("max_steps", 256)
 
         self._rollouts: List[AdversaryRollout] = []
         self._clusters: List[StrategyCluster] = []
@@ -103,12 +104,12 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
         batch_features = extract_level_features_batch(levels)
 
         # Get real protagonist hidden states (used as embedding for clustering)
-        hstates_all = get_pro_hstates(hstate_rng, levels, self)
+        hstates_all = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         # hstates_all shape: (n, hidden_dim)
 
         # Get real protagonist and antagonist returns for regret
         pro_returns, ant_returns, regrets = get_pro_ant_returns(
-            eval_rng, levels, self
+            eval_rng, levels, self, self.max_steps
         )
 
         # Build per-rollout records
@@ -340,7 +341,7 @@ class AdversaryStrategyClusteringExperiment(CheckpointExperiment):
             rng = jax.random.PRNGKey(123)
             levels = generate_levels(self.agent, rng, len(strategy_labels))
             rng, hstate_rng = jax.random.split(rng)
-            hstates = get_pro_hstates(hstate_rng, levels, self)
+            hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
             hstates_np = np.array(hstates)
         except Exception as e:
             return {'error': f'Failed to collect protagonist h-states: {e}'}

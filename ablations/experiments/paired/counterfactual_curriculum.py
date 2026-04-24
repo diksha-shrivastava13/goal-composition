@@ -54,7 +54,7 @@ class CounterfactualCurriculumExperiment(CheckpointExperiment):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.n_eval_levels = self.exp_config("n_eval_levels")
-        self.max_steps = self.exp_config("max_steps")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._require_paired()
 
     def _require_paired(self):

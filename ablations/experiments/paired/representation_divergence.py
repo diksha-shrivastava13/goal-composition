@@ -53,6 +53,7 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
         super().__init__(**kwargs)
         self.n_levels_per_checkpoint = self.exp_config("n_levels_per_checkpoint")
         self.hidden_dim = self.exp_config("hidden_dim")
+        self.max_steps = self.exp_config("max_steps", 256)
         self.checkpoint_steps = checkpoint_steps
         self._snapshots: List[DivergenceSnapshot] = []
         self._require_paired()
@@ -130,10 +131,10 @@ class RepresentationDivergenceExperiment(CheckpointExperiment):
         ]
 
         # Get real protagonist hidden states
-        pro_hstates = get_pro_hstates(pro_rng, levels, self)
+        pro_hstates = get_pro_hstates(pro_rng, levels, self, self.max_steps)
 
         # Get real antagonist hidden states
-        ant_hstates = get_ant_hstates(ant_rng, levels, self)
+        ant_hstates = get_ant_hstates(ant_rng, levels, self, self.max_steps)
 
         # Compute metrics
         cka = self._compute_cka(pro_hstates, ant_hstates)

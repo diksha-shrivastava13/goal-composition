@@ -83,7 +83,7 @@ class RegretTransferExperiment(CheckpointExperiment):
         self._primary_checkpoint_path = kwargs.pop('checkpoint_path', None)
         super().__init__(**kwargs)
         self.n_levels_per_subset = self.exp_config("n_levels_per_subset")
-        self.max_steps = self.exp_config("max_steps")
+        self.max_steps = self.exp_config("max_steps", 256)
         self.secondary_train_state = secondary_train_state
         self.secondary_agent = secondary_agent
         self._secondary_checkpoint_path = secondary_checkpoint_path
@@ -164,13 +164,13 @@ class RegretTransferExperiment(CheckpointExperiment):
 
         # Get returns and regret for both subsets (primary protagonist + antagonist)
         rng, eval_a_rng, eval_b_rng = jax.random.split(rng, 3)
-        pro_ret_a, ant_ret_a, regrets_a = get_pro_ant_returns(eval_a_rng, levels_a, self)
-        pro_ret_b, ant_ret_b, regrets_b = get_pro_ant_returns(eval_b_rng, levels_b, self)
+        pro_ret_a, ant_ret_a, regrets_a = get_pro_ant_returns(eval_a_rng, levels_a, self, self.max_steps)
+        pro_ret_b, ant_ret_b, regrets_b = get_pro_ant_returns(eval_b_rng, levels_b, self, self.max_steps)
 
         # Get difficulties
         rng, diff_a_rng, diff_b_rng = jax.random.split(rng, 3)
-        diff_a = compute_difficulty(levels_a, self, diff_a_rng)
-        diff_b = compute_difficulty(levels_b, self, diff_b_rng)
+        diff_a = compute_difficulty(levels_a, self, diff_a_rng, self.max_steps)
+        diff_b = compute_difficulty(levels_b, self, diff_b_rng, self.max_steps)
 
         self._data = {
             'subset_a': {
@@ -228,13 +228,13 @@ class RegretTransferExperiment(CheckpointExperiment):
 
         # Get returns and regret for both subsets
         rng, eval_a_rng, eval_b_rng = jax.random.split(rng, 3)
-        pro_ret_a, ant_ret_a, regrets_a = get_pro_ant_returns(eval_a_rng, levels_a, self)
-        pro_ret_b, ant_ret_b, regrets_b = get_pro_ant_returns(eval_b_rng, levels_b, self)
+        pro_ret_a, ant_ret_a, regrets_a = get_pro_ant_returns(eval_a_rng, levels_a, self, self.max_steps)
+        pro_ret_b, ant_ret_b, regrets_b = get_pro_ant_returns(eval_b_rng, levels_b, self, self.max_steps)
 
         # Get difficulties
         rng, diff_a_rng, diff_b_rng = jax.random.split(rng, 3)
-        diff_a = compute_difficulty(levels_a, self, diff_a_rng)
-        diff_b = compute_difficulty(levels_b, self, diff_b_rng)
+        diff_a = compute_difficulty(levels_a, self, diff_a_rng, self.max_steps)
+        diff_b = compute_difficulty(levels_b, self, diff_b_rng, self.max_steps)
 
         self._data = {
             'subset_a': {

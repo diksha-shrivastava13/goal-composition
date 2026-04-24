@@ -53,6 +53,7 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         self.trajectory_length = self.exp_config("trajectory_length")
         self.hidden_dim = self.exp_config("hidden_dim")
         self.reduced_dim = self.exp_config("reduced_dim")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._trajectory: List[TrajectoryPoint] = []
         self._require_paired()
 
@@ -86,24 +87,26 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         mean_goal_distance = float(batch_features['goal_distance'].mean())
 
         from ..utils.paired_helpers import compute_difficulty
-        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
         adversary_features = {
             'difficulty': float(np.mean(difficulties)),
             'wall_density_target': mean_wall_density,
         }
 
         # Get real protagonist hidden states
-        hstates = get_pro_hstates(h_rng, levels, self)
+        hstates = get_pro_hstates(h_rng, levels, self, self.max_steps)
 
         # Get real value estimates
         value_matrix = get_values_from_rollout(
-            self.train_state, self.agent, levels, val_rng
+            self.train_state, self.agent, levels, val_rng,
+            max_steps=self.max_steps,
         )
         values = value_matrix.mean(axis=1)
 
         # Get real policy entropies
         _logits, entropy_matrix = get_action_distribution(
-            self.train_state, self.agent, levels, act_rng
+            self.train_state, self.agent, levels, act_rng,
+            max_steps=self.max_steps,
         )
         entropies = entropy_matrix.mean(axis=1)
 

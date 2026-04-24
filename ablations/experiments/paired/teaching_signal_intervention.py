@@ -73,6 +73,7 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         self.intervention_steps = self.exp_config("intervention_steps")
         self.post_steps = self.exp_config("post_steps")
         self.hidden_dim = self.exp_config("hidden_dim")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._results: Dict[str, Dict[str, PhaseData]] = {}
         self._require_paired()
 
@@ -182,23 +183,25 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         ]
 
         # Get real protagonist hidden states
-        hstates = get_pro_hstates(h_rng, levels, self)
+        hstates = get_pro_hstates(h_rng, levels, self, self.max_steps)
 
         # Get real value estimates from protagonist rollout
         value_matrix = get_values_from_rollout(
-            self.train_state, self.agent, levels, val_rng
+            self.train_state, self.agent, levels, val_rng,
+            max_steps=self.max_steps,
         )
         values = value_matrix.mean(axis=1)
 
         # Get real policy entropies
         _logits, entropy_matrix = get_action_distribution(
-            self.train_state, self.agent, levels, act_rng
+            self.train_state, self.agent, levels, act_rng,
+            max_steps=self.max_steps,
         )
         policy_entropies = entropy_matrix.mean(axis=1)
 
         # Get real returns
         pro_returns, _ant_returns, _regrets = get_pro_ant_returns(
-            ret_rng, levels, self
+            ret_rng, levels, self, self.max_steps
         )
 
         return PhaseData(

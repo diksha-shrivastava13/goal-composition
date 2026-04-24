@@ -61,6 +61,7 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         self.n_samples = self.exp_config("n_samples")
         self.hidden_dim = self.exp_config("hidden_dim")
         self.divergence_threshold = self.exp_config("divergence_threshold")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._data_points: List[DivergencePoint] = []
         self._divergence_events: List[DivergenceEvent] = []
         self._probe_weights: Dict[str, np.ndarray] = {}
@@ -105,18 +106,20 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         levels = generate_levels(self.agent, level_rng, self.n_samples)
 
         # Get real hidden states
-        hstates = get_pro_hstates(hstate_rng, levels, self)
+        hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         self.hidden_dim = hstates.shape[1]
 
         # Get real action distribution (policy)
         logits, entropies = get_action_distribution(
             self.train_state, self.agent, levels, action_rng,
+            max_steps=self.max_steps,
         )
         last_logits = logits[:, -1, :]
 
         # Get real value estimates
         values = get_values_from_rollout(
             self.train_state, self.agent, levels, val_rng,
+            max_steps=self.max_steps,
         )
         mean_values = values.mean(axis=1)
 
@@ -124,7 +127,7 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         features_batch = extract_level_features_batch(levels)
 
         from ..utils.paired_helpers import compute_difficulty
-        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         # Fit Ridge models for divergence computation
         from sklearn.linear_model import Ridge
@@ -196,20 +199,20 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         """Train probes to decode beliefs from real hidden states."""
         rng, level_rng, hstate_rng, diff_rng = jax.random.split(rng, 4)
 
-        n_probe_train = 200
+        n_probe_train = min(200, self.n_samples)
 
         # Generate real levels for probe training
         levels = generate_levels(self.agent, level_rng, n_probe_train)
 
         # Get real hidden states
-        training_hstates = get_pro_hstates(hstate_rng, levels, self)
+        training_hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         self.hidden_dim = training_hstates.shape[1]
 
         # Extract real features as targets
         features_batch = extract_level_features_batch(levels)
 
         from ..utils.paired_helpers import compute_difficulty
-        probe_difficulties = compute_difficulty(levels, self, diff_rng)
+        probe_difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         training_features = []
         for i in range(n_probe_train):

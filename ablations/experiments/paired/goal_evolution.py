@@ -60,6 +60,7 @@ class GoalEvolutionExperiment(CheckpointExperiment):
         self.hidden_dim = self.exp_config("hidden_dim")
         self.n_shard_components = self.exp_config("n_shard_components")
         self.policy_effect_threshold = self.exp_config("policy_effect_threshold")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._trajectory_data: List[Dict[str, Any]] = []
         self._shards: List[Shard] = []
         self._composition_events: List[CompositionEvent] = []
@@ -86,12 +87,13 @@ class GoalEvolutionExperiment(CheckpointExperiment):
         levels = generate_levels(self.agent, level_rng, self.n_samples_per_step)
 
         # Get real hidden states from protagonist network
-        hstates = get_pro_hstates(hstate_rng, levels, self)
+        hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         self.hidden_dim = hstates.shape[1]
 
         # Get real action distribution from protagonist
         logits, _ = get_action_distribution(
             self.train_state, self.agent, levels, action_rng,
+            max_steps=self.max_steps,
         )
         # logits shape: (n, max_steps, n_actions) -> take last step per episode
         last_logits = logits[:, -1, :]  # (n, n_actions)
@@ -109,7 +111,7 @@ class GoalEvolutionExperiment(CheckpointExperiment):
 
         # Compute adversary features from level statistics
         from ..utils.paired_helpers import compute_difficulty
-        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
         difficulty = float(np.mean(difficulties))
 
         return {

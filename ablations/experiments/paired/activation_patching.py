@@ -72,6 +72,7 @@ class ActivationPatchingExperiment(CheckpointExperiment):
         self.n_pairs = self.exp_config("n_pairs")
         self.hidden_dim = self.exp_config("hidden_dim")
         self.top_k_variance = self.exp_config("top_k_variance")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._levels: List[Dict[str, Any]] = []
         self._hstates: np.ndarray = None
         self._patch_results: Dict[PatchTarget, List[PatchResult]] = {}
@@ -96,7 +97,7 @@ class ActivationPatchingExperiment(CheckpointExperiment):
         self._levels = levels_to_dicts(levels_pytree, n_total)
 
         # Get real protagonist hidden states
-        self._hstates = get_pro_hstates(h_rng, levels_pytree, self)
+        self._hstates = get_pro_hstates(h_rng, levels_pytree, self, self.max_steps)
 
         # Update hidden_dim from actual data
         self.hidden_dim = self._hstates.shape[1]

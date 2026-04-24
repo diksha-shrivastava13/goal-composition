@@ -71,7 +71,7 @@ class AntagonistAuditExperiment(CheckpointExperiment):
         super().__init__(**kwargs)
         self.n_levels_per_type = self.exp_config("n_levels_per_type")
         self.n_probe_levels = self.exp_config("n_probe_levels")
-        self.max_steps = self.exp_config("max_steps")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._audit_results: Dict[str, AuditResult] = {}
         self._strategy_data: List[Dict[str, Any]] = []
         self._probe_data: Dict[str, Any] = {}
@@ -119,12 +119,13 @@ class AntagonistAuditExperiment(CheckpointExperiment):
         batch_features = extract_level_features_batch(levels)
 
         pro_returns_arr, ant_returns_arr, _ = get_pro_ant_returns(
-            eval_rng, levels, self
+            eval_rng, levels, self, self.max_steps
         )
 
         ant_ts = getattr(self.train_state, 'ant_train_state', self.train_state)
         _, ant_entropies = get_action_distribution(
-            ant_ts, self.agent, levels, entropy_rng
+            ant_ts, self.agent, levels, entropy_rng,
+            max_steps=self.max_steps,
         )
         mean_entropies_per_level = ant_entropies.mean(axis=1)
 
@@ -163,12 +164,12 @@ class AntagonistAuditExperiment(CheckpointExperiment):
         # Get returns and regret
         rng, eval_rng = jax.random.split(rng)
         pro_returns, ant_returns, regrets = get_pro_ant_returns(
-            eval_rng, levels, self
+            eval_rng, levels, self, self.max_steps
         )
 
         # Get difficulty
         rng, diff_rng = jax.random.split(rng)
-        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         # Get antagonist h-states
         rng, ant_h_rng = jax.random.split(rng)

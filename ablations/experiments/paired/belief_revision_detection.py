@@ -54,6 +54,7 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
         self.detection_window = self.exp_config("detection_window")
         self.sigma_threshold = self.exp_config("sigma_threshold")
         self.hidden_dim = self.exp_config("hidden_dim")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._trajectory_data: List[Dict[str, Any]] = []
         self._events: List[BeliefRevisionEvent] = []
         self._require_paired()
@@ -89,7 +90,7 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
         level_type_shift = wall_density_std > 0.15  # High variance indicates mixed types
 
         from ..utils.paired_helpers import compute_difficulty
-        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
         adversary_features = {
             'difficulty': float(np.mean(difficulties)),
             'level_type_shift': level_type_shift,
@@ -97,17 +98,19 @@ class BeliefRevisionDetectionExperiment(CheckpointExperiment):
         }
 
         # Get real protagonist hidden states
-        hstates = get_pro_hstates(h_rng, levels, self)
+        hstates = get_pro_hstates(h_rng, levels, self, self.max_steps)
 
         # Get real value estimates
         value_matrix = get_values_from_rollout(
-            self.train_state, self.agent, levels, val_rng
+            self.train_state, self.agent, levels, val_rng,
+            max_steps=self.max_steps,
         )
         values = value_matrix.mean(axis=1)  # Per-level mean value
 
         # Get real policy logits and entropies
         logits_matrix, entropy_matrix = get_action_distribution(
-            self.train_state, self.agent, levels, act_rng
+            self.train_state, self.agent, levels, act_rng,
+            max_steps=self.max_steps,
         )
         # Mean logits across timesteps per level, then mean across levels
         policy_logits_mean = logits_matrix.mean(axis=1).mean(axis=0)  # (n_actions,)

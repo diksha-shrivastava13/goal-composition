@@ -51,6 +51,7 @@ class TeachingOpacityExperiment(CheckpointExperiment):
         self.n_adversary_strategies = self.exp_config("n_adversary_strategies")
         self.hidden_dim = self.exp_config("hidden_dim")
         self.n_strategy_clusters = self.exp_config("n_strategy_clusters")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._measurements: List[OpacityMeasurement] = []
         self._strategy_predictor_weights: Optional[Dict] = None
         self._max_diagonal: Optional[float] = None
@@ -80,14 +81,14 @@ class TeachingOpacityExperiment(CheckpointExperiment):
             levels = generate_adversary_levels(self.agent, adv_ts, level_rng, self.n_samples)
         else:
             levels = generate_levels(self.agent, level_rng, self.n_samples)
-        hstates = get_pro_hstates(hstate_rng, levels, self)
+        hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         self.hidden_dim = hstates.shape[1]
 
         # Extract level features as adversary strategy proxy
         features_batch = extract_level_features_batch(levels)
 
         from ..utils.paired_helpers import compute_difficulty
-        difficulties_arr = compute_difficulty(levels, self, diff_rng)
+        difficulties_arr = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         # Pre-compute data-driven terciles for strategy classification
         wds = np.array(features_batch['wall_density'])
@@ -152,19 +153,19 @@ class TeachingOpacityExperiment(CheckpointExperiment):
         """Train a probe to predict adversary strategy from real protagonist h-state."""
         rng, level_rng, hstate_rng, diff_rng = jax.random.split(rng, 4)
 
-        n_train = 200
+        n_train = min(200, self.n_samples)
         adv_ts = getattr(self.train_state, 'adv_train_state', None)
         if adv_ts is not None:
             levels = generate_adversary_levels(self.agent, adv_ts, level_rng, n_train)
         else:
             levels = generate_levels(self.agent, level_rng, n_train)
-        training_hstates = get_pro_hstates(hstate_rng, levels, self)
+        training_hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         self.hidden_dim = training_hstates.shape[1]
 
         features_batch = extract_level_features_batch(levels)
 
         from ..utils.paired_helpers import compute_difficulty
-        train_difficulties = compute_difficulty(levels, self, diff_rng)
+        train_difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         # Build strategy targets from real level features
         training_strategies = []

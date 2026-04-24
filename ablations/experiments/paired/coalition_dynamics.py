@@ -50,6 +50,7 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
         self.n_samples_per_step = self.exp_config("n_samples_per_step")
         self.trajectory_length = self.exp_config("trajectory_length")
         self.hidden_dim = self.exp_config("hidden_dim")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._time_series: Optional[TimeSeriesData] = None
         self._require_paired()
 
@@ -82,7 +83,7 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
 
             # Get real protagonist and antagonist returns via rollouts
             pro_returns, ant_returns, step_regrets = get_pro_ant_returns(
-                eval_rng, levels, self
+                eval_rng, levels, self, self.max_steps
             )
 
             ant_perf = float(ant_returns.mean())

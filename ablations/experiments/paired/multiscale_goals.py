@@ -57,6 +57,7 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         self.n_episodes = self.exp_config("n_episodes")
         self.max_steps_per_episode = self.exp_config("max_steps_per_episode")
         self.hidden_dim = self.exp_config("hidden_dim")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._episode_data: List[Dict[str, Any]] = []
         self._scale_goals: Dict[TemporalScale, List[ScaleGoal]] = {}
         self._require_paired()
@@ -87,7 +88,7 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         levels = generate_levels(self.agent, level_rng, 1)
 
         # Get real hidden states from protagonist
-        hstate_single = get_pro_hstates(hstate_rng, levels, self)  # (1, hidden_dim)
+        hstate_single = get_pro_hstates(hstate_rng, levels, self, self.max_steps)  # (1, hidden_dim)
         self.hidden_dim = hstate_single.shape[1]
 
         # Get real value trajectory from rollout
@@ -105,14 +106,14 @@ class MultiscaleGoalsExperiment(CheckpointExperiment):
         actions_ep = np.argmax(logits[0], axis=-1)  # (max_steps,)
 
         # Get real return for episode difficulty proxy
-        pro_returns, _, _ = get_pro_ant_returns(ret_rng, levels, self)
+        pro_returns, _, _ = get_pro_ant_returns(ret_rng, levels, self, self.max_steps)
         episode_return = float(pro_returns[0])
 
         # Extract level features
         features_batch = extract_level_features_batch(levels)
 
         from ..utils.paired_helpers import compute_difficulty
-        difficulties_arr = compute_difficulty(levels, self, diff_rng)
+        difficulties_arr = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         wall_density = float(features_batch['wall_density'][0])
         goal_distance = float(features_batch['goal_distance'][0])

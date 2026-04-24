@@ -84,6 +84,7 @@ class RegretDecompositionExperiment(CheckpointExperiment):
         self.dominance_ratio = self.exp_config("dominance_ratio")
         self.adaptive_threshold = self.exp_config("adaptive_threshold")
         self.solvability_threshold = self.exp_config("solvability_threshold")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._results_by_condition: Dict[str, List[Dict[str, Any]]] = {}
         self._decompositions: List[DecompositionResult] = []
         self._require_paired()
@@ -159,7 +160,7 @@ class RegretDecompositionExperiment(CheckpointExperiment):
             init_hstate = jax.tree_util.tree_map(jnp.zeros_like, self.agent.initialize_hidden_state(self.n_levels))
             from ..utils.batched_rollout import batched_rollout
             result = batched_rollout(
-                rng, self._levels, 256,
+                rng, self._levels, self.max_steps,
                 self.train_state.pro_train_state.apply_fn,
                 self.train_state.pro_train_state.params,
                 self.agent.env, self.agent.env_params,
@@ -173,16 +174,17 @@ class RegretDecompositionExperiment(CheckpointExperiment):
             if ant_ts is not None:
                 result = run_batched_rollout(
                     rng, self._levels, ant_ts, self.agent,
+                    max_steps=self.max_steps,
                 )
                 return np.array(result.episode_returns)
             else:
-                return get_protagonist_returns(rng, self._levels, self)
+                return get_protagonist_returns(rng, self._levels, self, self.max_steps)
         else:
             # Normal trained agent
             if agent_type == 'protagonist':
-                return get_protagonist_returns(rng, self._levels, self)
+                return get_protagonist_returns(rng, self._levels, self, self.max_steps)
             else:
-                return get_antagonist_returns(rng, self._levels, self)
+                return get_antagonist_returns(rng, self._levels, self, self.max_steps)
 
     def analyze(self) -> Dict[str, Any]:
         """Analyze regret decomposition."""
@@ -356,7 +358,7 @@ class RegretDecompositionExperiment(CheckpointExperiment):
 
         try:
             rng = jax.random.PRNGKey(42)
-            hstates = get_pro_hstates(rng, self._levels, self)
+            hstates = get_pro_hstates(rng, self._levels, self, self.max_steps)
             hstates_np = np.array(hstates)
         except Exception as e:
             return {'error': f'Failed to collect h-states: {e}'}

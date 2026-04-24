@@ -317,14 +317,14 @@ def compute_bfs_path_length(level_dict: Dict[str, Any]) -> int:
     return -1  # No path found
 
 
-def compute_difficulty(levels, experiment, rng: chex.PRNGKey) -> np.ndarray:
+def compute_difficulty(levels, experiment, rng: chex.PRNGKey, max_steps: int = 256) -> np.ndarray:
     """Compute real difficulty per level using protagonist returns.
 
     Returns:
         np.ndarray of shape (n,) with difficulty scores in [0, 1].
         Difficulty = 1 - pro_return (higher return = easier level).
     """
-    pro_returns = get_protagonist_returns(rng, levels, experiment)
+    pro_returns = get_protagonist_returns(rng, levels, experiment, max_steps)
     return np.clip(1.0 - pro_returns, 0.0, 1.0)
 
 

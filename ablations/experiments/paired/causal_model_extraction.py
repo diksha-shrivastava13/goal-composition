@@ -80,6 +80,7 @@ class CausalModelExtractionExperiment(CheckpointExperiment):
         self.edge_corr_threshold = self.exp_config("edge_corr_threshold")
         self.partial_corr_threshold = self.exp_config("partial_corr_threshold")
         self.final_edge_threshold = self.exp_config("final_edge_threshold")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._data: List[Dict[str, Any]] = []
         self._extracted_graph: List[CausalEdge] = []
         self._require_paired()
@@ -96,11 +97,11 @@ class CausalModelExtractionExperiment(CheckpointExperiment):
         levels = generate_levels(self.agent, level_rng, self.n_samples)
 
         # Get real hidden states from protagonist network
-        hstates = get_pro_hstates(hstate_rng, levels, self)
+        hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         self.hidden_dim = hstates.shape[1]
 
         # Get real returns
-        pro_returns, _, _ = get_pro_ant_returns(return_rng, levels, self)
+        pro_returns, _, _ = get_pro_ant_returns(return_rng, levels, self, self.max_steps)
 
         # Extract real level features
         features_batch = extract_level_features_batch(levels)
@@ -109,7 +110,7 @@ class CausalModelExtractionExperiment(CheckpointExperiment):
         level_dicts = levels_to_dicts(levels, self.n_samples)
 
         from ..utils.paired_helpers import compute_difficulty
-        difficulties_arr = compute_difficulty(levels, self, diff_rng)
+        difficulties_arr = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         for i in range(self.n_samples):
             wall_density = float(features_batch['wall_density'][i])
@@ -145,8 +146,8 @@ class CausalModelExtractionExperiment(CheckpointExperiment):
         # Fallback: generate a single real sample
         rng, level_rng, h_rng, ret_rng = jax.random.split(rng, 4)
         levels = generate_levels(self.agent, level_rng, 1)
-        hstates = get_pro_hstates(h_rng, levels, self)
-        pro_returns, _, _ = get_pro_ant_returns(ret_rng, levels, self)
+        hstates = get_pro_hstates(h_rng, levels, self, self.max_steps)
+        pro_returns, _, _ = get_pro_ant_returns(ret_rng, levels, self, self.max_steps)
         features = extract_level_features_batch(levels)
         level_dicts = levels_to_dicts(levels, 1)
         bfs_length = compute_bfs_path_length(level_dicts[0])
@@ -348,7 +349,7 @@ class CausalModelExtractionExperiment(CheckpointExperiment):
 
             # Run real rollout
             result = run_batched_rollout(
-                roll_rng, levels, self.train_state, self.agent, max_steps=self.config.get("max_steps", 256),
+                roll_rng, levels, self.train_state, self.agent, max_steps=self.max_steps,
             )
             outcomes = list(np.array(result.episode_returns))
         except Exception:

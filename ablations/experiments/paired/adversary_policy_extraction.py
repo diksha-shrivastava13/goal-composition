@@ -48,7 +48,7 @@ class AdversaryPolicyExtractionExperiment(CheckpointExperiment):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.n_levels = self.exp_config("n_levels")
-        self.max_steps = self.exp_config("max_steps")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._require_paired()
 
     def _require_paired(self):
@@ -81,7 +81,7 @@ class AdversaryPolicyExtractionExperiment(CheckpointExperiment):
             rng, gen_rng = jax.random.split(rng)
             levels = generate_levels(self.agent, gen_rng, n)
             rng, pro_rng = jax.random.split(rng)
-            adv_hstates = get_pro_hstates(pro_rng, levels, self)
+            adv_hstates = get_pro_hstates(pro_rng, levels, self, self.max_steps)
             adv_entropy = np.zeros(n)
 
         # Extract level features
@@ -90,12 +90,12 @@ class AdversaryPolicyExtractionExperiment(CheckpointExperiment):
         # Get protagonist and antagonist returns + regret on adversary-generated levels
         rng, eval_rng = jax.random.split(rng)
         pro_returns, ant_returns, regrets = get_pro_ant_returns(
-            eval_rng, levels, self
+            eval_rng, levels, self, self.max_steps
         )
 
         # Compute difficulty
         rng, diff_rng = jax.random.split(rng)
-        difficulties = compute_difficulty(levels, self, diff_rng)
+        difficulties = compute_difficulty(levels, self, diff_rng, self.max_steps)
 
         self.data = {
             'adv_hstates': adv_hstates,

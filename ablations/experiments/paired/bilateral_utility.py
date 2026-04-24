@@ -48,6 +48,7 @@ class BilateralUtilityExperiment(CheckpointExperiment):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.n_levels = self.exp_config("n_levels")
+        self.max_steps = self.exp_config("max_steps", 256)
         self._data: List[Dict[str, Any]] = []
         self._utility_profiles: Dict[str, AgentUtilityProfile] = {}
         self._require_paired()
@@ -67,11 +68,11 @@ class BilateralUtilityExperiment(CheckpointExperiment):
 
         # Get real protagonist and antagonist returns via rollouts
         pro_returns, ant_returns, regrets = get_pro_ant_returns(
-            eval_rng, levels, self
+            eval_rng, levels, self, self.max_steps
         )
 
         # Get protagonist hidden states for richer feature extraction
-        pro_hstates = get_pro_hstates(hstate_rng, levels, self)
+        pro_hstates = get_pro_hstates(hstate_rng, levels, self, self.max_steps)
         pro_hstates_np = np.array(pro_hstates)
 
         # Build per-level records
