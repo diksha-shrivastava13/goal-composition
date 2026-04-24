@@ -121,6 +121,11 @@ def run_smoke_test(method: str, agent: str) -> tuple:
         "--n_levels", "20",
         "--n_episodes", "20",
         "--max_steps", "32",
+        "--n_samples_per_step", "10",
+        "--trajectory_length", "5",
+        "--max_steps_per_episode", "16",
+        "--n_levels_per_type", "10",
+        "--n_probe_levels", "10",
     ]
 
     start = time.time()

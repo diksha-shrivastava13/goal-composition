@@ -214,12 +214,30 @@ def add_experiment_param_args(parser: argparse.ArgumentParser) -> None:
                             help="Number of episodes for experiments")
     exp_params.add_argument("--exp_adv_num_steps", type=int, default=None,
                             help="Adversary rollout steps for PAIRED experiments")
+    exp_params.add_argument("--n_samples_per_step", type=int, default=None,
+                            help="Samples per trajectory step (shard_dynamics, etc.)")
+    exp_params.add_argument("--trajectory_length", type=int, default=None,
+                            help="Trajectory length (shard_dynamics, etc.)")
+    exp_params.add_argument("--max_steps_per_episode", type=int, default=None,
+                            help="Max steps per episode (multiscale_goals)")
+    exp_params.add_argument("--n_levels_per_type", type=int, default=None,
+                            help="Levels per type (antagonist_audit)")
+    exp_params.add_argument("--n_probe_levels", type=int, default=None,
+                            help="Probe levels (antagonist_audit)")
 
 
 # CLI attr names added by add_experiment_param_args.
 # exp_adv_num_steps is mapped back to adv_num_steps for experiment consumption.
-_EXPERIMENT_PARAM_CLI_KEYS = ["n_levels", "max_steps", "n_samples", "n_episodes", "exp_adv_num_steps"]
-EXPERIMENT_PARAM_KEYS = ["n_levels", "max_steps", "n_samples", "n_episodes", "adv_num_steps"]
+_EXPERIMENT_PARAM_CLI_KEYS = [
+    "n_levels", "max_steps", "n_samples", "n_episodes", "exp_adv_num_steps",
+    "n_samples_per_step", "trajectory_length", "max_steps_per_episode",
+    "n_levels_per_type", "n_probe_levels",
+]
+EXPERIMENT_PARAM_KEYS = [
+    "n_levels", "max_steps", "n_samples", "n_episodes", "adv_num_steps",
+    "n_samples_per_step", "trajectory_length", "max_steps_per_episode",
+    "n_levels_per_type", "n_probe_levels",
+]
 
 
 def add_posthoc_args(parser: argparse.ArgumentParser) -> None:
@@ -333,6 +351,11 @@ def build_config_from_args(
         if val is not None:
             config_key = _cli_to_config.get(cli_key, cli_key)
             config[config_key] = val
+            # Also override ALL namespaced experiment defaults that use this key,
+            # so that exp_config() picks up the CLI value over the default.
+            for k in list(config.keys()):
+                if k.startswith("exp.") and k.endswith(f".{config_key}"):
+                    config[k] = val
 
     # Handle num_env_steps -> num_updates conversion
     num_env_steps = getattr(args, "num_env_steps", None)

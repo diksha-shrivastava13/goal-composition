@@ -184,6 +184,7 @@ def run_all_experiments(
 
     if parallel == 1:
         # Sequential execution
+        import gc
         for i, task in enumerate(tasks):
             print(f"\n[{i+1}/{len(tasks)}] {task['experiment_name']} on {task['agent_type']}")
             result = run_single_experiment(**task)
@@ -193,6 +194,13 @@ def run_all_experiments(
             else:
                 errors.append({'task': task, 'error': result['error']})
                 print(f"  ERROR: {result['error']}")
+
+            # Free memory between experiments to prevent cumulative OOM
+            gc.collect()
+            try:
+                jax.clear_caches()
+            except AttributeError:
+                pass  # older JAX versions
     else:
         # Parallel execution
         with ProcessPoolExecutor(max_workers=parallel) as executor:

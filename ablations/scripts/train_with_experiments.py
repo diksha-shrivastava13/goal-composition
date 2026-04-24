@@ -116,6 +116,14 @@ def run_checkpoint_experiments(
             results[exp_name] = {'status': 'success', 'result': result}
         except Exception as e:
             results[exp_name] = {'status': 'error', 'error': str(e)}
+        finally:
+            # Free memory between experiments to prevent cumulative OOM
+            import gc
+            gc.collect()
+            try:
+                jax.clear_caches()
+            except AttributeError:
+                pass  # older JAX versions
 
     return results
 
