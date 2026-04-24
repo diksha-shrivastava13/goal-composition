@@ -151,6 +151,7 @@ def run_batched_rollout(
     """Run batched rollout with a train_state on levels.
 
     Works for protagonist, antagonist, or any agent sub-state.
+    Chunking is handled automatically by batched_rollout.
 
     Returns:
         RolloutResult with episode_returns, episode_solved, etc.

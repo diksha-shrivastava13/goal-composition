@@ -33,7 +33,93 @@ class RolloutResult(NamedTuple):
     final_hstate: Optional[object]
 
 
+_ROLLOUT_CHUNK_SIZE = 64  # Max levels per batched rollout to avoid OOM
+
+
 def batched_rollout(
+    rng: chex.PRNGKey,
+    levels,                          # Batched Level pytree, leading dim = n_envs
+    max_steps: int,
+    apply_fn,                        # Network apply function
+    params,                          # Network parameters
+    env,                             # Environment (vmappable)
+    env_params,                      # Environment params (shared)
+    init_hstate,                     # Initial hstate pytree, shape (n_envs, hidden_dim)
+    *,
+    collect_values: bool = False,
+    collect_rewards: bool = False,
+    collect_actions: bool = False,
+    collect_entropies: bool = False,
+    collect_logits: bool = False,
+    collection_steps: Optional[List[int]] = None,
+    return_final_hstate: bool = False,
+) -> RolloutResult:
+    """GPU-batched rollout with automatic chunking to avoid OOM.
+
+    Delegates to _batched_rollout_unchunked in chunks of _ROLLOUT_CHUNK_SIZE.
+    """
+    n_envs = jax.tree_util.tree_leaves(levels)[0].shape[0]
+    kwargs = dict(
+        collect_values=collect_values, collect_rewards=collect_rewards,
+        collect_actions=collect_actions, collect_entropies=collect_entropies,
+        collect_logits=collect_logits, collection_steps=collection_steps,
+        return_final_hstate=return_final_hstate,
+    )
+
+    if n_envs <= _ROLLOUT_CHUNK_SIZE:
+        return _batched_rollout_unchunked(
+            rng, levels, max_steps, apply_fn, params, env, env_params,
+            init_hstate, **kwargs,
+        )
+
+    logger.info(f"[batched_rollout] Chunking {n_envs} envs into batches of {_ROLLOUT_CHUNK_SIZE}")
+    chunk_results = []
+    for start in range(0, n_envs, _ROLLOUT_CHUNK_SIZE):
+        end = min(start + _ROLLOUT_CHUNK_SIZE, n_envs)
+        rng, chunk_rng = jax.random.split(rng)
+        chunk_levels = jax.tree_util.tree_map(lambda x: x[start:end], levels)
+        chunk_hstate = jax.tree_util.tree_map(lambda x: x[start:end], init_hstate)
+        result = _batched_rollout_unchunked(
+            chunk_rng, chunk_levels, max_steps, apply_fn, params, env, env_params,
+            chunk_hstate, **kwargs,
+        )
+        chunk_results.append(result)
+
+    # Merge chunks
+    def _cat(arrays):
+        valid = [a for a in arrays if a is not None]
+        return np.concatenate(valid, axis=0) if valid else None
+
+    merged_final_hstate = None
+    if return_final_hstate and chunk_results[0].final_hstate is not None:
+        merged_final_hstate = jax.tree_util.tree_map(
+            lambda *arrs: jnp.concatenate(arrs, axis=0),
+            *[r.final_hstate for r in chunk_results],
+        )
+
+    merged_hstates_by_step = None
+    if chunk_results[0].hstates_by_step is not None:
+        merged_hstates_by_step = {}
+        for key in chunk_results[0].hstates_by_step:
+            merged_hstates_by_step[key] = np.concatenate(
+                [r.hstates_by_step[key] for r in chunk_results], axis=0
+            )
+
+    return RolloutResult(
+        episode_returns=_cat([r.episode_returns for r in chunk_results]),
+        episode_solved=_cat([r.episode_solved for r in chunk_results]),
+        episode_lengths=_cat([r.episode_lengths for r in chunk_results]),
+        values=_cat([r.values for r in chunk_results]),
+        rewards=_cat([r.rewards for r in chunk_results]),
+        actions=_cat([r.actions for r in chunk_results]),
+        entropies=_cat([r.entropies for r in chunk_results]),
+        logits=_cat([r.logits for r in chunk_results]),
+        hstates_by_step=merged_hstates_by_step,
+        final_hstate=merged_final_hstate,
+    )
+
+
+def _batched_rollout_unchunked(
     rng: chex.PRNGKey,
     levels,                          # Batched Level pytree, leading dim = n_envs
     max_steps: int,
