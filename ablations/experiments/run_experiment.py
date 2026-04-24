@@ -148,7 +148,7 @@ def get_experiment_class(experiment_name: str):
     return experiments[experiment_name]
 
 
-def load_checkpoint(checkpoint_path: str, agent=None, seed: int = 0):
+def load_checkpoint(checkpoint_path: str, agent=None, seed: int = 0, step: int = -1):
     """Load checkpoint from path.
 
     Args:
@@ -156,6 +156,7 @@ def load_checkpoint(checkpoint_path: str, agent=None, seed: int = 0):
         agent: Optional agent instance for creating train_state template.
                If None, attempts to create one from the config in checkpoint.
         seed: Random seed for creating template train state
+        step: Orbax checkpoint step to load (-1 for latest)
 
     Returns:
         (train_state, config) tuple
@@ -179,7 +180,7 @@ def load_checkpoint(checkpoint_path: str, agent=None, seed: int = 0):
     rng = jax.random.PRNGKey(seed)
     train_state_template = agent.create_train_state(rng)
 
-    return _load_checkpoint(checkpoint_path, train_state_template)
+    return _load_checkpoint(checkpoint_path, train_state_template, step=step)
 
 
 def load_agent(agent_type: str, config: Optional[Dict[str, Any]] = None):
@@ -200,6 +201,7 @@ def run_experiment(
     training_method: str = "accel",
     experiment_kwargs: Optional[Dict[str, Any]] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
+    step: int = -1,
 ) -> Dict[str, Any]:
     """
     Run a single experiment.
@@ -213,6 +215,7 @@ def run_experiment(
         training_method: Training method used (accel, plr, robust_plr, paired, dr)
         experiment_kwargs: Additional experiment parameters
         config_overrides: Runtime config overrides (e.g. from CLI --n_levels, --max_steps)
+        step: Orbax checkpoint step to load (-1 for latest)
 
     Returns:
         Dict with experiment results
@@ -241,7 +244,7 @@ def run_experiment(
     agent = load_agent(agent_type, config)
 
     # Load checkpoint (uses agent for train_state template)
-    train_state, checkpoint_config = load_checkpoint(checkpoint_path, agent=agent, seed=seed)
+    train_state, checkpoint_config = load_checkpoint(checkpoint_path, agent=agent, seed=seed, step=step)
 
     # Merge any additional checkpoint config
     if checkpoint_config:

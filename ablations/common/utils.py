@@ -43,8 +43,9 @@ def setup_checkpointing(
     training_method = config.get("training_method", "accel")
     agent_type = config.get("agent_type", "accel_probe")
 
+    base_dir = config.get("output_dir", os.getcwd())
     overall_save_dir = os.path.join(
-        os.getcwd(), "checkpoints", training_method, agent_type, str(seed)
+        base_dir, "checkpoints", training_method, agent_type, str(seed)
     )
     os.makedirs(overall_save_dir, exist_ok=True)
 

@@ -33,23 +33,40 @@ from ..configs import (
     BASE_AGENTS,
     PAIRED_AGENTS,
     get_experiments_for_method,
-    EXPERIMENT_PARAM_KEYS,
 )
 
 
-def find_checkpoints(results_dir: str, agent_type: str) -> List[str]:
-    """Find all checkpoints for an agent."""
-    pattern = os.path.join(results_dir, agent_type, 'seed_*', 'checkpoint_*')
-    checkpoints = glob.glob(pattern)
+def find_checkpoints(results_dir: str, agent_type: str, seed: int = 0) -> List[str]:
+    """Find all checkpoints for an agent.
 
-    # Sort by step number
-    def get_step(path):
-        try:
-            return int(path.split('checkpoint_')[-1])
-        except ValueError:
-            return 0
+    The checkpoint structure from training is:
+        {results_dir}/{agent_type}/{seed}/models/{step}/
 
-    return sorted(checkpoints, key=get_step)
+    Each checkpoint is identified by its parent dir:
+        {results_dir}/{agent_type}/{seed}/
+    plus a step number from Orbax.
+
+    Returns:
+        List of (checkpoint_dir, step) tuples sorted by step,
+        where checkpoint_dir contains config.json and models/.
+    """
+    checkpoint_dir = os.path.join(results_dir, agent_type, str(seed))
+    models_dir = os.path.join(checkpoint_dir, "models")
+
+    if not os.path.isdir(models_dir):
+        return []
+
+    # Orbax saves steps as numbered subdirectories under models/
+    steps = []
+    for entry in os.listdir(models_dir):
+        entry_path = os.path.join(models_dir, entry)
+        if os.path.isdir(entry_path):
+            try:
+                steps.append(int(entry))
+            except ValueError:
+                pass
+
+    return sorted(steps)
 
 
 def run_single_experiment(
@@ -60,8 +77,13 @@ def run_single_experiment(
     seed: int = 0,
     training_method: str = "accel",
     config_overrides: Optional[Dict[str, Any]] = None,
+    step: int = -1,
 ) -> Dict[str, Any]:
-    """Run a single experiment (wrapper for subprocess)."""
+    """Run a single experiment on a specific checkpoint step.
+
+    Args:
+        step: Orbax checkpoint step to load (-1 for latest).
+    """
     from .run_experiment import run_experiment
 
     try:
@@ -73,6 +95,7 @@ def run_single_experiment(
             seed=seed,
             training_method=training_method,
             config_overrides=config_overrides,
+            step=step,
         )
         return {'status': 'success', 'result': result}
     except Exception as e:
@@ -119,31 +142,32 @@ def run_all_experiments(
     tasks = []
 
     for agent_type in agents:
-        checkpoints = find_checkpoints(results_dir, agent_type)
+        steps = find_checkpoints(results_dir, agent_type, seed=seed)
 
         if checkpoints_per_agent is not None:
             # Sample evenly across training
-            n_checkpoints = len(checkpoints)
-            if n_checkpoints > checkpoints_per_agent:
-                indices = [int(i * n_checkpoints / checkpoints_per_agent)
+            n_steps = len(steps)
+            if n_steps > checkpoints_per_agent:
+                indices = [int(i * n_steps / checkpoints_per_agent)
                           for i in range(checkpoints_per_agent)]
-                checkpoints = [checkpoints[i] for i in indices]
+                steps = [steps[i] for i in indices]
 
-        for checkpoint_path in checkpoints:
-            # Extract step from checkpoint path
-            step = checkpoint_path.split('checkpoint_')[-1]
+        # checkpoint_dir is the parent dir with config.json and models/
+        checkpoint_dir = os.path.join(results_dir, agent_type, str(seed))
 
+        for step in steps:
             for experiment_name in experiments:
                 exp_output_dir = output_path / agent_type / f"step_{step}" / experiment_name
 
                 tasks.append({
-                    'experiment': experiment_name,
-                    'checkpoint': checkpoint_path,
+                    'experiment_name': experiment_name,
+                    'checkpoint_path': checkpoint_dir,
                     'agent_type': agent_type,
                     'output_dir': str(exp_output_dir),
                     'seed': seed,
                     'training_method': training_method,
                     'config_overrides': config_overrides,
+                    'step': step,
                 })
 
     print(f"Running {len(tasks)} experiment tasks:")
@@ -161,7 +185,7 @@ def run_all_experiments(
     if parallel == 1:
         # Sequential execution
         for i, task in enumerate(tasks):
-            print(f"\n[{i+1}/{len(tasks)}] {task['experiment']} on {task['agent_type']}")
+            print(f"\n[{i+1}/{len(tasks)}] {task['experiment_name']} on {task['agent_type']}")
             result = run_single_experiment(**task)
 
             if result['status'] == 'success':
@@ -179,7 +203,7 @@ def run_all_experiments(
 
             for i, future in enumerate(as_completed(futures)):
                 task = futures[future]
-                print(f"\n[{i+1}/{len(tasks)}] Completed: {task['experiment']} on {task['agent_type']}")
+                print(f"\n[{i+1}/{len(tasks)}] Completed: {task['experiment_name']} on {task['agent_type']}")
 
                 try:
                     result = future.result()
@@ -415,6 +439,7 @@ def main():
         add_common_args,
         add_experiment_param_args,
         add_posthoc_args,
+        _EXPERIMENT_PARAM_CLI_KEYS,
     )
 
     parser = argparse.ArgumentParser(description="Run all experiments on checkpoints")
@@ -437,7 +462,14 @@ def main():
         generate_summary_report(output_dir)
     else:
         # Build config overrides from experiment params
-        config_overrides = {k: getattr(args, k) for k in EXPERIMENT_PARAM_KEYS if getattr(args, k) is not None}
+        # CLI uses exp_adv_num_steps but experiments expect adv_num_steps
+        _cli_to_config = {"exp_adv_num_steps": "adv_num_steps"}
+        config_overrides = {}
+        for cli_key in _EXPERIMENT_PARAM_CLI_KEYS:
+            val = getattr(args, cli_key, None)
+            if val is not None:
+                config_key = _cli_to_config.get(cli_key, cli_key)
+                config_overrides[config_key] = val
 
         run_all_experiments(
             results_dir=args.results_dir,

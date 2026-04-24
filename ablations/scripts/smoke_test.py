@@ -116,6 +116,11 @@ def run_smoke_test(method: str, agent: str) -> tuple:
         "--num_train_envs", "4",
         "--num_steps", "16",
         "--no_wandb",
+        # Reduce experiment sizes to avoid OOM on small instances
+        "--n_samples", "20",
+        "--n_levels", "20",
+        "--n_episodes", "20",
+        "--max_steps", "32",
     ]
 
     start = time.time()
