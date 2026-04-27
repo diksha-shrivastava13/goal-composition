@@ -58,6 +58,21 @@ class LinearPropertyProbe:
         X = np.asarray(X)
         y = np.asarray(y)
 
+        # Drop zero-variance features to avoid division-by-zero in StandardScaler
+        feature_stds = np.std(X, axis=0)
+        self._nonconst_mask = feature_stds > 1e-10
+        if self._nonconst_mask.sum() == 0:
+            # All features are constant — probe is meaningless
+            self.fitted = False
+            return {
+                "mean_score": 0.0,
+                "std_score": 0.0,
+                "n_cv_folds": 0,
+                "scores": [],
+                "note": "all features constant",
+            }
+        X = X[:, self._nonconst_mask]
+
         # Standardize features
         X_scaled = self.scaler.fit_transform(X)
 
@@ -97,7 +112,10 @@ class LinearPropertyProbe:
         """Predict targets for new hidden states."""
         if not self.fitted:
             raise RuntimeError("Probe must be fitted before prediction")
-        X_scaled = self.scaler.transform(np.asarray(X))
+        X = np.asarray(X)
+        if hasattr(self, '_nonconst_mask'):
+            X = X[:, self._nonconst_mask]
+        X_scaled = self.scaler.transform(X)
         return self.model.predict(X_scaled)
 
     def get_weights(self) -> np.ndarray:
@@ -144,6 +162,20 @@ class MLPPropertyProbe:
         """Fit probe and return cross-validation metrics."""
         X = np.asarray(X)
         y = np.asarray(y)
+
+        # Drop zero-variance features
+        feature_stds = np.std(X, axis=0)
+        self._nonconst_mask = feature_stds > 1e-10
+        if self._nonconst_mask.sum() == 0:
+            self.fitted = False
+            return {
+                "mean_score": 0.0,
+                "std_score": 0.0,
+                "n_cv_folds": 0,
+                "scores": [],
+                "note": "all features constant",
+            }
+        X = X[:, self._nonconst_mask]
 
         X_scaled = self.scaler.fit_transform(X)
 
@@ -200,7 +232,10 @@ class MLPPropertyProbe:
         """Predict targets for new hidden states."""
         if not self.fitted:
             raise RuntimeError("Probe must be fitted before prediction")
-        X_scaled = self.scaler.transform(np.asarray(X))
+        X = np.asarray(X)
+        if hasattr(self, '_nonconst_mask'):
+            X = X[:, self._nonconst_mask]
+        X_scaled = self.scaler.transform(X)
         return self.model.predict(X_scaled)
 
 

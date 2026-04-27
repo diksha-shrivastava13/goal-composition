@@ -460,6 +460,14 @@ class DRCoverageExperiment(CheckpointExperiment):
             'n_levels_sampled': len(self._data.wall_densities),
         }
 
+    @staticmethod
+    def _safe_corrcoef(a: np.ndarray, b: np.ndarray) -> float:
+        """Correlation coefficient safe against zero-variance inputs."""
+        if np.std(a) < 1e-10 or np.std(b) < 1e-10:
+            return 0.0
+        c = np.corrcoef(a, b)[0, 1]
+        return float(c) if np.isfinite(c) else 0.0
+
     def _compute_chance_baseline(self, n_permutations: int = 100) -> Dict[str, Any]:
         """Compute chance baseline for prediction losses via permutation.
 
@@ -481,9 +489,9 @@ class DRCoverageExperiment(CheckpointExperiment):
         for _ in range(n_permutations):
             shuffled_losses = rng_perm.permutation(pred_losses)
             # Correlation between loss and features under permutation
-            corr_density = float(np.corrcoef(wall_densities, shuffled_losses)[0, 1])
-            corr_distance = float(np.corrcoef(goal_distances, shuffled_losses)[0, 1])
-            corr_return = float(np.corrcoef(returns, shuffled_losses)[0, 1])
+            corr_density = self._safe_corrcoef(wall_densities, shuffled_losses)
+            corr_distance = self._safe_corrcoef(goal_distances, shuffled_losses)
+            corr_return = self._safe_corrcoef(returns, shuffled_losses)
             permuted_correlations.append({
                 'density': corr_density,
                 'distance': corr_distance,
@@ -491,9 +499,9 @@ class DRCoverageExperiment(CheckpointExperiment):
             })
 
         # Actual correlations
-        actual_corr_density = float(np.corrcoef(wall_densities, pred_losses)[0, 1])
-        actual_corr_distance = float(np.corrcoef(goal_distances, pred_losses)[0, 1])
-        actual_corr_return = float(np.corrcoef(returns, pred_losses)[0, 1])
+        actual_corr_density = self._safe_corrcoef(wall_densities, pred_losses)
+        actual_corr_distance = self._safe_corrcoef(goal_distances, pred_losses)
+        actual_corr_return = self._safe_corrcoef(returns, pred_losses)
 
         # Compute p-values: fraction of permuted correlations >= actual
         perm_density = np.array([p['density'] for p in permuted_correlations])

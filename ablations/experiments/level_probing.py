@@ -731,14 +731,20 @@ class LevelProbingExperiment(CheckpointExperiment):
 
             # Correlations by dimension
             n_dims = min(X_pro.shape[1], X_ant.shape[1])
+            regret_std = np.std(regret)
             for dim in range(n_dims):
-                pro_corr = abs(np.corrcoef(X_pro[:, dim], regret)[0, 1])
-                ant_corr = abs(np.corrcoef(X_ant[:, dim], regret)[0, 1])
-
-                if np.isnan(pro_corr):
-                    pro_corr = 0
-                if np.isnan(ant_corr):
-                    ant_corr = 0
+                if regret_std < 1e-10 or np.std(X_pro[:, dim]) < 1e-10:
+                    pro_corr = 0.0
+                else:
+                    pro_corr = abs(np.corrcoef(X_pro[:, dim], regret)[0, 1])
+                    if np.isnan(pro_corr):
+                        pro_corr = 0.0
+                if regret_std < 1e-10 or np.std(X_ant[:, dim]) < 1e-10:
+                    ant_corr = 0.0
+                else:
+                    ant_corr = abs(np.corrcoef(X_ant[:, dim], regret)[0, 1])
+                    if np.isnan(ant_corr):
+                        ant_corr = 0.0
 
                 if ant_corr - pro_corr > 0.1:
                     differential_dims.append(dim)

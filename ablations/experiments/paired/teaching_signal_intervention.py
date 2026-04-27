@@ -72,6 +72,12 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
         self.baseline_steps = self.exp_config("baseline_steps")
         self.intervention_steps = self.exp_config("intervention_steps")
         self.post_steps = self.exp_config("post_steps")
+        # Respect global n_levels override (e.g. from smoke test CLI)
+        n_levels_cap = self.exp_config("n_levels", None)
+        if n_levels_cap is not None:
+            self.baseline_steps = min(self.baseline_steps, n_levels_cap)
+            self.intervention_steps = min(self.intervention_steps, n_levels_cap)
+            self.post_steps = min(self.post_steps, n_levels_cap)
         self.hidden_dim = self.exp_config("hidden_dim")
         self.max_steps = self.exp_config("max_steps", 256)
         self._results: Dict[str, Dict[str, PhaseData]] = {}
@@ -83,11 +89,18 @@ class TeachingSignalInterventionExperiment(CheckpointExperiment):
 
     def collect_data(self, rng: chex.PRNGKey) -> Dict[str, Dict[str, PhaseData]]:
         """Collect data for all interventions."""
+        import gc
         for intervention_name, constraints in self.INTERVENTIONS.items():
             rng, int_rng = jax.random.split(rng)
             self._results[intervention_name] = self._run_intervention_protocol(
                 int_rng, constraints
             )
+            # Free GPU memory between interventions to prevent OOM
+            gc.collect()
+            try:
+                jax.clear_caches()
+            except AttributeError:
+                pass
 
         return self._results
 

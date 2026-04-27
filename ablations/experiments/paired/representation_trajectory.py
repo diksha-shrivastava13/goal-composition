@@ -168,8 +168,11 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         # Get trajectory of mean h-states
         H = np.array([p.hstate_mean for p in self._trajectory])
 
-        # PCA reduction
-        pca = PCA(n_components=self.reduced_dim)
+        # PCA reduction — clamp n_components to available dimensions
+        n_components = min(self.reduced_dim, H.shape[0] - 1, H.shape[1])
+        if n_components < 2:
+            return {'error': f'Insufficient data for PCA: {H.shape[0]} samples, {H.shape[1]} features'}
+        pca = PCA(n_components=n_components)
         H_reduced = pca.fit_transform(H)
 
         # Get adversary features
@@ -198,8 +201,8 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
             return {'error': 'Fit failed'}
 
         # Extract A, B, c
-        A = beta[:self.reduced_dim, :]  # Autoregressive
-        B = beta[self.reduced_dim:self.reduced_dim + 2, :]  # Adversary effect
+        A = beta[:n_components, :]  # Autoregressive
+        B = beta[n_components:n_components + 2, :]  # Adversary effect
         c = beta[-1, :]  # Intercept
 
         # Compute residuals
@@ -357,18 +360,22 @@ class RepresentationTrajectoryExperiment(CheckpointExperiment):
         ax = axes[1, 0]
         from sklearn.decomposition import PCA
         H = np.array([p.hstate_mean for p in self._trajectory])
-        pca = PCA(n_components=2)
-        H_2d = pca.fit_transform(H)
-        # Color by step
-        scatter = ax.scatter(H_2d[:, 0], H_2d[:, 1], c=steps, cmap='viridis', s=50)
-        ax.plot(H_2d[:, 0], H_2d[:, 1], 'k-', alpha=0.3, linewidth=1)
-        ax.scatter(H_2d[0, 0], H_2d[0, 1], c='g', s=200, marker='o', label='Start', zorder=5)
-        ax.scatter(H_2d[-1, 0], H_2d[-1, 1], c='r', s=200, marker='*', label='End', zorder=5)
-        ax.set_xlabel('PC1')
-        ax.set_ylabel('PC2')
-        ax.set_title('Representation Trajectory (PCA)')
-        ax.legend()
-        plt.colorbar(scatter, ax=ax, label='Step')
+        n_pca = min(2, H.shape[0] - 1, H.shape[1])
+        if n_pca < 2:
+            ax.text(0.5, 0.5, 'Insufficient data for PCA', ha='center', va='center', transform=ax.transAxes)
+        else:
+            pca = PCA(n_components=2)
+            H_2d = pca.fit_transform(H)
+            # Color by step
+            scatter = ax.scatter(H_2d[:, 0], H_2d[:, 1], c=steps, cmap='viridis', s=50)
+            ax.plot(H_2d[:, 0], H_2d[:, 1], 'k-', alpha=0.3, linewidth=1)
+            ax.scatter(H_2d[0, 0], H_2d[0, 1], c='g', s=200, marker='o', label='Start', zorder=5)
+            ax.scatter(H_2d[-1, 0], H_2d[-1, 1], c='r', s=200, marker='*', label='End', zorder=5)
+            ax.set_xlabel('PC1')
+            ax.set_ylabel('PC2')
+            ax.set_title('Representation Trajectory (PCA)')
+            ax.legend()
+            plt.colorbar(scatter, ax=ax, label='Step')
 
         # Cumulative distance
         ax = axes[1, 1]

@@ -149,10 +149,13 @@ class UtilityExtractionExperiment(CheckpointExperiment):
         _log("pro_rollout", msg="Running batched protagonist rollout...")
         t0 = time.time()
         rng, rng_pro = jax.random.split(rng)
+        pro_ts = getattr(self.train_state, 'pro_train_state', None)
+        if pro_ts is None:
+            raise ValueError("UtilityExtraction requires pro_train_state in PAIREDTrainState")
         pro_result = batched_rollout(
             rng_pro, levels, max_steps,
-            self.train_state.pro_train_state.apply_fn,
-            self.train_state.pro_train_state.params,
+            pro_ts.apply_fn,
+            pro_ts.params,
             self.agent.env, self.agent.env_params,
             self.agent.initialize_hidden_state(n),
             collection_steps=[-1],
@@ -164,7 +167,9 @@ class UtilityExtractionExperiment(CheckpointExperiment):
         _log("ant_rollout", msg="Running batched antagonist rollout...")
         t0 = time.time()
         rng, rng_ant = jax.random.split(rng)
-        ant_train_state = self.train_state.ant_train_state
+        ant_train_state = getattr(self.train_state, 'ant_train_state', None)
+        if ant_train_state is None:
+            raise ValueError("UtilityExtraction requires ant_train_state in PAIREDTrainState")
         ant_result = batched_rollout(
             rng_ant, levels, max_steps,
             ant_train_state.apply_fn,

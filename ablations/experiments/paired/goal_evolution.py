@@ -206,10 +206,13 @@ class GoalEvolutionExperiment(CheckpointExperiment):
     ) -> float:
         """Measure how much a component influences policy."""
         # Compute correlation between activation and action distribution
-        n_actions = 4
+        n_actions = int(np.max(actions)) + 1 if len(actions) > 0 else 1
+        # Ensure at least as many columns as any action index
+        n_actions = max(n_actions, 2)
         action_one_hot = np.zeros((len(actions), n_actions))
         for i, a in enumerate(actions):
-            action_one_hot[i, a] = 1
+            if a < n_actions:
+                action_one_hot[i, a] = 1
 
         # Correlation between activation and action choices
         correlations = []

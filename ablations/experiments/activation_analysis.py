@@ -811,9 +811,14 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
         max_vals = np.max(np.abs(hidden_states), axis=0)
         saturated_dims = int(np.sum((max_vals > 0.99) & (dim_stds < 0.01)))
 
-        # Correlation structure
-        corr_matrix = np.corrcoef(hidden_states.T)
-        mean_abs_corr = float(np.mean(np.abs(corr_matrix[np.triu_indices_from(corr_matrix, k=1)])))
+        # Correlation structure — filter out zero-variance dimensions to avoid NaN
+        nonconst_mask = dim_stds > 1e-10
+        if nonconst_mask.sum() >= 2:
+            corr_matrix = np.corrcoef(hidden_states[:, nonconst_mask].T)
+            triu_vals = corr_matrix[np.triu_indices_from(corr_matrix, k=1)]
+            mean_abs_corr = float(np.nanmean(np.abs(triu_vals)))
+        else:
+            mean_abs_corr = 0.0
 
         return {
             'mean_activation': mean_activation,
@@ -1007,13 +1012,13 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
             # Correlation between prediction loss and clustering quality
             # Use wall_density as a proxy for difficulty
             wall_densities = self._data.wall_densities[:len(prediction_losses)]
-            if len(wall_densities) > 10:
+            if len(wall_densities) > 10 and np.std(wall_densities) > 1e-10 and np.std(prediction_losses) > 1e-10:
                 corr = np.corrcoef(wall_densities, prediction_losses)[0, 1]
                 results['loss_vs_difficulty_correlation'] = float(corr) if np.isfinite(corr) else 0.0
 
             # Correlation with episode returns
             returns = self._data.episode_returns[:len(prediction_losses)]
-            if len(returns) > 10:
+            if len(returns) > 10 and np.std(returns) > 1e-10 and np.std(prediction_losses) > 1e-10:
                 corr = np.corrcoef(returns, prediction_losses)[0, 1]
                 results['loss_vs_return_correlation'] = float(corr) if np.isfinite(corr) else 0.0
 
