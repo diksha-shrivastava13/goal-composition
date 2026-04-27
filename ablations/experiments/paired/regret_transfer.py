@@ -271,9 +271,12 @@ class RegretTransferExperiment(CheckpointExperiment):
         a = self._data['subset_a']
         b = self._data['subset_b']
 
+        is_proxy = self._data.get('mode') == 'wall_density_proxy'
         results = {
             'training_method': self.training_method,
             'mode': self._data.get('mode', 'unknown'),
+            'is_proxy': is_proxy,
+            'note': 'Wall-density proxy — not directly comparable to cross-adversary evaluation' if is_proxy else None,
         }
 
         # --- Probe features to test ---

@@ -99,6 +99,9 @@ def run_single_experiment(
         )
         return {'status': 'success', 'result': result}
     except Exception as e:
+        import traceback
+        print(f"  ERROR in {experiment_name}: {e}")
+        traceback.print_exc()
         return {'status': 'error', 'error': str(e)}
 
 
@@ -464,6 +467,10 @@ def main():
                         help='Only generate summary report from existing results')
 
     args = parser.parse_args()
+
+    # Route warnings through logging for clean log ordering
+    import logging
+    logging.captureWarnings(True)
 
     if args.summarize:
         output_dir = args.output_dir or "."

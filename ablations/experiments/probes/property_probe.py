@@ -9,7 +9,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from sklearn.linear_model import Ridge, RidgeClassifier, LogisticRegression
 from sklearn.neural_network import MLPRegressor, MLPClassifier
-from sklearn.model_selection import cross_val_score, cross_val_predict
+from collections import Counter
+from sklearn.model_selection import cross_val_score, cross_val_predict, StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, accuracy_score, f1_score
 import jax.numpy as jnp
@@ -67,10 +68,18 @@ class LinearPropertyProbe:
             self.model = LogisticRegression(C=1/self.alpha, max_iter=1000)
             scoring = "accuracy"
 
-        # Cross-validation
+        # Adaptive CV: reduce n_splits if any class has fewer members than folds
+        n_folds = self.cv_folds
+        if self.task == "classification":
+            min_class_count = min(Counter(y).values())
+            n_folds = max(2, min(self.cv_folds, min_class_count))
+            cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        else:
+            cv = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+
         scores = cross_val_score(
             self.model, X_scaled, y,
-            cv=self.cv_folds, scoring=scoring
+            cv=cv, scoring=scoring
         )
 
         # Fit on full data
@@ -80,6 +89,7 @@ class LinearPropertyProbe:
         return {
             "mean_score": float(np.mean(scores)),
             "std_score": float(np.std(scores)),
+            "n_cv_folds": n_folds,
             "scores": scores.tolist(),
         }
 
@@ -111,7 +121,7 @@ class MLPPropertyProbe:
         alpha: float = 1e-4,
         task: str = "regression",
         cv_folds: int = 5,
-        max_iter: int = 500,
+        max_iter: int = 2000,
     ):
         """
         Args:
@@ -137,12 +147,19 @@ class MLPPropertyProbe:
 
         X_scaled = self.scaler.fit_transform(X)
 
+        # Disable early_stopping when samples are too few for validation split
+        use_early_stopping = True
+        if self.task == "classification":
+            min_class_count = min(Counter(y).values())
+            if min_class_count < 3:
+                use_early_stopping = False
+
         if self.task == "regression":
             self.model = MLPRegressor(
                 hidden_layer_sizes=self.hidden_layers,
                 alpha=self.alpha,
                 max_iter=self.max_iter,
-                early_stopping=True,
+                early_stopping=use_early_stopping,
                 validation_fraction=0.1,
             )
             scoring = "r2"
@@ -151,14 +168,22 @@ class MLPPropertyProbe:
                 hidden_layer_sizes=self.hidden_layers,
                 alpha=self.alpha,
                 max_iter=self.max_iter,
-                early_stopping=True,
+                early_stopping=use_early_stopping,
                 validation_fraction=0.1,
             )
             scoring = "accuracy"
 
+        # Adaptive CV: reduce n_splits if any class has fewer members than folds
+        n_folds = self.cv_folds
+        if self.task == "classification":
+            n_folds = max(2, min(self.cv_folds, min_class_count))
+            cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        else:
+            cv = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+
         scores = cross_val_score(
             self.model, X_scaled, y,
-            cv=self.cv_folds, scoring=scoring
+            cv=cv, scoring=scoring
         )
 
         self.model.fit(X_scaled, y)
@@ -167,6 +192,7 @@ class MLPPropertyProbe:
         return {
             "mean_score": float(np.mean(scores)),
             "std_score": float(np.std(scores)),
+            "n_cv_folds": n_folds,
             "scores": scores.tolist(),
         }
 

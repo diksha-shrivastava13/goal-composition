@@ -287,9 +287,11 @@ class CrossAgentComparisonExperiment(CheckpointExperiment):
             }
 
         # Correlation with difficulty
-        if len(wall_densities) > 10:
+        if len(wall_densities) > 10 and np.std(wall_densities) > 1e-10 and np.std(losses) > 1e-10:
             corr = np.corrcoef(wall_densities, losses)[0, 1]
             results['difficulty_correlation'] = float(corr) if np.isfinite(corr) else 0.0
+        elif len(wall_densities) > 10:
+            results['difficulty_correlation'] = 0.0
 
         return results
 

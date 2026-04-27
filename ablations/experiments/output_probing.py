@@ -203,8 +203,8 @@ class OutputProbingExperiment(CheckpointExperiment):
                     n_steps = min(ep_len, ant_ep_len)
 
                     regret = max(0, float(ant_result.episode_returns[i] - pro_result.episode_returns[i]))
-                    goal_dist = abs(float(goal_positions[i][0] - agent_positions[i][0])) + \
-                                abs(float(goal_positions[i][1] - agent_positions[i][1]))
+                    goal_dist = abs(int(goal_positions[i][0]) - int(agent_positions[i][0])) + \
+                                abs(int(goal_positions[i][1]) - int(agent_positions[i][1]))
                     adv_difficulty = float(1.0 - pro_result.episode_returns[i])  # Real difficulty from protagonist return
 
                     self._data.regrets.extend([regret] * ep_len)

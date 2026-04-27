@@ -117,10 +117,17 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
 
         from scipy.stats import spearmanr
 
+        def _safe_spearmanr(a, b):
+            """Spearman rank correlation with guard against constant inputs."""
+            a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+            if np.std(a) < 1e-10 or np.std(b) < 1e-10:
+                return np.nan, np.nan
+            return spearmanr(a, b)
+
         results = {}
 
         # Cross-sectional correlations (Spearman rank)
-        rho, p = spearmanr(
+        rho, p = _safe_spearmanr(
             self._time_series.adversary_difficulty,
             self._time_series.antagonist_performance,
         )
@@ -130,7 +137,7 @@ class CoalitionDynamicsExperiment(CheckpointExperiment):
             'significant': float(p) < 0.05 if not np.isnan(p) else False,
         }
 
-        rho, p = spearmanr(
+        rho, p = _safe_spearmanr(
             self._time_series.protagonist_performance,
             self._time_series.adversary_difficulty,
         )

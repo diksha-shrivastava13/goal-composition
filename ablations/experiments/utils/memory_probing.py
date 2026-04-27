@@ -284,8 +284,8 @@ def analyze_selective_memory(
         returns = np.array([e["return"] for e in episode_features])
         median_return = np.median(returns)
         high_return = returns >= median_return
-        retained_high = retained[high_return].mean()
-        retained_low = retained[~high_return].mean()
+        retained_high = retained[high_return].mean() if high_return.any() else float('nan')
+        retained_low = retained[~high_return].mean() if (~high_return).any() else float('nan')
         results["return_bias"] = float(retained_high - retained_low)
 
     # Recency bias (if episode_idx available)
@@ -359,7 +359,7 @@ def compute_memory_decay_curve(
         "decay_rate": float(decay_rate),
         "initial_accuracy": float(initial_accuracy),
         "half_life": float(half_life),
-        "fit_r2": float(1 - np.var(log_acc - (coeffs[0] * lags_valid + coeffs[1])) / np.var(log_acc)),
+        "fit_r2": float(1 - np.var(log_acc - (coeffs[0] * lags_valid + coeffs[1])) / np.var(log_acc)) if np.var(log_acc) > 1e-10 else float('nan'),
     }
 
 

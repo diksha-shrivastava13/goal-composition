@@ -1141,15 +1141,18 @@ class ActivationAnalysisExperiment(CheckpointExperiment):
 
         # Lasso sparse feature identification
         from sklearn.linear_model import LassoCV
+        from sklearn.preprocessing import StandardScaler
         level_properties = np.column_stack([
             wall_densities,
             self._data.episode_returns[valid_mask],
         ])
         try:
-            lasso = LassoCV(cv=5, max_iter=2000)
-            lasso.fit(h, level_properties[:, 0])  # Predict wall_density
+            scaler = StandardScaler()
+            h_scaled = scaler.fit_transform(h)
+            lasso = LassoCV(cv=5, max_iter=10000, tol=1e-4)
+            lasso.fit(h_scaled, level_properties[:, 0])  # Predict wall_density
             n_nonzero = int(np.sum(np.abs(lasso.coef_) > 1e-6))
-            lasso_r2 = float(lasso.score(h, level_properties[:, 0]))
+            lasso_r2 = float(lasso.score(h_scaled, level_properties[:, 0]))
         except Exception:
             n_nonzero = 0
             lasso_r2 = 0.0

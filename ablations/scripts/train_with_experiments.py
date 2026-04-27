@@ -115,6 +115,9 @@ def run_checkpoint_experiments(
             )
             results[exp_name] = {'status': 'success', 'result': result}
         except Exception as e:
+            import traceback
+            print(f"  ERROR in {exp_name}: {e}")
+            traceback.print_exc()
             results[exp_name] = {'status': 'error', 'error': str(e)}
         finally:
             # Free memory between experiments to prevent cumulative OOM
@@ -456,6 +459,10 @@ Examples:
                         help="Disable wandb logging")
 
     args = parser.parse_args()
+
+    # Route warnings through logging for clean log ordering
+    import logging
+    logging.captureWarnings(True)
 
     # Build config via shared resolver
     base_config = build_config_from_args(args)

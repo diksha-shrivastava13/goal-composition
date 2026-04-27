@@ -10,6 +10,7 @@ Contains:
 
 import os
 import json
+import warnings
 from typing import Optional
 import jax
 import jax.numpy as jnp
@@ -90,7 +91,9 @@ def load_checkpoint(
     if step == -1:
         step = checkpoint_manager.latest_step()
 
-    loaded_checkpoint = checkpoint_manager.restore(step)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Couldn't find sharding info")
+        loaded_checkpoint = checkpoint_manager.restore(step)
 
     if "params" in loaded_checkpoint:
         # Standard (non-PAIRED) checkpoint

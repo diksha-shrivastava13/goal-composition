@@ -412,8 +412,11 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         steps = [p.step for p in self._data_points]
         divergences = [p.belief_policy_divergence + p.belief_value_divergence for p in self._data_points]
 
-        # Linear regression
-        slope = np.polyfit(steps, divergences, 1)[0]
+        # Linear regression (guard against near-constant x)
+        if np.ptp(steps) < 1e-6:
+            slope = 0.0
+        else:
+            slope = np.polyfit(steps, divergences, 1)[0]
 
         # Compare early vs late
         n = len(self._data_points)
@@ -500,11 +503,12 @@ class BeliefBehaviourDivergenceExperiment(CheckpointExperiment):
         ax.set_xlabel('Level Difficulty')
         ax.set_ylabel('Total Divergence')
         ax.set_title('Divergence vs Difficulty')
-        # Fit line
-        z = np.polyfit(difficulties, total_div, 1)
-        p = np.poly1d(z)
-        x_line = np.linspace(min(difficulties), max(difficulties), 100)
-        ax.plot(x_line, p(x_line), 'r--', linewidth=2)
+        # Fit line (guard against near-constant difficulties)
+        if np.ptp(difficulties) > 1e-6:
+            z = np.polyfit(difficulties, total_div, 1)
+            p = np.poly1d(z)
+            x_line = np.linspace(min(difficulties), max(difficulties), 100)
+            ax.plot(x_line, p(x_line), 'r--', linewidth=2)
 
         # Probe accuracy
         ax = axes[1, 0]
