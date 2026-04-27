@@ -114,7 +114,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "seed": 42,
     },
     "mutation_adaptation": {
-        "n_level_pairs": 50,
+        "n_level_pairs": 200,
         "mutation_distances": [1, 2, 3, 5],
         "n_random_baselines": 10,
         "max_episode_steps": 256,
@@ -140,12 +140,12 @@ EXPERIMENT_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "n_steps_per_episode": 50,
     },
     "goal_extraction": {
-        "n_samples": 100,
+        "n_samples": 200,
         "n_patching_pairs": 50,
         "n_attribution_steps": 50,
     },
     "cross_episode_flow": {
-        "n_episode_sequences": 20,
+        "n_episode_sequences": 100,
         "sequence_length": 10,
         "max_lag_to_test": 5,
     },
@@ -155,13 +155,13 @@ EXPERIMENT_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "feature_names": None,  # None = use default feature set
     },
     "n_env_prediction": {
-        "n_sequences": 50,
+        "n_sequences": 100,
         "sequence_length": 15,
         "horizons": [1, 2, 5, 10],
         "max_steps": 256,
     },
     "n_step_prediction": {
-        "n_levels": 50,
+        "n_levels": 100,
         "max_steps": 128,
         "horizons": [1, 5, 10, 25],
     },
@@ -169,7 +169,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # --- Training-time experiments (3) ---
     "behavioral_coupling": {
         "collection_interval": 100,
-        "probe_n_samples": 50,
+        "probe_n_samples": 100,
         "rolling_window": 20,
         "granger_max_lag": 10,
         "random_baseline_samples": 100,
@@ -208,7 +208,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "n_levels": 500,
     },
     "adversary_ablation": {
-        "n_levels_per_condition": 50,
+        "n_levels_per_condition": 200,
     },
     "regret_decomposition": {
         "n_levels": 500,
@@ -283,7 +283,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
     "multiscale_goals": {
         "n_episodes": 100,
-        "max_steps_per_episode": 50,
+        "max_steps_per_episode": 256,
         "hidden_dim": 256,
     },
     "shard_dynamics": {
